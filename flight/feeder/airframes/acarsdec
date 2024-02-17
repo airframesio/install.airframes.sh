@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# Feed acarsdec to Airframes
+#
+
+# Determine which OS we are running on (Linux, Darwin, Windows)
+case "$OSTYPE" in
+  darwin*)
+    OS="MacOS"
+    ;;
+  linux*)
+    OS="Linux"
+    ;;
+  msys*)
+    OS="Windows"
+    ;;
+  *)
+    echo "OS not supported: $OSTYPE"
+    exit 1
+    ;;
+esac
+
+# Determine which architecture we are running on (x86_64, arm64, armv7l, i686)
+case "$(uname -m)" in
+  x86_64)
+    ARCH="amd64"
+    ;;
+  arm64)
+    ARCH="arm64"
+    ;;
+  armv7l)
+    ARCH="armv7"
+    ;;
+  i686)
+    ARCH="386"
+    ;;
+  *)
+    echo "Architecture not supported: $(uname -m)"
+    exit 1
+    ;;
+esac
+
+# Check if acarsdec is installed
+if [ -x "$(command -v acarsdec)" ]; then
+  echo "acarsdec is installed"
+else
+  echo "acarsdec is not installed, you must install acarsdec first"
+  exit 1
+fi
