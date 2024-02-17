@@ -47,3 +47,17 @@ else
   echo "acarsdec is not installed, you must install acarsdec first"
   exit 1
 fi
+
+# Check if acarsdec is running
+if pgrep -x "acarsdec" > /dev/null; then
+  echo "acarsdec is running"
+else
+  echo "acarsdec is not running"
+fi
+
+# Check if acarsdec is feeding to Airframes by checking for feed.airframes.io in the parameters of the process
+if pgrep -x "acarsdec" | xargs ps -o args= | grep -q "feed.airframes.io"; then
+  echo "acarsdec is feeding to Airframes"
+else
+  echo "acarsdec is not feeding to Airframes"
+fi
