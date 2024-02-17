@@ -1,0 +1,7 @@
+/Users/kevin/Cloud/Dropbox/work/airframes/install.airframes.sh/flight/acarsdec-master/build/CMakeFiles/acarsdec.dir
+/Users/kevin/Cloud/Dropbox/work/airframes/install.airframes.sh/flight/acarsdec-master/build/CMakeFiles/edit_cache.dir
+/Users/kevin/Cloud/Dropbox/work/airframes/install.airframes.sh/flight/acarsdec-master/build/CMakeFiles/rebuild_cache.dir
+/Users/kevin/Cloud/Dropbox/work/airframes/install.airframes.sh/flight/acarsdec-master/build/CMakeFiles/list_install_components.dir
+/Users/kevin/Cloud/Dropbox/work/airframes/install.airframes.sh/flight/acarsdec-master/build/CMakeFiles/install.dir
+/Users/kevin/Cloud/Dropbox/work/airframes/install.airframes.sh/flight/acarsdec-master/build/CMakeFiles/install/local.dir
+/Users/kevin/Cloud/Dropbox/work/airframes/install.airframes.sh/flight/acarsdec-master/build/CMakeFiles/install/strip.dir

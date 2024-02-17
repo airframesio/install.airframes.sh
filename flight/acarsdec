@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+#
+# acarsdec installer
+#
+# Airframes
+#
+
+# Determine which OS we are running on (Linux, Darwin, Windows)
+case "$OSTYPE" in
+  darwin*)
+    OS="MacOS"
+    ;;
+  linux*)
+    OS="Linux"
+    ;;
+  msys*)
+    OS="Windows"
+    ;;
+  *)
+    echo "OS not supported: $OSTYPE"
+    exit 1
+    ;;
+esac
+echo "OS: $OS"
+
+# Determine which architecture we are running on (x86_64, arm64, armv7l, i686)
+case "$(uname -m)" in
+  x86_64)
+    ARCH="amd64"
+    ;;
+  arm64)
+    ARCH="arm64"
+    ;;
+  armv7l)
+    ARCH="armv7"
+    ;;
+  i686)
+    ARCH="386"
+    ;;
+  *)
+    echo "Architecture not supported: $(uname -m)"
+    exit 1
+    ;;
+esac
+echo "Architecture: $ARCH"
+
+# Determine which version to install (latest, stable)
+VERSION="main"
+echo "Version: $VERSION"
+
+# Determine if RTL-SDR, Airspy, and/or SDRplay is selected by user flag
+RTLSDR="no"
+AIRSPY="no"
+SDRPLAY="no"
+for i in "$@"; do
+  if [ "$i" == "--rtlsdr" ]; then
+    RTLSDR="yes"
+  elif [ "$i" == "--airspy" ]; then
+    AIRSPY="yes"
+  elif [ "$i" == "--sdrplay" ]; then
+    SDRPLAY="yes"
+  fi
+done
+echo "RTLSDR: $RTLSDR"
+echo "Airspy: $AIRSPY"
+echo "SDRplay: $SDRPLAY"
+
+# If version is "main" then download the latest release from GitHub
+if [ "$VERSION" == "main" ]; then
+  URL="https://github.com/TLeconte/acarsdec/archive/refs/heads/master.zip"
+  FILE="master.zip"
+  DIR="acarsdec-master"
+
+  sudo rm -rf $DIR
+  rm $FILE
+
+  echo "Downloading latest release from GitHub"
+  curl -L -o $FILE $URL
+  unzip $FILE
+  cd $DIR
+  mkdir build
+  cd build
+
+  if [ "$RTLSDR" == "yes" ]; then
+    RTLSDR_FLAG="-DRTLSDR=ON"
+  else
+    RTLSDR_FLAG="-DRTLSDR=OFF"
+  fi
+
+  if [ "$AIRSPY" == "yes" ]; then
+    AIRSPY_FLAG="-DAIRSPY=ON"
+  else
+    AIRSPY_FLAG="-DAIRSPY=OFF"
+  fi
+
+  if [ "$SDRPLAY" == "yes" ]; then
+    SDRPLAY_FLAG="-DSDRPLAY=ON"
+  else
+    SDRPLAY_FLAG="-DSDRPLAY=OFF"
+  fi
+
+  cmake .. $RTLSDR_FLAG $AIRSPY_FLAG $SDRPLAY_FLAG
+
+  make
+  # if exit code is not 0 then report error and exit
+  if [ $? -ne 0 ]; then
+    echo "Error: make failed"
+    exit 1
+  fi
+
+  sudo make install
+  cd ../..
+  sudo rm -rf $DIR
+  rm $FILE
+  exit 0
+fi
