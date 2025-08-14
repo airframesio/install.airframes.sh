@@ -1,32 +1,79 @@
-<html>
+<!DOCTYPE html>
+<html lang="en">
   <head>
-    <title>Airframes Installers</title>
-    <meta name="description" content="Easy installation of decoder clients & Airframes feeder clients, entirely or individually.">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Airframes Installers - Easy Decoder & Feeder Setup</title>
+    <meta name="description" content="Streamlined installation of flight, balloon, and ship tracking decoders & Airframes feeder clients. One-command setup for ACARS, VDL2, HFDL decoders.">
     <link rel="icon" type="image/png" href="favicon.png">
     <link rel="stylesheet" type="text/css" href="style.css">
   </head>
   <body>
-    <div style="position: relative; z-index: 100;">
-      <center>
-        <a href="https://airframes.io">
-          <img src="images/logotype-bw.svg" alt="Airframes" style="margin-top: 50px; width: 400px;">
+    <div class="container">
+      <header>
+        <a href="https://airframes.io" class="logo-link">
+          <img src="images/logotype-bw.svg" alt="Airframes" class="logo">
         </a>
-        <h2>Installers</h2>
-        <h3 id="glitch">WELCOME TO THE PARTY!</h3>
-        <p style="margin-left: 20px; margin-right: 20px; line-height: 1.2rem;"><small>Easy installation of flight, balloon, &amp; ship tracking decoders &amp; feeder clients.</small></p>
-        <p>Coming soon...</p>
-        <p></p>
-        <p style="font-size: 0.7rem;">
-          <span><a href="https://app.airframes.io">Home</a></span> |
-          <span><a href="https://app.airframes.io/about">About</a></span> |
-          <span><a href="https://discord.gg/airframes">Discord</a></span> |
-          <span><a href="https://community.airframes.io">Community</a></span> |
-          <span><a href="https://docs.airframes.io">Docs</a></span> |
-          <span><a href="https://twitter.com/airframesio">Twitter</a></span> |
-          <span><a href="https://airwaves.social/@airframes">Mastodon</a></span> |
-          <span><a href="https://shop.airframes.io">Shop</a></span>
-        </p>
-      </center>
+        <h1 class="title">Installer Suite</h1>
+        <h2 class="tagline" id="glitch">DECODE THE SKIES</h2>
+        <p class="description">Streamlined installation scripts for aviation, maritime, and atmospheric tracking systems</p>
+      </header>
+
+      <main>
+        <div class="cards">
+          <div class="card flight">
+            <div class="card-icon">✈️</div>
+            <h3>Flight Tracking</h3>
+            <p>ACARS, VDL2, HFDL decoders</p>
+            <div class="card-status ready">Available Now</div>
+          </div>
+          <div class="card balloon">
+            <div class="card-icon">🎈</div>
+            <h3>Balloon Tracking</h3>
+            <p>High-altitude balloon telemetry</p>
+            <div class="card-status ready">Available Now</div>
+          </div>
+          <div class="card ship">
+            <div class="card-icon">🚢</div>
+            <h3>Ship Tracking</h3>
+            <p>AIS maritime decoders</p>
+            <div class="card-status ready">Available Now</div>
+          </div>
+          <div class="card satellite">
+            <div class="card-icon">🛰️</div>
+            <h3>Satellite Tracking</h3>
+            <p>LEO/GEO satellite telemetry</p>
+            <div class="card-status coming">Coming Soon</div>
+          </div>
+          <div class="card spacestation">
+            <div class="card-icon">🚀</div>
+            <h3>Space Station Tracking</h3>
+            <p>ISS and orbital platform data</p>
+            <div class="card-status coming">Coming Soon</div>
+          </div>
+        </div>
+
+        <div class="install-section">
+          <h3>Quick Start</h3>
+          <div class="code-block">
+            <code>curl -sSL https://install.airframes.sh/installer | bash</code>
+            <button class="copy-btn" onclick="navigator.clipboard.writeText('curl -sSL https://install.airframes.sh/installer | bash')">Copy</button>
+          </div>
+          <p class="install-note">Supports Linux, macOS, and Windows (WSL)</p>
+        </div>
+      </main>
+
+      <footer>
+        <nav class="footer-nav">
+          <a href="https://app.airframes.io">Home</a>
+          <a href="https://app.airframes.io/about">About</a>
+          <a href="https://discord.gg/airframes">Discord</a>
+          <a href="https://community.airframes.io">Community</a>
+          <a href="https://docs.airframes.io">Docs</a>
+          <a href="https://x.com/airframesio">X</a>
+          <a href="https://shop.airframes.io">Shop</a>
+        </nav>
+      </footer>
     </div>
     <div id="bg"></div>
   </body>
