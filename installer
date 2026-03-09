@@ -936,6 +936,20 @@ nproc_count() {
   nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2
 }
 
+# Build platform-specific cmake flags (Homebrew prefix, macOS workarounds)
+platform_cmake_flags() {
+  local flags="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+
+  if [ "$OS" = "macos" ]; then
+    local prefix
+    prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+    flags="${flags} -DCMAKE_PREFIX_PATH=${prefix}"
+    flags="${flags} -DCMAKE_C_FLAGS=-DHOST_NAME_MAX=255"
+  fi
+
+  echo "$flags"
+}
+
 install_base_deps() {
   step "Installing base build dependencies"
   pkg_update
@@ -980,7 +994,8 @@ build_libacars() {
 
   cd libacars
   mkdir -p build && cd build
-  cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+  # shellcheck disable=SC2086
+  cmake .. $(platform_cmake_flags)
   make -j"$(nproc_count)"
   sudo make install
 
@@ -1013,7 +1028,7 @@ compile_decoder() {
   cd "$decoder"
   mkdir -p build && cd build
   # shellcheck disable=SC2086
-  cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5 $cmake_flags
+  cmake .. $(platform_cmake_flags) $cmake_flags
   make -j"$(nproc_count)"
   sudo make install
 
