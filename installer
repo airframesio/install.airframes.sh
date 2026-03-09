@@ -6,10 +6,10 @@
 # One-command setup for aviation decoders and Airframes feeding.
 #
 # Usage:
-#   curl -sSL https://install.airframes.sh/installer | bash
-#   curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
-#   curl -sSL https://install.airframes.sh/installer | bash -s -- --token <TOKEN>
-#   curl -sSL https://install.airframes.sh/installer | bash -s -- -y all --region north_america
+#   bash <(curl -sSL https://install.airframes.sh/installer)
+#   bash <(curl -sSL https://install.airframes.sh/installer) acarsdec
+#   bash <(curl -sSL https://install.airframes.sh/installer) --token <TOKEN>
+#   bash <(curl -sSL https://install.airframes.sh/installer) -y all --region north_america
 #
 # Supports: Linux (Debian/Ubuntu/Raspbian/Fedora/Arch/Alpine), macOS (Homebrew)
 #
@@ -1347,11 +1347,11 @@ Options:
   --freq "F1 F2 ..."      Override frequencies
 
 Examples:
-  curl -sSL https://install.airframes.sh/installer | bash
-  curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
-  curl -sSL https://install.airframes.sh/installer | bash -s -- --token abc123
-  curl -sSL https://install.airframes.sh/installer | bash -s -- -y all --region north_america
-  curl -sSL https://install.airframes.sh/installer | bash -s -- dumpvdl2 --sdr airspy --method docker
+  bash <(curl -sSL https://install.airframes.sh/installer)
+  bash <(curl -sSL https://install.airframes.sh/installer) acarsdec
+  bash <(curl -sSL https://install.airframes.sh/installer) --token abc123
+  bash <(curl -sSL https://install.airframes.sh/installer) -y all --region north_america
+  bash <(curl -sSL https://install.airframes.sh/installer) dumpvdl2 --sdr airspy --method docker
 EOF
 }
 
