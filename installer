@@ -1,0 +1,1772 @@
+#!/usr/bin/env bash
+#
+# Airframes Installer
+# https://install.airframes.sh/installer
+#
+# One-command setup for aviation decoders and Airframes feeding.
+#
+# Usage:
+#   curl -sSL https://install.airframes.sh/installer | bash
+#   curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
+#   curl -sSL https://install.airframes.sh/installer | bash -s -- --token <TOKEN>
+#   curl -sSL https://install.airframes.sh/installer | bash -s -- -y all --region north_america
+#
+# Supports: Linux (Debian/Ubuntu/Raspbian/Fedora/Arch/Alpine), macOS (Homebrew)
+#
+
+set -euo pipefail
+
+# ===========================================================================
+# Section 1: Header / shebang / set options
+# ===========================================================================
+
+# Ensure we have bash 4+ (needed for associative arrays)
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # Try Homebrew bash
+    if [ -x /opt/homebrew/bin/bash ]; then
+      exec /opt/homebrew/bin/bash "$0" "$@"
+    elif [ -x /usr/local/bin/bash ]; then
+      exec /usr/local/bin/bash "$0" "$@"
+    else
+      echo "[airframes] bash 4+ required. Install with: brew install bash"
+      exit 1
+    fi
+  else
+    echo "[airframes] bash 4+ required (found ${BASH_VERSION})"
+    exit 1
+  fi
+fi
+
+# ===========================================================================
+# Section 2: Constants & version
+# ===========================================================================
+
+VERSION="2.0.0"
+API_BASE="https://app.airframes.io/api/v1"
+AIRFRAMES_FEED_HOST="feed.airframes.io"
+BUILD_DIR="/tmp/airframes-build"
+CONFIG_DIR="/opt/airframes/config"
+LIBACARS_REPO="https://github.com/szpajder/libacars.git"
+GUM_VERSION="0.14.5"
+
+# ===========================================================================
+# Section 3: Color & output utilities
+# ===========================================================================
+
+if [ -t 1 ] && [ -t 0 ]; then
+  IS_TTY=true
+else
+  IS_TTY=false
+fi
+
+if [ "$IS_TTY" = true ]; then
+  BOLD="\033[1m"
+  DIM="\033[2m"
+  ITALIC="\033[3m"
+  CYAN="\033[36m"
+  GREEN="\033[32m"
+  YELLOW="\033[33m"
+  RED="\033[31m"
+  MAGENTA="\033[35m"
+  BLUE="\033[34m"
+  RESET="\033[0m"
+else
+  BOLD="" DIM="" ITALIC="" CYAN="" GREEN="" YELLOW="" RED="" MAGENTA="" BLUE="" RESET=""
+fi
+
+info()    { echo -e "${CYAN}[airframes]${RESET} $*"; }
+ok()      { echo -e "${GREEN}[airframes]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[airframes]${RESET} $*"; }
+err()     { echo -e "${RED}[airframes]${RESET} $*" >&2; }
+step()    { echo -e "\n${BOLD}==> $*${RESET}"; }
+substep() { echo -e "  ${DIM}-> $*${RESET}"; }
+
+# ===========================================================================
+# Section 4: State variables
+# ===========================================================================
+
+# Platform
+OS=""
+ARCH=""
+DISTRO=""
+PKG=""
+IS_WSL=false
+
+# Operation mode
+MODE=""                  # cli, tui, automated
+USE_GUM=true
+HAS_GUM=false
+AUTO_YES=false
+TOKEN=""
+SELECTED_DECODERS=()
+SELECTED_METHOD="source" # source, docker, binary, package
+SELECTED_REGION=""
+SELECTED_SDR="rtlsdr"
+STATION_IDENT=""
+FEED_HOST=""
+FEED_PORT=""
+FREQUENCIES=""
+CREATE_SERVICE=false
+SHOW_RUN_CMD=true
+
+# Detected SDRs
+declare -a DETECTED_SDRS=()
+
+# ===========================================================================
+# Section 5: Package manager abstraction
+# ===========================================================================
+
+pkg_translate() {
+  local generic="$1"
+
+  case "$PKG" in
+    apt)
+      case "$generic" in
+        build-essential) echo "build-essential" ;;
+        cmake)           echo "cmake" ;;
+        pkg-config)      echo "pkg-config" ;;
+        git)             echo "git" ;;
+        curl)            echo "curl" ;;
+        librtlsdr-dev)   echo "librtlsdr-dev" ;;
+        libusb-dev)      echo "libusb-1.0-0-dev" ;;
+        libairspy-dev)   echo "libairspy-dev" ;;
+        libglib2-dev)    echo "libglib2.0-dev" ;;
+        libzmq-dev)      echo "libzmq3-dev" ;;
+        libconfig-dev)   echo "libconfig++-dev" ;;
+        libliquid-dev)   echo "libliquid-dev" ;;
+        libfftw3-dev)    echo "libfftw3-dev" ;;
+        libsqlite3-dev)  echo "libsqlite3-dev" ;;
+        libsoapysdr-dev) echo "libsoapysdr-dev" ;;
+        libxml2-dev)     echo "libxml2-dev" ;;
+        libsndfile-dev)  echo "libsndfile-dev" ;;
+        zlib-dev)        echo "zlib1g-dev" ;;
+        docker)          echo "docker.io" ;;
+        docker-compose)  echo "docker-compose" ;;
+      esac
+      ;;
+    dnf)
+      case "$generic" in
+        build-essential) echo "gcc gcc-c++ make" ;;
+        cmake)           echo "cmake" ;;
+        pkg-config)      echo "pkgconf-pkg-config" ;;
+        git)             echo "git" ;;
+        curl)            echo "curl" ;;
+        librtlsdr-dev)   echo "rtl-sdr-devel" ;;
+        libusb-dev)      echo "libusb1-devel" ;;
+        libairspy-dev)   echo "airspy-devel" ;;
+        libglib2-dev)    echo "glib2-devel" ;;
+        libzmq-dev)      echo "zeromq-devel" ;;
+        libconfig-dev)   echo "libconfig-devel" ;;
+        libliquid-dev)   echo "liquid-dsp-devel" ;;
+        libfftw3-dev)    echo "fftw-devel" ;;
+        libsqlite3-dev)  echo "sqlite-devel" ;;
+        libsoapysdr-dev) echo "SoapySDR-devel" ;;
+        libxml2-dev)     echo "libxml2-devel" ;;
+        libsndfile-dev)  echo "libsndfile-devel" ;;
+        zlib-dev)        echo "zlib-devel" ;;
+        docker)          echo "docker" ;;
+        docker-compose)  echo "docker-compose" ;;
+      esac
+      ;;
+    pacman)
+      case "$generic" in
+        build-essential) echo "base-devel" ;;
+        cmake)           echo "cmake" ;;
+        pkg-config)      echo "pkgconf" ;;
+        git)             echo "git" ;;
+        curl)            echo "curl" ;;
+        librtlsdr-dev)   echo "rtl-sdr" ;;
+        libusb-dev)      echo "libusb" ;;
+        libairspy-dev)   echo "airspy" ;;
+        libglib2-dev)    echo "glib2" ;;
+        libzmq-dev)      echo "zeromq" ;;
+        libconfig-dev)   echo "libconfig" ;;
+        libliquid-dev)   echo "" ;; # AUR only
+        libfftw3-dev)    echo "fftw" ;;
+        libsqlite3-dev)  echo "sqlite" ;;
+        libsoapysdr-dev) echo "soapysdr" ;;
+        libxml2-dev)     echo "libxml2" ;;
+        libsndfile-dev)  echo "libsndfile" ;;
+        zlib-dev)        echo "zlib" ;;
+        docker)          echo "docker" ;;
+        docker-compose)  echo "docker-compose" ;;
+      esac
+      ;;
+    apk)
+      case "$generic" in
+        build-essential) echo "build-base" ;;
+        cmake)           echo "cmake" ;;
+        pkg-config)      echo "pkgconf" ;;
+        git)             echo "git" ;;
+        curl)            echo "curl" ;;
+        librtlsdr-dev)   echo "rtl-sdr-dev" ;;
+        libusb-dev)      echo "libusb-dev" ;;
+        libairspy-dev)   echo "airspy-dev" ;;
+        libglib2-dev)    echo "glib-dev" ;;
+        libzmq-dev)      echo "zeromq-dev" ;;
+        libconfig-dev)   echo "libconfig-dev" ;;
+        libliquid-dev)   echo "" ;; # build from source
+        libfftw3-dev)    echo "fftw-dev" ;;
+        libsqlite3-dev)  echo "sqlite-dev" ;;
+        libsoapysdr-dev) echo "soapysdr-dev" ;;
+        libxml2-dev)     echo "libxml2-dev" ;;
+        libsndfile-dev)  echo "libsndfile-dev" ;;
+        zlib-dev)        echo "zlib-dev" ;;
+        docker)          echo "docker" ;;
+        docker-compose)  echo "docker-compose" ;;
+      esac
+      ;;
+    brew)
+      case "$generic" in
+        build-essential) echo "" ;; # implicit with Xcode CLT
+        cmake)           echo "cmake" ;;
+        pkg-config)      echo "pkg-config" ;;
+        git)             echo "git" ;;
+        curl)            echo "" ;; # built-in
+        librtlsdr-dev)   echo "librtlsdr" ;;
+        libusb-dev)      echo "libusb" ;;
+        libairspy-dev)   echo "airspy" ;;
+        libglib2-dev)    echo "glib" ;;
+        libzmq-dev)      echo "zeromq" ;;
+        libconfig-dev)   echo "libconfig" ;;
+        libliquid-dev)   echo "liquid-dsp" ;;
+        libfftw3-dev)    echo "fftw" ;;
+        libsqlite3-dev)  echo "sqlite" ;;
+        libsoapysdr-dev) echo "soapysdr" ;;
+        libxml2-dev)     echo "" ;; # system provided
+        libsndfile-dev)  echo "libsndfile" ;;
+        zlib-dev)        echo "" ;; # system provided
+        docker)          echo "docker" ;;
+        docker-compose)  echo "docker-compose" ;;
+      esac
+      ;;
+  esac
+}
+
+pkg_install() {
+  local -a pkgs=()
+  for generic in "$@"; do
+    local translated
+    translated=$(pkg_translate "$generic")
+    if [ -n "$translated" ]; then
+      # Split space-separated packages (e.g., "gcc gcc-c++ make")
+      read -ra parts <<< "$translated"
+      pkgs+=("${parts[@]}")
+    fi
+  done
+
+  if [ ${#pkgs[@]} -eq 0 ]; then
+    return 0
+  fi
+
+  substep "Installing: ${pkgs[*]}"
+
+  case "$PKG" in
+    apt)
+      sudo apt-get install -y -qq "${pkgs[@]}"
+      ;;
+    dnf)
+      sudo dnf install -y -q "${pkgs[@]}"
+      ;;
+    pacman)
+      sudo pacman -S --noconfirm --needed "${pkgs[@]}"
+      ;;
+    apk)
+      sudo apk add --quiet "${pkgs[@]}"
+      ;;
+    brew)
+      brew install "${pkgs[@]}" 2>/dev/null || true
+      ;;
+  esac
+}
+
+pkg_remove() {
+  local pkg="$1"
+  case "$PKG" in
+    apt)    sudo apt-get remove -y -qq "$pkg" 2>/dev/null || true ;;
+    dnf)    sudo dnf remove -y -q "$pkg" 2>/dev/null || true ;;
+    pacman) sudo pacman -R --noconfirm "$pkg" 2>/dev/null || true ;;
+    apk)    sudo apk del --quiet "$pkg" 2>/dev/null || true ;;
+    brew)   brew uninstall "$pkg" 2>/dev/null || true ;;
+  esac
+}
+
+pkg_update() {
+  case "$PKG" in
+    apt)    sudo apt-get update -qq ;;
+    dnf)    : ;; # dnf auto-refreshes
+    pacman) sudo pacman -Sy --noconfirm ;;
+    apk)    sudo apk update --quiet ;;
+    brew)   : ;; # brew auto-updates
+  esac
+}
+
+# ===========================================================================
+# Section 6: Platform detection
+# ===========================================================================
+
+detect_os() {
+  case "$(uname -s)" in
+    Linux)  OS="linux" ;;
+    Darwin) OS="macos" ;;
+    MINGW*|MSYS*|CYGWIN*)
+      OS="windows"
+      ;;
+    *)
+      err "Unsupported OS: $(uname -s)"
+      exit 1
+      ;;
+  esac
+
+  # WSL detection
+  if [ "$OS" = "linux" ] && [ -f /proc/version ]; then
+    if grep -qi "microsoft\|wsl" /proc/version 2>/dev/null; then
+      IS_WSL=true
+    fi
+  fi
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)   ARCH="amd64" ;;
+    aarch64|arm64)   ARCH="arm64" ;;
+    armv7l|armv6l)   ARCH="armv7" ;;
+    i686|i386)       ARCH="386" ;;
+    *)
+      err "Unsupported architecture: $(uname -m)"
+      exit 1
+      ;;
+  esac
+}
+
+detect_distro() {
+  if [ "$OS" = "macos" ]; then
+    DISTRO="macos"
+    return
+  fi
+
+  if [ "$OS" = "windows" ]; then
+    DISTRO="windows"
+    return
+  fi
+
+  # Linux distro detection
+  if [ -f /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "$ID" in
+      debian)    DISTRO="debian" ;;
+      ubuntu)    DISTRO="ubuntu" ;;
+      raspbian)  DISTRO="raspbian" ;;
+      armbian)   DISTRO="armbian" ;;
+      fedora)    DISTRO="fedora" ;;
+      rocky)     DISTRO="rocky" ;;
+      rhel|centos) DISTRO="rhel" ;;
+      arch|manjaro) DISTRO="arch" ;;
+      alpine)    DISTRO="alpine" ;;
+      *)
+        # Check for ID_LIKE as fallback
+        case "${ID_LIKE:-}" in
+          *debian*|*ubuntu*) DISTRO="debian" ;;
+          *fedora*|*rhel*)   DISTRO="fedora" ;;
+          *arch*)            DISTRO="arch" ;;
+          *) DISTRO="unknown" ;;
+        esac
+        ;;
+    esac
+  elif [ -f /etc/debian_version ]; then
+    DISTRO="debian"
+  elif [ -f /etc/fedora-release ]; then
+    DISTRO="fedora"
+  elif [ -f /etc/arch-release ]; then
+    DISTRO="arch"
+  elif [ -f /etc/alpine-release ]; then
+    DISTRO="alpine"
+  else
+    DISTRO="unknown"
+  fi
+}
+
+detect_pkg_manager() {
+  if [ "$OS" = "macos" ]; then
+    if ! command -v brew >/dev/null 2>&1; then
+      err "Homebrew is required on macOS. Install it from https://brew.sh"
+      exit 1
+    fi
+    PKG="brew"
+  elif command -v apt-get >/dev/null 2>&1; then
+    PKG="apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG="dnf"
+  elif command -v pacman >/dev/null 2>&1; then
+    PKG="pacman"
+  elif command -v apk >/dev/null 2>&1; then
+    PKG="apk"
+  else
+    err "No supported package manager found (apt, dnf, pacman, apk, or brew)."
+    exit 1
+  fi
+}
+
+detect_platform() {
+  detect_os
+  detect_arch
+  detect_distro
+  detect_pkg_manager
+}
+
+# ===========================================================================
+# Section 7: Gum install & UI abstraction
+# ===========================================================================
+
+install_gum() {
+  if command -v gum >/dev/null 2>&1; then
+    HAS_GUM=true
+    return 0
+  fi
+
+  info "Installing gum for interactive UI..."
+
+  case "$PKG" in
+    apt)
+      # Use Charm's apt repo
+      sudo mkdir -p /etc/apt/keyrings
+      curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg 2>/dev/null
+      echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list >/dev/null
+      sudo apt-get update -qq
+      sudo apt-get install -y -qq gum
+      ;;
+    dnf)
+      echo '[charm]
+name=Charm
+baseurl=https://repo.charm.sh/yum/
+enabled=1
+gpgcheck=1
+gpgkey=https://repo.charm.sh/yum/gpg.key' | sudo tee /etc/yum.repos.d/charm.repo >/dev/null
+      sudo dnf install -y -q gum
+      ;;
+    pacman)
+      sudo pacman -S --noconfirm gum 2>/dev/null || {
+        # Fallback to binary
+        install_gum_binary
+        return
+      }
+      ;;
+    apk)
+      sudo apk add --quiet gum 2>/dev/null || {
+        install_gum_binary
+        return
+      }
+      ;;
+    brew)
+      brew install gum
+      ;;
+  esac
+
+  if command -v gum >/dev/null 2>&1; then
+    HAS_GUM=true
+    ok "gum installed"
+  else
+    install_gum_binary
+  fi
+}
+
+install_gum_binary() {
+  local gum_arch="$ARCH"
+  local gum_os="$OS"
+  [ "$gum_os" = "macos" ] && gum_os="Darwin"
+  [ "$gum_os" = "linux" ] && gum_os="Linux"
+  [ "$gum_arch" = "amd64" ] && gum_arch="x86_64"
+  [ "$gum_arch" = "arm64" ] && gum_arch="aarch64"
+  [ "$gum_arch" = "armv7" ] && gum_arch="armv7"
+
+  local url="https://github.com/charmbracelet/gum/releases/download/v${GUM_VERSION}/gum_${GUM_VERSION}_${gum_os}_${gum_arch}.tar.gz"
+  local tmp="/tmp/gum-install"
+
+  mkdir -p "$tmp"
+  if curl -fsSL "$url" | tar xz -C "$tmp" 2>/dev/null; then
+    sudo install -m 755 "$tmp/gum" /usr/local/bin/gum 2>/dev/null || {
+      install -m 755 "$tmp/gum" "$HOME/.local/bin/gum" 2>/dev/null
+      export PATH="$HOME/.local/bin:$PATH"
+    }
+    rm -rf "$tmp"
+    if command -v gum >/dev/null 2>&1; then
+      HAS_GUM=true
+      ok "gum installed"
+    fi
+  else
+    warn "Could not install gum, falling back to plain menus"
+  fi
+}
+
+# UI abstraction: gum when available, plain bash fallback
+
+ui_choose() {
+  local prompt="$1"
+  shift
+  local -a options=("$@")
+
+  if [ "$HAS_GUM" = true ]; then
+    gum choose --header "$prompt" "${options[@]}"
+  else
+    echo -e "\n  ${BOLD}${prompt}${RESET}" >&2
+    local i=1
+    for opt in "${options[@]}"; do
+      echo -e "  ${CYAN}${i}${RESET})  ${opt}" >&2
+      ((i++))
+    done
+    echo >&2
+    local choice
+    while true; do
+      echo -ne "  ${BOLD}Select [1-${#options[@]}]: ${RESET}" >&2
+      read -r choice
+      if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
+        echo "${options[$((choice-1))]}"
+        return 0
+      fi
+      warn "Invalid selection" >&2
+    done
+  fi
+}
+
+ui_multichoice() {
+  local prompt="$1"
+  shift
+  local -a options=("$@")
+
+  if [ "$HAS_GUM" = true ]; then
+    gum choose --no-limit --header "$prompt" "${options[@]}"
+  else
+    echo -e "\n  ${BOLD}${prompt}${RESET}" >&2
+    echo -e "  ${DIM}(Enter numbers separated by spaces, e.g., 1 3 4)${RESET}" >&2
+    local i=1
+    for opt in "${options[@]}"; do
+      echo -e "  ${CYAN}${i}${RESET})  ${opt}" >&2
+      ((i++))
+    done
+    echo >&2
+    local choices
+    echo -ne "  ${BOLD}Select: ${RESET}" >&2
+    read -r choices
+    for idx in $choices; do
+      if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#options[@]}" ]; then
+        echo "${options[$((idx-1))]}"
+      fi
+    done
+  fi
+}
+
+ui_confirm() {
+  local prompt="$1"
+  local default="${2:-yes}"
+
+  if [ "$AUTO_YES" = true ]; then
+    return 0
+  fi
+
+  if [ "$HAS_GUM" = true ]; then
+    if [ "$default" = "yes" ]; then
+      gum confirm --default=yes "$prompt"
+    else
+      gum confirm --default=no "$prompt"
+    fi
+  else
+    local yn
+    if [ "$default" = "yes" ]; then
+      echo -ne "  ${prompt} [Y/n] " >&2
+      read -r yn
+      [[ ! "$yn" =~ ^[Nn] ]]
+    else
+      echo -ne "  ${prompt} [y/N] " >&2
+      read -r yn
+      [[ "$yn" =~ ^[Yy] ]]
+    fi
+  fi
+}
+
+ui_input() {
+  local prompt="$1"
+  local default="${2:-}"
+
+  if [ "$HAS_GUM" = true ]; then
+    if [ -n "$default" ]; then
+      gum input --placeholder "$prompt" --value "$default"
+    else
+      gum input --placeholder "$prompt"
+    fi
+  else
+    local val
+    if [ -n "$default" ]; then
+      echo -ne "  ${prompt} [${default}]: " >&2
+      read -r val
+      echo "${val:-$default}"
+    else
+      echo -ne "  ${prompt}: " >&2
+      read -r val
+      echo "$val"
+    fi
+  fi
+}
+
+ui_spin() {
+  local title="$1"
+  shift
+
+  if [ "$HAS_GUM" = true ]; then
+    gum spin --spinner dot --title "$title" -- "$@"
+  else
+    info "$title"
+    "$@"
+  fi
+}
+
+# ===========================================================================
+# Section 8: SDR detection
+# ===========================================================================
+
+# USB VID:PID database
+declare -A SDR_VIDPID_MAP=(
+  ["0bda:2838"]="rtlsdr"
+  ["0bda:2832"]="rtlsdr"
+  ["1d50:604b"]="airspy"
+  ["1d50:60a1"]="airspy_hf"
+  ["1df7:2500"]="sdrplay"
+  ["1df7:3000"]="sdrplay"
+  ["1df7:3010"]="sdrplay"
+  ["1df7:3020"]="sdrplay"
+  ["1df7:3030"]="sdrplay"
+)
+
+declare -A SDR_VIDPID_NAMES=(
+  ["0bda:2838"]="RTL-SDR (RTL2838)"
+  ["0bda:2832"]="RTL-SDR (RTL2832)"
+  ["1d50:604b"]="Airspy Mini/R2"
+  ["1d50:60a1"]="Airspy HF+"
+  ["1df7:2500"]="SDRplay RSP1"
+  ["1df7:3000"]="SDRplay RSP1A"
+  ["1df7:3010"]="SDRplay RSP2"
+  ["1df7:3020"]="SDRplay RSPduo"
+  ["1df7:3030"]="SDRplay RSPdx"
+)
+
+detect_sdrs() {
+  DETECTED_SDRS=()
+
+  if [ "$OS" = "linux" ]; then
+    if ! command -v lsusb >/dev/null 2>&1; then
+      return
+    fi
+
+    local lsusb_output
+    lsusb_output=$(lsusb 2>/dev/null) || return
+
+    for vidpid in "${!SDR_VIDPID_MAP[@]}"; do
+      if echo "$lsusb_output" | grep -qi "$vidpid"; then
+        local sdr_type="${SDR_VIDPID_MAP[$vidpid]}"
+        local sdr_name="${SDR_VIDPID_NAMES[$vidpid]}"
+        DETECTED_SDRS+=("${sdr_type}:${sdr_name}")
+      fi
+    done
+
+  elif [ "$OS" = "macos" ]; then
+    local usb_output
+    usb_output=$(system_profiler SPUSBDataType 2>/dev/null) || return
+
+    # Check for known product names
+    if echo "$usb_output" | grep -qi "RTL2838\|RTL2832\|RTL-SDR"; then
+      DETECTED_SDRS+=("rtlsdr:RTL-SDR")
+    fi
+    if echo "$usb_output" | grep -qi "Airspy"; then
+      DETECTED_SDRS+=("airspy:Airspy")
+    fi
+    if echo "$usb_output" | grep -qi "SDRplay"; then
+      DETECTED_SDRS+=("sdrplay:SDRplay")
+    fi
+  fi
+}
+
+show_detected_sdrs() {
+  if [ ${#DETECTED_SDRS[@]} -eq 0 ]; then
+    warn "No SDR devices detected"
+    info "Make sure your SDR is plugged in via USB"
+    return 1
+  fi
+
+  ok "Detected SDR devices:"
+  for sdr in "${DETECTED_SDRS[@]}"; do
+    local sdr_name="${sdr#*:}"
+    echo -e "  ${GREEN}●${RESET} ${sdr_name}"
+  done
+  return 0
+}
+
+get_sdr_type() {
+  if [ ${#DETECTED_SDRS[@]} -gt 0 ]; then
+    # Return the type of the first detected SDR
+    local first="${DETECTED_SDRS[0]}"
+    echo "${first%%:*}"
+  else
+    echo "rtlsdr"
+  fi
+}
+
+# ===========================================================================
+# Section 9: Frequency tables
+# ===========================================================================
+
+# ACARS frequencies by region
+declare -A ACARS_FREQS=(
+  ["north_america"]="131.550 131.525 131.725 131.825 130.025 130.425 130.450 131.125"
+  ["europe"]="131.525 131.725 131.825 136.900 131.550"
+  ["asia_pacific"]="131.550 131.525 131.450"
+  ["global"]="131.550 131.525 131.725"
+)
+
+# VDL Mode 2 frequencies by region
+declare -A VDL2_FREQS=(
+  ["north_america"]="136.650 136.800 136.900 136.975"
+  ["europe"]="136.725 136.775 136.825 136.875 136.975"
+  ["asia_pacific"]="136.700 136.800 136.900"
+  ["global"]="136.975 136.650 136.800"
+)
+
+# HFDL frequencies by band (MHz) — global, not regional
+declare -A HFDL_FREQS=(
+  ["5"]="5451 5502 5508 5514 5529 5538 5544 5547 5583 5589 5622 5655 5720"
+  ["6"]="6529 6535 6559 6565 6589 6596 6619 6628 6646 6652 6661 6712"
+  ["8"]="8825 8834 8843 8851 8885 8886 8894 8912 8921 8927 8936 8939 8942 8948 8957 8977"
+  ["10"]="10027 10060 10063 10066 10075 10081 10084 10087 10093"
+  ["11"]="11184 11306 11312 11318 11321 11327 11348 11354 11384 11387"
+  ["13"]="13264 13270 13276 13303 13312 13315 13321 13324 13342 13351 13354"
+  ["21"]="21928 21931 21934 21937 21949 21955 21982 21990 21995 21997"
+)
+
+get_frequencies() {
+  local decoder="$1"
+  local region="${2:-north_america}"
+
+  case "$decoder" in
+    acarsdec)
+      echo "${ACARS_FREQS[$region]:-${ACARS_FREQS[north_america]}}"
+      ;;
+    vdlm2dec|dumpvdl2)
+      echo "${VDL2_FREQS[$region]:-${VDL2_FREQS[north_america]}}"
+      ;;
+    dumphfdl)
+      # Default: 8 MHz band
+      echo "${HFDL_FREQS[8]}"
+      ;;
+  esac
+}
+
+detect_region_from_timezone() {
+  local tz
+  tz=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "")
+  if [ -z "$tz" ]; then
+    tz=$(cat /etc/timezone 2>/dev/null || echo "")
+  fi
+  if [ -z "$tz" ]; then
+    tz="${TZ:-}"
+  fi
+
+  case "$tz" in
+    America/*|US/*|Canada/*) echo "north_america" ;;
+    Europe/*|Africa/*)       echo "europe" ;;
+    Asia/*|Australia/*|Pacific/*) echo "asia_pacific" ;;
+    *) echo "north_america" ;; # default
+  esac
+}
+
+# ===========================================================================
+# Section 10: Decoder registry
+# ===========================================================================
+
+# Data-driven decoder configuration
+# Format: DECODER_<FIELD>[decoder_name]
+
+declare -A DECODER_REPO=(
+  ["acarsdec"]="https://github.com/TLeconte/acarsdec.git"
+  ["dumpvdl2"]="https://github.com/szpajder/dumpvdl2.git"
+  ["dumphfdl"]="https://github.com/szpajder/dumphfdl.git"
+  ["vdlm2dec"]="https://github.com/TLeconte/vdlm2dec.git"
+)
+
+declare -A DECODER_FEED_PORT=(
+  ["acarsdec"]="5550"
+  ["dumpvdl2"]="5552"
+  ["dumphfdl"]="5556"
+  ["vdlm2dec"]="5555"
+)
+
+declare -A DECODER_LABEL=(
+  ["acarsdec"]="acarsdec — VHF ACARS decoder"
+  ["dumpvdl2"]="dumpvdl2 — VDL Mode 2 decoder"
+  ["dumphfdl"]="dumphfdl — HF Data Link decoder"
+  ["vdlm2dec"]="vdlm2dec — VDL Mode 2 decoder (alt)"
+)
+
+declare -A DECODER_CMAKE_FLAGS=(
+  ["acarsdec"]="-Drtl=ON"
+  ["dumpvdl2"]=""
+  ["dumphfdl"]=""
+  ["vdlm2dec"]="-Drtl=ON"
+)
+
+declare -A DECODER_EXTRA_DEPS=(
+  ["acarsdec"]="zlib-dev libxml2-dev libsndfile-dev"
+  ["dumpvdl2"]="libzmq-dev libglib2-dev libsoapysdr-dev"
+  ["dumphfdl"]="libconfig-dev libliquid-dev libfftw3-dev libzmq-dev libsqlite3-dev libsoapysdr-dev"
+  ["vdlm2dec"]="zlib-dev libxml2-dev libsndfile-dev"
+)
+
+# Packages that must be removed before building (break cmake)
+declare -A DECODER_REMOVE_PKGS=(
+  ["acarsdec"]=""
+  ["dumpvdl2"]="libmirisdr-dev"
+  ["dumphfdl"]="libmirisdr-dev"
+  ["vdlm2dec"]=""
+)
+
+declare -A DECODER_DOCKER_IMAGE=(
+  ["acarsdec"]="ghcr.io/sdr-enthusiasts/docker-acarsdec:latest"
+  ["dumpvdl2"]="ghcr.io/sdr-enthusiasts/docker-dumpvdl2:latest"
+  ["dumphfdl"]="ghcr.io/sdr-enthusiasts/docker-dumphfdl:latest"
+  ["vdlm2dec"]="ghcr.io/sdr-enthusiasts/docker-vdlm2dec:latest"
+)
+
+DECODER_LIST=("acarsdec" "dumpvdl2" "dumphfdl" "vdlm2dec")
+
+get_cmake_flags_for_sdr() {
+  local decoder="$1"
+  local sdr="${2:-rtlsdr}"
+  local flags="${DECODER_CMAKE_FLAGS[$decoder]:-}"
+
+  case "$decoder" in
+    acarsdec|vdlm2dec)
+      case "$sdr" in
+        rtlsdr)  flags="-Drtl=ON" ;;
+        airspy)  flags="-Dairspy=ON" ;;
+        sdrplay) flags="-Dsdrplay=ON" ;;
+      esac
+      ;;
+    dumpvdl2|dumphfdl)
+      # These auto-detect SDR libraries at cmake time
+      ;;
+  esac
+
+  echo "$flags"
+}
+
+# ===========================================================================
+# Section 11: API integration
+# ===========================================================================
+
+api_fetch_config() {
+  if [ -z "$TOKEN" ]; then
+    return 1
+  fi
+
+  step "Fetching station configuration from Airframes..."
+
+  local response
+  response=$(curl -sf --max-time 15 \
+    "${API_BASE}/installer/config?token=${TOKEN}" 2>/dev/null) || {
+    err "Failed to fetch configuration. Check your token and try again."
+    return 1
+  }
+
+  # Parse JSON without jq (grep/sed based)
+  local _extract='s/.*"FIELD"\s*:\s*"\{0,1\}\([^",}]*\)"\{0,1\}.*/\1/p'
+
+  local decoder source_type feed_host feed_port frequencies region ident
+
+  decoder=$(echo "$response" | sed -n "${_extract/FIELD/decoder}")
+  source_type=$(echo "$response" | sed -n "${_extract/FIELD/sourceType}")
+  feed_host=$(echo "$response" | sed -n "${_extract/FIELD/feedHost}")
+  feed_port=$(echo "$response" | sed -n "${_extract/FIELD/feedPort}")
+  ident=$(echo "$response" | sed -n "${_extract/FIELD/ident}")
+  region=$(echo "$response" | sed -n "${_extract/FIELD/region}")
+
+  # Extract frequencies array
+  frequencies=$(echo "$response" | grep -o '"frequencies"\s*:\s*\[[^]]*\]' | grep -o '"[0-9.]*"' | tr -d '"' | tr '\n' ' ')
+
+  if [ -z "$decoder" ]; then
+    err "Invalid configuration received from API"
+    return 1
+  fi
+
+  SELECTED_DECODERS=("$decoder")
+  FEED_HOST="${feed_host:-$AIRFRAMES_FEED_HOST}"
+  FEED_PORT="${feed_port:-${DECODER_FEED_PORT[$decoder]:-5550}}"
+  FREQUENCIES="${frequencies:-$(get_frequencies "$decoder" "${region:-north_america}")}"
+  STATION_IDENT="${ident:-}"
+  SELECTED_REGION="${region:-north_america}"
+
+  ok "Station: ${STATION_IDENT}"
+  ok "Decoder: ${decoder}"
+  ok "Feed: ${FEED_HOST}:${FEED_PORT}"
+  ok "Frequencies: ${FREQUENCIES}"
+
+  api_report_status "installing_dependencies" "Starting installation" 5
+  return 0
+}
+
+api_report_status() {
+  if [ -z "$TOKEN" ]; then
+    return 0
+  fi
+
+  local status="$1"
+  local message="${2:-}"
+  local percent="${3:-0}"
+
+  # Fire-and-forget: don't block on failure
+  curl -sf -X POST "${API_BASE}/installer/status" \
+    -H "Content-Type: application/json" \
+    -d "{\"token\":\"${TOKEN}\",\"status\":\"${status}\",\"message\":\"${message}\",\"percent\":${percent}}" \
+    >/dev/null 2>&1 &
+}
+
+# ===========================================================================
+# Section 12: Install method — compile from source
+# ===========================================================================
+
+nproc_count() {
+  nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2
+}
+
+install_base_deps() {
+  step "Installing base build dependencies"
+  pkg_update
+  pkg_install build-essential cmake pkg-config git curl librtlsdr-dev libusb-dev
+}
+
+install_decoder_deps() {
+  local decoder="$1"
+
+  local extra="${DECODER_EXTRA_DEPS[$decoder]:-}"
+  if [ -n "$extra" ]; then
+    substep "Installing ${decoder} dependencies"
+    # shellcheck disable=SC2086
+    pkg_install $extra
+  fi
+
+  # Remove conflicting packages
+  local remove="${DECODER_REMOVE_PKGS[$decoder]:-}"
+  if [ -n "$remove" ]; then
+    for pkg in $remove; do
+      substep "Removing conflicting package: ${pkg}"
+      pkg_remove "$pkg"
+    done
+  fi
+}
+
+build_libacars() {
+  if [ -f "$BUILD_DIR/.libacars_built" ]; then
+    info "libacars already built, skipping"
+    return 0
+  fi
+
+  step "Building libacars"
+  api_report_status "building_libacars" "Building libacars dependency" 20
+
+  mkdir -p "$BUILD_DIR"
+  cd "$BUILD_DIR"
+
+  if [ ! -d libacars ]; then
+    git clone --depth 1 "$LIBACARS_REPO"
+  fi
+
+  cd libacars
+  mkdir -p build && cd build
+  cmake ..
+  make -j"$(nproc_count)"
+  sudo make install
+
+  if [ "$OS" = "linux" ]; then
+    sudo ldconfig
+  fi
+
+  touch "$BUILD_DIR/.libacars_built"
+  ok "libacars installed"
+}
+
+compile_decoder() {
+  local decoder="$1"
+  local repo="${DECODER_REPO[$decoder]}"
+  local sdr="${SELECTED_SDR:-rtlsdr}"
+  local cmake_flags
+  cmake_flags=$(get_cmake_flags_for_sdr "$decoder" "$sdr")
+
+  step "Building ${decoder}"
+  api_report_status "building_decoder" "Building ${decoder} from source" 50
+
+  mkdir -p "$BUILD_DIR"
+  cd "$BUILD_DIR"
+
+  if [ -d "$decoder" ]; then
+    rm -rf "$decoder"
+  fi
+
+  git clone --depth 1 "$repo" "$decoder"
+  cd "$decoder"
+  mkdir -p build && cd build
+  # shellcheck disable=SC2086
+  cmake .. $cmake_flags
+  make -j"$(nproc_count)"
+  sudo make install
+
+  if [ "$OS" = "linux" ]; then
+    sudo ldconfig
+  fi
+
+  ok "${decoder} installed"
+}
+
+install_from_source() {
+  local decoder="$1"
+
+  install_decoder_deps "$decoder"
+  build_libacars
+  compile_decoder "$decoder"
+}
+
+# ===========================================================================
+# Section 13: Install method — Docker containers
+# ===========================================================================
+
+ensure_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    step "Installing Docker"
+    if [ "$OS" = "linux" ]; then
+      curl -fsSL https://get.docker.com | sudo sh
+      sudo usermod -aG docker "$USER" 2>/dev/null || true
+    elif [ "$OS" = "macos" ]; then
+      err "Please install Docker Desktop from https://docker.com/products/docker-desktop"
+      return 1
+    fi
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    err "Docker is not running. Please start Docker and try again."
+    return 1
+  fi
+
+  ok "Docker is ready"
+}
+
+install_with_docker() {
+  local decoder="$1"
+  local image="${DECODER_DOCKER_IMAGE[$decoder]:-}"
+
+  if [ -z "$image" ]; then
+    err "No Docker image available for ${decoder}"
+    return 1
+  fi
+
+  ensure_docker || return 1
+
+  step "Pulling Docker image for ${decoder}"
+  api_report_status "building_decoder" "Pulling Docker image for ${decoder}" 50
+
+  docker pull "$image"
+
+  local port="${FEED_PORT:-${DECODER_FEED_PORT[$decoder]}}"
+  local host="${FEED_HOST:-$AIRFRAMES_FEED_HOST}"
+  local freqs="${FREQUENCIES:-$(get_frequencies "$decoder" "${SELECTED_REGION:-north_america}")}"
+
+  # Generate docker-compose.yml
+  local compose_dir="${CONFIG_DIR}/${decoder}"
+  sudo mkdir -p "$compose_dir"
+
+  local compose_file="${compose_dir}/docker-compose.yml"
+
+  local env_block=""
+  case "$decoder" in
+    acarsdec)
+      env_block="      FEED_ID: \"${STATION_IDENT:-airframes}\"
+      FREQUENCIES: \"${freqs}\"
+      OUTPUT_SERVER: \"${host}\"
+      OUTPUT_SERVER_PORT: \"${port}\"
+      OUTPUT_SERVER_MODE: \"json\""
+      ;;
+    dumpvdl2)
+      local freqs_hz=""
+      for f in $freqs; do
+        if [[ "$f" == *.* ]]; then
+          freqs_hz+=" $(echo "$f" | awk '{printf "%.0f", $1 * 1000000}')"
+        else
+          freqs_hz+=" $f"
+        fi
+      done
+      env_block="      FEED_ID: \"${STATION_IDENT:-airframes}\"
+      FREQUENCIES: \"${freqs_hz## }\"
+      SERVER: \"${host}\"
+      SERVER_PORT: \"${port}\""
+      ;;
+    dumphfdl)
+      env_block="      FEED_ID: \"${STATION_IDENT:-airframes}\"
+      FREQUENCIES: \"${freqs}\"
+      SERVER: \"${host}\"
+      SERVER_PORT: \"${port}\""
+      ;;
+    vdlm2dec)
+      env_block="      FEED_ID: \"${STATION_IDENT:-airframes}\"
+      FREQUENCIES: \"${freqs}\"
+      SERVER: \"${host}\"
+      SERVER_PORT: \"${port}\""
+      ;;
+  esac
+
+  sudo tee "$compose_file" >/dev/null << EOF
+version: '3.8'
+services:
+  ${decoder}:
+    image: ${image}
+    container_name: airframes-${decoder}
+    restart: unless-stopped
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    environment:
+${env_block}
+EOF
+
+  ok "Docker compose file created at ${compose_file}"
+  info "Start with: cd ${compose_dir} && docker compose up -d"
+
+  if ui_confirm "Start ${decoder} container now?"; then
+    cd "$compose_dir"
+    sudo docker compose up -d
+    ok "${decoder} is running in Docker"
+  fi
+}
+
+# ===========================================================================
+# Section 14: Install method — pre-built binaries (stub)
+# ===========================================================================
+
+install_from_binary() {
+  local decoder="$1"
+
+  warn "Pre-built binary installation is not yet available for ${decoder}"
+  info "Falling back to compile from source..."
+  install_from_source "$decoder"
+}
+
+# ===========================================================================
+# Section 15: Install method — system packages (stub)
+# ===========================================================================
+
+install_from_package() {
+  local decoder="$1"
+
+  warn "System package installation is not yet available for ${decoder}"
+  info "Falling back to compile from source..."
+  install_from_source "$decoder"
+}
+
+# ===========================================================================
+# Section 16: Feeding configuration
+# ===========================================================================
+
+build_run_command() {
+  local decoder="$1"
+  local host="${FEED_HOST:-$AIRFRAMES_FEED_HOST}"
+  local port="${FEED_PORT:-${DECODER_FEED_PORT[$decoder]}}"
+  local freqs="${FREQUENCIES:-$(get_frequencies "$decoder" "${SELECTED_REGION:-north_america}")}"
+  local sdr="${SELECTED_SDR:-rtlsdr}"
+
+  case "$decoder" in
+    acarsdec)
+      echo "acarsdec -v -o 4 -g 42 -r 0 ${freqs} -j ${host}:${port}"
+      ;;
+    dumpvdl2)
+      # dumpvdl2 takes frequencies in Hz
+      local freqs_hz=""
+      for f in $freqs; do
+        if [[ "$f" == *.* ]]; then
+          freqs_hz+=" $(echo "$f" | awk '{printf "%.0f", $1 * 1000000}')"
+        else
+          freqs_hz+=" $f"
+        fi
+      done
+      case "$sdr" in
+        rtlsdr)  echo "dumpvdl2 --rtlsdr 0${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
+        airspy)  echo "dumpvdl2 --airspy 0${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
+        sdrplay) echo "dumpvdl2 --soapysdr driver=sdrplay${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
+      esac
+      ;;
+    dumphfdl)
+      local freq_args=""
+      for f in $freqs; do
+        freq_args+=" ${f}"
+      done
+      case "$sdr" in
+        rtlsdr)  echo "dumphfdl --soapysdr driver=rtlsdr --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
+        airspy)  echo "dumphfdl --soapysdr driver=airspy --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
+        sdrplay) echo "dumphfdl --soapysdr driver=sdrplay --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
+      esac
+      ;;
+    vdlm2dec)
+      echo "vdlm2dec -v -r 0 -G -E -U -j ${host}:${port} ${freqs}"
+      ;;
+  esac
+}
+
+show_run_command() {
+  local decoder="$1"
+  local cmd
+  cmd=$(build_run_command "$decoder")
+
+  echo
+  ok "${decoder} is ready to feed Airframes!"
+  echo
+  info "Run this command to start feeding:"
+  echo -e "  ${DIM}${cmd}${RESET}"
+  echo
+}
+
+# ===========================================================================
+# Section 17: Systemd service creation
+# ===========================================================================
+
+create_systemd_service() {
+  local decoder="$1"
+  local cmd
+  cmd=$(build_run_command "$decoder")
+
+  if [ "$OS" != "linux" ]; then
+    warn "Systemd services are only supported on Linux"
+    return 1
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemctl not found — cannot create service"
+    return 1
+  fi
+
+  local service_name="airframes-${decoder}"
+  local service_file="/etc/systemd/system/${service_name}.service"
+
+  step "Creating systemd service: ${service_name}"
+
+  sudo tee "$service_file" >/dev/null << EOF
+[Unit]
+Description=Airframes ${decoder} decoder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${cmd}
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable "$service_name"
+  sudo systemctl start "$service_name"
+
+  ok "Service ${service_name} created and started"
+  info "Check status: systemctl status ${service_name}"
+  info "View logs: journalctl -u ${service_name} -f"
+}
+
+# ===========================================================================
+# Section 18: Config file management
+# ===========================================================================
+
+save_config() {
+  local decoder="$1"
+  local config_file="${CONFIG_DIR}/${decoder}.json"
+
+  sudo mkdir -p "$CONFIG_DIR"
+
+  local host="${FEED_HOST:-$AIRFRAMES_FEED_HOST}"
+  local port="${FEED_PORT:-${DECODER_FEED_PORT[$decoder]}}"
+  local freqs="${FREQUENCIES:-$(get_frequencies "$decoder" "${SELECTED_REGION:-north_america}")}"
+  local region="${SELECTED_REGION:-north_america}"
+  local sdr="${SELECTED_SDR:-rtlsdr}"
+  local ident="${STATION_IDENT:-}"
+  local cmd
+  cmd=$(build_run_command "$decoder")
+
+  sudo tee "$config_file" >/dev/null << EOF
+{
+  "decoder": "${decoder}",
+  "stationIdent": "${ident}",
+  "feedHost": "${host}",
+  "feedPort": ${port},
+  "frequencies": "${freqs}",
+  "region": "${region}",
+  "sdrType": "${sdr}",
+  "installMethod": "${SELECTED_METHOD}",
+  "runCommand": "${cmd}",
+  "installedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "installerVersion": "${VERSION}"
+}
+EOF
+
+  substep "Config saved to ${config_file}"
+}
+
+# ===========================================================================
+# Section 19: CLI argument parser
+# ===========================================================================
+
+usage() {
+  cat << EOF
+Airframes Installer v${VERSION}
+
+Usage: installer [OPTIONS] [DECODER...]
+
+Decoders:
+  acarsdec    VHF ACARS decoder
+  dumpvdl2    VDL Mode 2 decoder
+  dumphfdl    HF Data Link decoder
+  vdlm2dec    VDL Mode 2 decoder (alternative)
+  all         Install all decoders
+
+Options:
+  -h, --help              Show this help message
+  -v, --version           Show version
+  -y, --yes               Skip confirmation prompts (automated mode)
+  --token TOKEN           Use station token from web wizard
+  --region REGION         Set region (north_america, europe, asia_pacific)
+  --sdr TYPE              Set SDR type (rtlsdr, airspy, sdrplay)
+  --method METHOD         Install method (source, docker, binary, package)
+  --no-tui                Disable gum TUI, use plain menus
+  --no-service            Don't offer to create systemd service
+  --freq "F1 F2 ..."      Override frequencies
+
+Examples:
+  curl -sSL https://install.airframes.sh/installer | bash
+  curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
+  curl -sSL https://install.airframes.sh/installer | bash -s -- --token abc123
+  curl -sSL https://install.airframes.sh/installer | bash -s -- -y all --region north_america
+  curl -sSL https://install.airframes.sh/installer | bash -s -- dumpvdl2 --sdr airspy --method docker
+EOF
+}
+
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -v|--version)
+        echo "Airframes Installer v${VERSION}"
+        exit 0
+        ;;
+      -y|--yes)
+        AUTO_YES=true
+        shift
+        ;;
+      --token)
+        TOKEN="$2"
+        shift 2
+        ;;
+      --region)
+        SELECTED_REGION="$2"
+        shift 2
+        ;;
+      --sdr)
+        SELECTED_SDR="$2"
+        shift 2
+        ;;
+      --method)
+        SELECTED_METHOD="$2"
+        shift 2
+        ;;
+      --no-tui)
+        USE_GUM=false
+        shift
+        ;;
+      --no-service)
+        CREATE_SERVICE=false
+        SHOW_RUN_CMD=true
+        shift
+        ;;
+      --freq)
+        FREQUENCIES="$2"
+        shift 2
+        ;;
+      acarsdec|dumpvdl2|dumphfdl|vdlm2dec)
+        SELECTED_DECODERS+=("$1")
+        shift
+        ;;
+      all)
+        SELECTED_DECODERS=("${DECODER_LIST[@]}")
+        shift
+        ;;
+      *)
+        err "Unknown argument: $1"
+        usage
+        exit 1
+        ;;
+    esac
+  done
+}
+
+# ===========================================================================
+# Section 20: TUI flow (gum-based wizard)
+# ===========================================================================
+
+show_banner() {
+  echo -e "${CYAN}"
+  cat << 'BANNER'
+
+     ___   _       __
+    /   | (_)____  / __/________ _____ ___  ___  _____
+   / /| |/ / ___/ / /_/ ___/ __ `/ __ `__ \/ _ \/ ___/
+  / ___ / / /    / __/ /  / /_/ / / / / / /  __(__  )
+ /_/  |_/_/_/   /_/ /_/   \__,_/_/ /_/ /_/\___/____/
+
+BANNER
+  echo -e "${RESET}"
+  echo -e "  ${BOLD}Airframes Installer${RESET} v${VERSION}"
+  echo -e "  ${DIM}Decode the skies. Feed the community.${RESET}"
+  echo
+}
+
+tui_select_decoders() {
+  if [ "$HAS_GUM" = true ]; then
+    step "Select decoders to install"
+
+    local -a labels=()
+    for d in "${DECODER_LIST[@]}"; do
+      labels+=("${DECODER_LABEL[$d]}")
+    done
+
+    local selections
+    selections=$(gum choose --no-limit --header "Select decoders to install:" "${labels[@]}") || {
+      info "No decoders selected"
+      exit 0
+    }
+
+    SELECTED_DECODERS=()
+    while IFS= read -r line; do
+      for d in "${DECODER_LIST[@]}"; do
+        if [[ "$line" == "${DECODER_LABEL[$d]}" ]]; then
+          SELECTED_DECODERS+=("$d")
+        fi
+      done
+    done <<< "$selections"
+  else
+    step "Select decoders to install"
+    echo -e "  ${DIM}(Enter numbers separated by spaces, e.g., 1 3)${RESET}"
+    echo
+
+    local i=1
+    for d in "${DECODER_LIST[@]}"; do
+      echo -e "  ${CYAN}${i}${RESET})  ${DECODER_LABEL[$d]}"
+      ((i++))
+    done
+    echo -e "  ${CYAN}5${RESET})  All of the above"
+    echo
+
+    local choices
+    echo -ne "  ${BOLD}Select: ${RESET}"
+    read -r choices
+
+    SELECTED_DECODERS=()
+    for idx in $choices; do
+      case "$idx" in
+        5) SELECTED_DECODERS=("${DECODER_LIST[@]}"); break ;;
+        [1-4]) SELECTED_DECODERS+=("${DECODER_LIST[$((idx-1))]}") ;;
+      esac
+    done
+  fi
+
+  if [ ${#SELECTED_DECODERS[@]} -eq 0 ]; then
+    info "No decoders selected. Bye!"
+    exit 0
+  fi
+
+  ok "Selected: ${SELECTED_DECODERS[*]}"
+}
+
+tui_select_method() {
+  local methods=("Compile from source (recommended)" "Docker containers" "Pre-built binaries (coming soon)" "System packages (coming soon)")
+
+  local choice
+  choice=$(ui_choose "Installation method:" "${methods[@]}")
+
+  case "$choice" in
+    *source*)   SELECTED_METHOD="source" ;;
+    *Docker*)   SELECTED_METHOD="docker" ;;
+    *binaries*) SELECTED_METHOD="binary" ;;
+    *packages*) SELECTED_METHOD="package" ;;
+  esac
+
+  ok "Method: ${SELECTED_METHOD}"
+}
+
+tui_select_region() {
+  local regions=("North America" "Europe" "Asia / Pacific" "Global / Other")
+
+  local choice
+  choice=$(ui_choose "Select your region (for frequency defaults):" "${regions[@]}")
+
+  case "$choice" in
+    *America*)   SELECTED_REGION="north_america" ;;
+    *Europe*)    SELECTED_REGION="europe" ;;
+    *Asia*|*Pacific*) SELECTED_REGION="asia_pacific" ;;
+    *Global*|*Other*) SELECTED_REGION="global" ;;
+  esac
+
+  ok "Region: ${SELECTED_REGION}"
+}
+
+tui_select_sdr() {
+  # First try to detect SDRs
+  detect_sdrs
+
+  if [ ${#DETECTED_SDRS[@]} -gt 0 ]; then
+    show_detected_sdrs
+    echo
+
+    local detected_type
+    detected_type=$(get_sdr_type)
+
+    if ui_confirm "Use detected SDR (${detected_type})?"; then
+      SELECTED_SDR="$detected_type"
+      return
+    fi
+  fi
+
+  local sdrs=("RTL-SDR (most common)" "Airspy Mini/R2" "SDRplay RSP")
+
+  local choice
+  choice=$(ui_choose "Select your SDR type:" "${sdrs[@]}")
+
+  case "$choice" in
+    *RTL*)    SELECTED_SDR="rtlsdr" ;;
+    *Airspy*) SELECTED_SDR="airspy" ;;
+    *SDR*)    SELECTED_SDR="sdrplay" ;;
+  esac
+
+  ok "SDR: ${SELECTED_SDR}"
+}
+
+tui_confirm_install() {
+  echo
+  step "Installation Summary"
+  echo
+  echo -e "  ${BOLD}Decoders:${RESET}  ${SELECTED_DECODERS[*]}"
+  echo -e "  ${BOLD}Method:${RESET}    ${SELECTED_METHOD}"
+  echo -e "  ${BOLD}Region:${RESET}    ${SELECTED_REGION}"
+  echo -e "  ${BOLD}SDR:${RESET}       ${SELECTED_SDR}"
+  if [ -n "$STATION_IDENT" ]; then
+    echo -e "  ${BOLD}Station:${RESET}   ${STATION_IDENT}"
+  fi
+  echo
+
+  if ! ui_confirm "Proceed with installation?"; then
+    info "Aborted."
+    exit 0
+  fi
+}
+
+tui_post_install() {
+  local decoder="$1"
+
+  echo
+  if [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+    local actions=("Show run command" "Create systemd service (auto-start on boot)" "Both")
+    local choice
+    choice=$(ui_choose "How would you like to run ${decoder}?" "${actions[@]}")
+
+    case "$choice" in
+      *"Show run"*)
+        show_run_command "$decoder"
+        ;;
+      *systemd*)
+        create_systemd_service "$decoder"
+        ;;
+      *Both*)
+        show_run_command "$decoder"
+        create_systemd_service "$decoder"
+        ;;
+    esac
+  else
+    show_run_command "$decoder"
+  fi
+}
+
+tui_flow() {
+  show_banner
+
+  # Detect platform
+  info "Detected: ${OS} / ${ARCH} / ${DISTRO} / ${PKG}"
+  if [ "$IS_WSL" = true ]; then
+    info "Running under Windows Subsystem for Linux"
+  fi
+  echo
+
+  # Install gum for TUI
+  if [ "$USE_GUM" = true ]; then
+    install_gum
+  fi
+
+  # Decoder selection
+  tui_select_decoders
+
+  # Installation method
+  tui_select_method
+
+  # Region selection
+  tui_select_region
+
+  # SDR selection
+  tui_select_sdr
+
+  # Confirmation
+  tui_confirm_install
+
+  # Install
+  install_base_deps
+
+  mkdir -p "$BUILD_DIR"
+
+  for decoder in "${SELECTED_DECODERS[@]}"; do
+    case "$SELECTED_METHOD" in
+      source)  install_from_source "$decoder" ;;
+      docker)  install_with_docker "$decoder" ;;
+      binary)  install_from_binary "$decoder" ;;
+      package) install_from_package "$decoder" ;;
+    esac
+
+    save_config "$decoder"
+    tui_post_install "$decoder"
+  done
+
+  echo
+  ok "Done! Thank you for feeding Airframes."
+  info "Learn more at https://docs.airframes.io"
+}
+
+# ===========================================================================
+# Section 21: Main entry point (mode dispatch)
+# ===========================================================================
+
+main() {
+  parse_args "$@"
+  detect_platform
+
+  # Windows native (not WSL) — show guide and exit
+  if [ "$OS" = "windows" ] && [ "$IS_WSL" = false ]; then
+    show_banner
+    echo
+    warn "Native Windows is not directly supported."
+    echo
+    info "Options:"
+    echo -e "  1. Install ${BOLD}WSL 2${RESET} (recommended): wsl --install"
+    echo -e "  2. Use ${BOLD}Docker Desktop${RESET}: https://docker.com/products/docker-desktop"
+    echo
+    info "After installing WSL, run this installer again inside your WSL terminal."
+    exit 0
+  fi
+
+  # Token mode: fetch config from API
+  if [ -n "$TOKEN" ]; then
+    show_banner
+    info "Detected: ${OS} / ${ARCH} / ${DISTRO} / ${PKG}"
+    echo
+
+    api_fetch_config || exit 1
+
+    if [ -z "$SELECTED_REGION" ]; then
+      SELECTED_REGION=$(detect_region_from_timezone)
+    fi
+
+    install_base_deps
+    mkdir -p "$BUILD_DIR"
+
+    for decoder in "${SELECTED_DECODERS[@]}"; do
+      case "$SELECTED_METHOD" in
+        source)  install_from_source "$decoder" ;;
+        docker)  install_with_docker "$decoder" ;;
+        binary)  install_from_binary "$decoder" ;;
+        package) install_from_package "$decoder" ;;
+      esac
+
+      save_config "$decoder"
+
+      api_report_status "configuring" "Configuring ${decoder}" 80
+      show_run_command "$decoder"
+
+      if [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+        if [ "$AUTO_YES" = true ] || ui_confirm "Create systemd service for ${decoder}?"; then
+          create_systemd_service "$decoder"
+          api_report_status "feeding" "${decoder} is feeding" 95
+        fi
+      fi
+    done
+
+    api_report_status "complete" "Installation complete" 100
+    echo
+    ok "Done! Thank you for feeding Airframes."
+    info "Your station will appear on the dashboard shortly."
+    exit 0
+  fi
+
+  # CLI mode: decoder(s) passed as arguments
+  if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    show_banner
+    info "Detected: ${OS} / ${ARCH} / ${DISTRO} / ${PKG}"
+    echo
+
+    if [ -z "$SELECTED_REGION" ]; then
+      SELECTED_REGION=$(detect_region_from_timezone)
+    fi
+
+    if [ "$AUTO_YES" = false ]; then
+      if ! ui_confirm "Install ${SELECTED_DECODERS[*]}?"; then
+        info "Aborted."
+        exit 0
+      fi
+    fi
+
+    install_base_deps
+    mkdir -p "$BUILD_DIR"
+
+    for decoder in "${SELECTED_DECODERS[@]}"; do
+      case "$SELECTED_METHOD" in
+        source)  install_from_source "$decoder" ;;
+        docker)  install_with_docker "$decoder" ;;
+        binary)  install_from_binary "$decoder" ;;
+        package) install_from_package "$decoder" ;;
+      esac
+
+      save_config "$decoder"
+      show_run_command "$decoder"
+    done
+
+    echo
+    ok "Done! Thank you for feeding Airframes."
+    info "Learn more at https://docs.airframes.io"
+    exit 0
+  fi
+
+  # TUI mode: no args, interactive
+  if [ "$IS_TTY" = true ]; then
+    tui_flow
+  else
+    # Piped without args and without a TTY — show help
+    err "No decoder specified and no interactive terminal detected."
+    echo
+    usage
+    exit 1
+  fi
+}
+
+main "$@"
