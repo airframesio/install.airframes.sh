@@ -944,16 +944,29 @@ platform_cmake_flags() {
     local prefix
     prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
     flags="${flags} -DCMAKE_PREFIX_PATH=${prefix}"
-    flags="${flags} -DCMAKE_C_FLAGS=-DHOST_NAME_MAX=255"
+    flags="${flags} -DCMAKE_INCLUDE_PATH=${prefix}/include"
+    flags="${flags} -DCMAKE_LIBRARY_PATH=${prefix}/lib"
   fi
 
   echo "$flags"
+}
+
+# Set environment so cmake and the C compiler find Homebrew headers/libs
+platform_env_setup() {
+  if [ "$OS" = "macos" ]; then
+    local prefix
+    prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+    export CFLAGS="-DHOST_NAME_MAX=255 -I${prefix}/include ${CFLAGS:-}"
+    export LDFLAGS="-L${prefix}/lib ${LDFLAGS:-}"
+    export PKG_CONFIG_PATH="${prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  fi
 }
 
 install_base_deps() {
   step "Installing base build dependencies"
   pkg_update
   pkg_install build-essential cmake pkg-config git curl librtlsdr-dev libusb-dev
+  platform_env_setup
 }
 
 install_decoder_deps() {
