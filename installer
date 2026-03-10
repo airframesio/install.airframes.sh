@@ -1023,6 +1023,25 @@ build_libacars() {
   ok "libacars installed"
 }
 
+# Apply macOS compatibility patches to decoder sources.
+# acarsdec uses pthread_tryjoin_np which is a Linux-only glibc extension.
+# Replace with pthread_join (POSIX-portable). The thread is already signaled
+# to stop, so a blocking join is safe and the while loop exits on first pass.
+patch_macos_sources() {
+  local decoder="$1"
+
+  case "$decoder" in
+    acarsdec)
+      for src in rtl.c soapy.c; do
+        if [ -f "$src" ]; then
+          sed -i.bak 's/pthread_tryjoin_np/pthread_join/g' "$src"
+          rm -f "${src}.bak"
+        fi
+      done
+      ;;
+  esac
+}
+
 compile_decoder() {
   local decoder="$1"
   local repo="${DECODER_REPO[$decoder]}"
@@ -1042,6 +1061,12 @@ compile_decoder() {
 
   git clone --depth 1 "$repo" "$decoder"
   cd "$decoder"
+
+  # Apply macOS-specific source patches
+  if [ "$OS" = "macos" ]; then
+    patch_macos_sources "$decoder"
+  fi
+
   mkdir -p build && cd build
   # shellcheck disable=SC2086
   cmake .. $(platform_cmake_flags) $cmake_flags
