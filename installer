@@ -944,6 +944,7 @@ platform_cmake_flags() {
     local prefix
     prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
     flags="${flags} -DCMAKE_PREFIX_PATH=${prefix}"
+    flags="${flags} -DCMAKE_C_FLAGS=-DHOST_NAME_MAX=255"
     flags="${flags} -DCMAKE_INCLUDE_PATH=${prefix}/include"
     flags="${flags} -DCMAKE_LIBRARY_PATH=${prefix}/lib"
   fi
@@ -951,13 +952,15 @@ platform_cmake_flags() {
   echo "$flags"
 }
 
-# Set environment so cmake and the C compiler find Homebrew headers/libs
+# Set environment so the C compiler finds Homebrew headers/libs.
+# C_INCLUDE_PATH and LIBRARY_PATH are Clang/GCC env vars that add search
+# paths unconditionally, even when CMakeLists.txt overrides CMAKE_C_FLAGS.
 platform_env_setup() {
   if [ "$OS" = "macos" ]; then
     local prefix
     prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
-    export CFLAGS="-DHOST_NAME_MAX=255 -I${prefix}/include ${CFLAGS:-}"
-    export LDFLAGS="-L${prefix}/lib ${LDFLAGS:-}"
+    export C_INCLUDE_PATH="${prefix}/include${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}"
+    export LIBRARY_PATH="${prefix}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"
     export PKG_CONFIG_PATH="${prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
   fi
 }
