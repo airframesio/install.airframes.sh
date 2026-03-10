@@ -1024,14 +1024,13 @@ build_libacars() {
 }
 
 # Apply macOS compatibility patches to decoder sources.
-# acarsdec uses pthread_tryjoin_np which is a Linux-only glibc extension.
-# Replace with pthread_join (POSIX-portable). The thread is already signaled
-# to stop, so a blocking join is safe and the while loop exits on first pass.
 patch_macos_sources() {
   local decoder="$1"
 
   case "$decoder" in
     acarsdec)
+      # pthread_tryjoin_np is a Linux-only glibc extension.
+      # Replace with pthread_join (POSIX-portable).
       for src in rtl.c soapy.c; do
         if [ -f "$src" ]; then
           sed -i.bak 's/pthread_tryjoin_np/pthread_join/g' "$src"
@@ -1039,7 +1038,79 @@ patch_macos_sources() {
         fi
       done
       ;;
+    vdlm2dec)
+      # pthread_barrier_t doesn't exist on macOS. Add a polyfill
+      # (BSD-licensed, from Aleksey Demakov, used by dumpvdl2/dumphfdl).
+      create_pthread_barrier_polyfill
+      # Include the polyfill header from vdlm2.h before pthread_barrier_t usage
+      sed -i.bak '/#include <pthread.h>/a\
+#ifndef PTHREAD_BARRIER_SERIAL_THREAD\
+#include "pthread_barrier.h"\
+#endif' vdlm2.h
+      rm -f vdlm2.h.bak
+      # Add pthread_barrier.c to the build
+      sed -i.bak 's/add_executable(vdlm2dec /add_executable(vdlm2dec pthread_barrier.c /' CMakeLists.txt
+      rm -f CMakeLists.txt.bak
+      ;;
   esac
+}
+
+# Create pthread_barrier polyfill files for macOS (BSD-licensed).
+create_pthread_barrier_polyfill() {
+  cat > pthread_barrier.h << 'HEOF'
+#ifndef _PTHREAD_BARRIER_H
+#define _PTHREAD_BARRIER_H
+#include <pthread.h>
+#if !defined(PTHREAD_BARRIER_SERIAL_THREAD)
+#define PTHREAD_BARRIER_SERIAL_THREAD (1)
+typedef struct { } pthread_barrierattr_t;
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    unsigned int limit;
+    unsigned int count;
+    unsigned int phase;
+} pthread_barrier_t;
+int pthread_barrier_init(pthread_barrier_t *restrict barrier,
+    const pthread_barrierattr_t *restrict attr, unsigned int count);
+int pthread_barrier_wait(pthread_barrier_t *barrier);
+#endif
+#endif
+HEOF
+
+  cat > pthread_barrier.c << 'CEOF'
+#include "pthread_barrier.h"
+#include <errno.h>
+#if !defined(HAVE_PTHREAD_BARRIERS)
+int pthread_barrier_init(pthread_barrier_t *restrict barrier,
+    const pthread_barrierattr_t *restrict attr __attribute__((unused)),
+    unsigned count) {
+    if (count == 0) { errno = EINVAL; return -1; }
+    if (pthread_mutex_init(&barrier->mutex, 0) < 0) return -1;
+    if (pthread_cond_init(&barrier->cond, 0) < 0) {
+        int e = errno; pthread_mutex_destroy(&barrier->mutex); errno = e; return -1;
+    }
+    barrier->limit = count; barrier->count = 0; barrier->phase = 0;
+    return 0;
+}
+int pthread_barrier_wait(pthread_barrier_t *barrier) {
+    pthread_mutex_lock(&barrier->mutex);
+    barrier->count++;
+    if (barrier->count >= barrier->limit) {
+        barrier->phase++; barrier->count = 0;
+        pthread_cond_broadcast(&barrier->cond);
+        pthread_mutex_unlock(&barrier->mutex);
+        return PTHREAD_BARRIER_SERIAL_THREAD;
+    } else {
+        unsigned phase = barrier->phase;
+        do pthread_cond_wait(&barrier->cond, &barrier->mutex);
+        while (phase == barrier->phase);
+        pthread_mutex_unlock(&barrier->mutex);
+        return 0;
+    }
+}
+#endif
+CEOF
 }
 
 compile_decoder() {
