@@ -1109,8 +1109,9 @@ patch_macos_sources() {
       # pthread_barrier_t doesn't exist on macOS. Add a polyfill
       # (BSD-licensed, from Aleksey Demakov, used by dumpvdl2/dumphfdl).
       create_pthread_barrier_polyfill
-      # Include the polyfill header from vdlm2.h before pthread_barrier_t usage
+      # Include complex.h and polyfill header from vdlm2.h
       sed -i.bak '/#include <pthread.h>/a\
+#include <complex.h>\
 #ifndef PTHREAD_BARRIER_SERIAL_THREAD\
 #include "pthread_barrier.h"\
 #endif' vdlm2.h

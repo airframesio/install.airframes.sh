@@ -768,6 +768,7 @@ patch_macos_sources() {
     vdlm2dec)
       create_pthread_barrier_polyfill
       sed -i.bak '/#include <pthread.h>/a\
+#include <complex.h>\
 #ifndef PTHREAD_BARRIER_SERIAL_THREAD\
 #include "pthread_barrier.h"\
 #endif' vdlm2.h

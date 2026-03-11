@@ -91,14 +91,14 @@ jobs:
             libsqlite3-dev libxml2-dev zlib1g-dev libsoapysdr-dev \
             libsndfile-dev libconfig++-dev libfftw3-dev
 
-          # liquid-dsp needed for dumphfdl, may not be in apt
+          # liquid-dsp >= 1.3.0 needed for dumphfdl, not in apt on ubuntu-22.04
           if [ "$DECODER" = "dumphfdl" ]; then
-            if ! dpkg -s libliquid-dev >/dev/null 2>&1; then
-              git clone --depth 1 https://github.com/jgaeddert/liquid-dsp.git /tmp/liquid-dsp
-              cd /tmp/liquid-dsp
-              ./bootstrap.sh && ./configure --prefix=/usr && make -j"$(nproc)" && sudo make install
-              sudo ldconfig
-            fi
+            sudo apt-get install -y autoconf automake libtool
+            git clone https://github.com/jgaeddert/liquid-dsp.git /tmp/liquid-dsp
+            cd /tmp/liquid-dsp
+            git checkout v1.7.0
+            ./bootstrap.sh && ./configure --prefix=/usr && make -j"$(nproc)" && sudo make install
+            sudo ldconfig
           fi
 
           # libmirisdr-dev conflicts with dumpvdl2/dumphfdl builds
@@ -157,7 +157,9 @@ jobs:
             vdlm2dec)
               cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.h" .
               cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.c" .
+              # Add missing complex.h and pthread_barrier polyfill
               sed -i.bak '/#include <pthread.h>/a\
+          #include <complex.h>\
           #ifndef PTHREAD_BARRIER_SERIAL_THREAD\
           #include "pthread_barrier.h"\
           #endif' vdlm2.h
@@ -191,8 +193,10 @@ jobs:
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$STAGING"
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_RPATH=/usr/local/lib"
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
-            export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            export C_INCLUDE_PATH="$STAGING/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+            export LIBRARY_PATH="$STAGING/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
             export LD_LIBRARY_PATH="$STAGING/lib:${LD_LIBRARY_PATH:-}"
+            export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           fi
 
           # shellcheck disable=SC2086
