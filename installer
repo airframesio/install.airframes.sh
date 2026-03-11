@@ -42,13 +42,15 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
 CONFIG_DIR="/opt/airframes/config"
 LIBACARS_REPO="https://github.com/szpajder/libacars.git"
 GUM_VERSION="0.14.5"
+GITHUB_REPO="airframesio/install.airframes.sh"
+GITHUB_RELEASES="https://github.com/airframesio/install.airframes.sh/releases"
 
 # ===========================================================================
 # Section 3: Color & output utilities
@@ -100,7 +102,7 @@ HAS_GUM=false
 AUTO_YES=false
 TOKEN=""
 SELECTED_DECODERS=()
-SELECTED_METHOD="source" # source, docker, binary, package
+SELECTED_METHOD="binary" # binary, source, docker, package
 SELECTED_REGION=""
 SELECTED_SDR="rtlsdr"
 STATION_IDENT=""
@@ -947,6 +949,10 @@ platform_cmake_flags() {
     flags="${flags} -DCMAKE_C_FLAGS=-DHOST_NAME_MAX=255"
     flags="${flags} -DCMAKE_INCLUDE_PATH=${prefix}/include"
     flags="${flags} -DCMAKE_LIBRARY_PATH=${prefix}/lib"
+    flags="${flags} -DCMAKE_INSTALL_RPATH=/usr/local/lib;${prefix}/lib"
+    flags="${flags} -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
+    flags="${flags} -DCMAKE_MACOSX_RPATH=ON"
+    flags="${flags} -DCMAKE_INSTALL_NAME_DIR=/usr/local/lib"
   fi
 
   echo "$flags"
@@ -1017,10 +1023,71 @@ build_libacars() {
 
   if [ "$OS" = "linux" ]; then
     sudo ldconfig
+  elif [ "$OS" = "macos" ]; then
+    fix_macos_dylib_paths
   fi
 
   touch "$BUILD_DIR/.libacars_built"
   ok "libacars installed"
+}
+
+# Fix libacars dylib install name on macOS.
+# CMake sets it to @rpath/libacars-2.2.dylib by default, but binaries
+# linking against it won't have LC_RPATH entries. Use an absolute path instead.
+fix_macos_dylib_paths() {
+  local prefix
+  prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+
+  for dylib in /usr/local/lib/libacars-2*.dylib; do
+    if [ -f "$dylib" ] && [ ! -L "$dylib" ]; then
+      local current_id
+      current_id=$(otool -D "$dylib" | tail -1)
+      if [[ "$current_id" == @rpath/* ]]; then
+        substep "Fixing install name: ${dylib}"
+        sudo install_name_tool -id "$dylib" "$dylib"
+      fi
+    fi
+  done
+}
+
+# Fix rpath references in installed decoder binaries on macOS.
+fix_macos_binary_rpaths() {
+  local decoder="$1"
+  local bin_path
+  bin_path=$(command -v "$decoder" 2>/dev/null || echo "/usr/local/bin/${decoder}")
+
+  if [ ! -f "$bin_path" ]; then
+    return
+  fi
+
+  local prefix
+  prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+
+  # Replace @rpath references to libacars with absolute paths
+  local deps
+  deps=$(otool -L "$bin_path" | grep '@rpath/' | awk '{print $1}')
+  for dep in $deps; do
+    local libname="${dep#@rpath/}"
+    local resolved=""
+    # Search in known lib dirs
+    for dir in /usr/local/lib "${prefix}/lib"; do
+      if [ -f "${dir}/${libname}" ]; then
+        resolved="${dir}/${libname}"
+        break
+      fi
+    done
+    if [ -n "$resolved" ]; then
+      substep "Fixing ${decoder}: ${dep} -> ${resolved}"
+      sudo install_name_tool -change "$dep" "$resolved" "$bin_path"
+    fi
+  done
+
+  # Also add rpath entries as fallback
+  for rpath in /usr/local/lib "${prefix}/lib"; do
+    if ! otool -l "$bin_path" | grep -A2 LC_RPATH | grep -q "$rpath"; then
+      sudo install_name_tool -add_rpath "$rpath" "$bin_path" 2>/dev/null || true
+    fi
+  done
 }
 
 # Apply macOS compatibility patches to decoder sources.
@@ -1146,6 +1213,8 @@ compile_decoder() {
 
   if [ "$OS" = "linux" ]; then
     sudo ldconfig
+  elif [ "$OS" = "macos" ]; then
+    fix_macos_binary_rpaths "$decoder"
   fi
 
   ok "${decoder} installed"
@@ -1270,15 +1339,121 @@ EOF
 }
 
 # ===========================================================================
-# Section 14: Install method — pre-built binaries (stub)
+# Section 14: Install method — pre-built binaries
 # ===========================================================================
+
+# Map OS/ARCH to release artifact platform string
+get_platform_target() {
+  local os_part arch_part
+  case "$OS" in
+    linux) os_part="linux" ;;
+    macos) os_part="macos" ;;
+    *)     os_part="unknown" ;;
+  esac
+  case "$ARCH" in
+    x86_64|amd64)    arch_part="amd64" ;;
+    aarch64|arm64)   arch_part="arm64" ;;
+    armv7l|armhf)    arch_part="armhf" ;;
+    *)               arch_part="$ARCH" ;;
+  esac
+
+  # macOS uses x86_64/arm64 naming in releases
+  if [ "$os_part" = "macos" ]; then
+    case "$ARCH" in
+      x86_64)       arch_part="x86_64" ;;
+      arm64|aarch64) arch_part="arm64" ;;
+    esac
+  fi
+
+  echo "${os_part}-${arch_part}"
+}
+
+# Find the latest GitHub release tag for a decoder.
+# Returns the tag name (e.g. "acarsdec-v3.7") or empty string.
+get_latest_release_tag() {
+  local decoder="$1"
+  local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases"
+  local releases
+
+  releases=$(curl -fsSL "$api_url" --header "Accept: application/vnd.github.v3+json" 2>/dev/null) || return 1
+
+  # Extract the first tag_name matching this decoder prefix (most recent)
+  echo "$releases" | sed -n "s/.*\"tag_name\": \"\(${decoder}-v[^\"]*\)\".*/\1/p" | head -1
+}
+
+# Get download URL for a specific release tag and platform
+get_release_download_url() {
+  local tag="$1" decoder="$2" platform="$3"
+  echo "${GITHUB_RELEASES}/download/${tag}/${decoder}-${platform}.tar.gz"
+}
 
 install_from_binary() {
   local decoder="$1"
 
-  warn "Pre-built binary installation is not yet available for ${decoder}"
-  info "Falling back to compile from source..."
-  install_from_source "$decoder"
+  # Still need system libraries (librtlsdr, glib, etc.)
+  install_decoder_deps "$decoder"
+
+  local target
+  target=$(get_platform_target)
+
+  step "Checking for pre-built ${decoder} binary (${target})"
+
+  local tag
+  tag=$(get_latest_release_tag "$decoder")
+
+  if [ -z "$tag" ]; then
+    warn "No pre-built binary available for ${decoder}"
+    info "Falling back to compile from source..."
+    install_from_source "$decoder"
+    return
+  fi
+
+  local url
+  url=$(get_release_download_url "$tag" "$decoder" "$target")
+  local version="${tag#${decoder}-v}"
+
+  step "Downloading ${decoder} v${version}"
+  substep "${url}"
+
+  local tmpdir
+  tmpdir=$(mktemp -d)
+
+  if ! curl -fsSL "$url" -o "${tmpdir}/${decoder}.tar.gz" 2>/dev/null; then
+    warn "Download failed for ${decoder} (${target})"
+    info "Falling back to compile from source..."
+    rm -rf "$tmpdir"
+    install_from_source "$decoder"
+    return
+  fi
+
+  step "Installing ${decoder} v${version}"
+
+  tar xzf "${tmpdir}/${decoder}.tar.gz" -C "$tmpdir"
+
+  # Install binary
+  if [ -f "${tmpdir}/bin/${decoder}" ]; then
+    sudo install -m 0755 "${tmpdir}/bin/${decoder}" "/usr/local/bin/${decoder}"
+    substep "Installed /usr/local/bin/${decoder}"
+  else
+    warn "Binary not found in archive"
+    rm -rf "$tmpdir"
+    install_from_source "$decoder"
+    return
+  fi
+
+  # Install shared libraries (libacars)
+  if [ -d "${tmpdir}/lib" ]; then
+    sudo cp -a "${tmpdir}/lib/"* /usr/local/lib/
+    substep "Installed shared libraries to /usr/local/lib/"
+  fi
+
+  if [ "$OS" = "linux" ]; then
+    sudo ldconfig
+  fi
+
+  rm -rf "$tmpdir"
+
+  ok "${decoder} v${version} installed (pre-built binary)"
 }
 
 # ===========================================================================
@@ -1406,6 +1581,98 @@ EOF
   info "View logs: journalctl -u ${service_name} -f"
 }
 
+create_launchd_service() {
+  local decoder="$1"
+  local cmd
+  cmd=$(build_run_command "$decoder")
+
+  if [ "$OS" != "macos" ]; then
+    warn "launchd services are only supported on macOS"
+    return 1
+  fi
+
+  local service_label="io.airframes.${decoder}"
+  local plist_dir="$HOME/Library/LaunchAgents"
+  local plist_file="${plist_dir}/${service_label}.plist"
+  local logfile="/tmp/airframes-${decoder}.log"
+
+  mkdir -p "$plist_dir"
+
+  step "Creating launchd service: ${service_label}"
+
+  # Split command into binary + args array for plist
+  local bin
+  bin=$(echo "$cmd" | awk '{print $1}')
+  local bin_path
+  bin_path=$(command -v "$bin" 2>/dev/null || echo "/usr/local/bin/${bin}")
+
+  local args_xml=""
+  local first=true
+  for arg in $cmd; do
+    if [ "$first" = true ]; then
+      args_xml="${args_xml}    <string>${bin_path}</string>
+"
+      first=false
+    else
+      args_xml="${args_xml}    <string>${arg}</string>
+"
+    fi
+  done
+
+  cat > "$plist_file" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${service_label}</string>
+  <key>ProgramArguments</key>
+  <array>
+${args_xml}  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${logfile}</string>
+  <key>StandardErrorPath</key>
+  <string>${logfile}</string>
+</dict>
+</plist>
+EOF
+
+  launchctl load "$plist_file"
+
+  ok "Service ${service_label} created and started"
+  info "Check logs: tail -f ${logfile}"
+  info "Stop: launchctl unload ${plist_file}"
+}
+
+install_manager_script() {
+  step "Installing airframes manager"
+
+  local install_dir="/usr/local/bin"
+  local script_url="https://raw.githubusercontent.com/airframesio/install.airframes.sh/main/airframes-manager"
+  local manager_path="${install_dir}/airframes"
+
+  # Try to download from repo; fall back to bundled copy from build dir
+  local tmp_script="/tmp/airframes-manager-download"
+  if curl -fsSL "$script_url" -o "$tmp_script" 2>/dev/null; then
+    sudo install -m 0755 "$tmp_script" "$manager_path"
+    rm -f "$tmp_script"
+  elif [ -f "${BUILD_DIR}/airframes-manager" ]; then
+    sudo install -m 0755 "${BUILD_DIR}/airframes-manager" "$manager_path"
+  else
+    warn "Could not download airframes manager script"
+    info "You can install it manually from: ${script_url}"
+    return 0
+  fi
+
+  ok "Airframes manager installed to ${manager_path}"
+  info "Run 'airframes' for interactive dashboard"
+  info "Run 'airframes --help' for all commands"
+}
+
 # ===========================================================================
 # Section 18: Config file management
 # ===========================================================================
@@ -1468,7 +1735,7 @@ Options:
   --token TOKEN           Use station token from web wizard
   --region REGION         Set region (north_america, europe, asia_pacific)
   --sdr TYPE              Set SDR type (rtlsdr, airspy, sdrplay)
-  --method METHOD         Install method (source, docker, binary, package)
+  --method METHOD         Install method (binary, source, docker)
   --no-tui                Disable gum TUI, use plain menus
   --no-service            Don't offer to create systemd service
   --freq "F1 F2 ..."      Override frequencies
@@ -1622,16 +1889,15 @@ tui_select_decoders() {
 }
 
 tui_select_method() {
-  local methods=("Compile from source (recommended)" "Docker containers" "Pre-built binaries (coming soon)" "System packages (coming soon)")
+  local methods=("Pre-built binaries (recommended)" "Compile from source" "Docker containers")
 
   local choice
   choice=$(ui_choose "Installation method:" "${methods[@]}")
 
   case "$choice" in
+    *binaries*) SELECTED_METHOD="binary" ;;
     *source*)   SELECTED_METHOD="source" ;;
     *Docker*)   SELECTED_METHOD="docker" ;;
-    *binaries*) SELECTED_METHOD="binary" ;;
-    *packages*) SELECTED_METHOD="package" ;;
   esac
 
   ok "Method: ${SELECTED_METHOD}"
@@ -1724,6 +1990,23 @@ tui_post_install() {
         create_systemd_service "$decoder"
         ;;
     esac
+  elif [ "$OS" = "macos" ]; then
+    local actions=("Show run command" "Create launchd service (auto-start on login)" "Both")
+    local choice
+    choice=$(ui_choose "How would you like to run ${decoder}?" "${actions[@]}")
+
+    case "$choice" in
+      *"Show run"*)
+        show_run_command "$decoder"
+        ;;
+      *launchd*)
+        create_launchd_service "$decoder"
+        ;;
+      *Both*)
+        show_run_command "$decoder"
+        create_launchd_service "$decoder"
+        ;;
+    esac
   else
     show_run_command "$decoder"
   fi
@@ -1775,6 +2058,8 @@ tui_flow() {
     save_config "$decoder"
     tui_post_install "$decoder"
   done
+
+  install_manager_script
 
   echo
   ok "Done! Thank you for feeding Airframes."
@@ -1836,9 +2121,15 @@ main() {
           create_systemd_service "$decoder"
           api_report_status "feeding" "${decoder} is feeding" 95
         fi
+      elif [ "$OS" = "macos" ]; then
+        if [ "$AUTO_YES" = true ] || ui_confirm "Create launchd service for ${decoder}?"; then
+          create_launchd_service "$decoder"
+          api_report_status "feeding" "${decoder} is feeding" 95
+        fi
       fi
     done
 
+    install_manager_script
     api_report_status "complete" "Installation complete" 100
     echo
     ok "Done! Thank you for feeding Airframes."
@@ -1877,6 +2168,8 @@ main() {
       save_config "$decoder"
       show_run_command "$decoder"
     done
+
+    install_manager_script
 
     echo
     ok "Done! Thank you for feeding Airframes."

@@ -1,0 +1,32 @@
+{
+  "libacars": {
+    "repo": "szpajder/libacars",
+    "ref": "v2.2.0"
+  },
+  "decoders": {
+    "acarsdec": {
+      "repo": "TLeconte/acarsdec",
+      "ref": "master",
+      "version": "3.7",
+      "previous_ref": ""
+    },
+    "dumpvdl2": {
+      "repo": "szpajder/dumpvdl2",
+      "ref": "v2.3.0",
+      "version": "2.3.0",
+      "previous_ref": ""
+    },
+    "dumphfdl": {
+      "repo": "szpajder/dumphfdl",
+      "ref": "v1.4.1",
+      "version": "1.4.1",
+      "previous_ref": ""
+    },
+    "vdlm2dec": {
+      "repo": "TLeconte/vdlm2dec",
+      "ref": "master",
+      "version": "2.3",
+      "previous_ref": ""
+    }
+  }
+}

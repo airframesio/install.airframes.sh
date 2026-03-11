@@ -1,0 +1,1209 @@
+#!/usr/bin/env bash
+#
+# Airframes Manager
+# https://airframes.io
+#
+# Manage aviation decoder clients installed by the Airframes installer.
+#
+# Usage:
+#   airframes                                    # TUI dashboard
+#   airframes status [decoder|all]               # Show decoder status
+#   airframes start <decoder|all>                # Start decoder(s)
+#   airframes stop <decoder|all>                 # Stop decoder(s)
+#   airframes restart <decoder|all>              # Restart decoder(s)
+#   airframes logs <decoder> [-f]                # View decoder logs
+#   airframes update <decoder|all>               # Update decoder(s)
+#   airframes config <decoder> [show|edit]       # View/edit config
+#   airframes version                            # Show version
+#
+
+set -euo pipefail
+
+# ===========================================================================
+# Section 1: Ensure bash 4+
+# ===========================================================================
+
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    if [ -x /opt/homebrew/bin/bash ]; then
+      exec /opt/homebrew/bin/bash "$0" "$@"
+    elif [ -x /usr/local/bin/bash ]; then
+      exec /usr/local/bin/bash "$0" "$@"
+    else
+      echo "[airframes] bash 4+ required. Install with: brew install bash"
+      exit 1
+    fi
+  else
+    echo "[airframes] bash 4+ required (found ${BASH_VERSION})"
+    exit 1
+  fi
+fi
+
+# ===========================================================================
+# Section 2: Constants
+# ===========================================================================
+
+MANAGER_VERSION="1.0.0"
+CONFIG_DIR="/opt/airframes/config"
+BUILD_DIR="/tmp/airframes-build"
+LIBACARS_REPO="https://github.com/szpajder/libacars.git"
+GITHUB_REPO="airframesio/install.airframes.sh"
+GITHUB_RELEASES="https://github.com/airframesio/install.airframes.sh/releases"
+
+declare -a DECODER_LIST=(acarsdec dumpvdl2 dumphfdl vdlm2dec)
+
+declare -A DECODER_REPO=(
+  [acarsdec]="https://github.com/TLeconte/acarsdec.git"
+  [dumpvdl2]="https://github.com/szpajder/dumpvdl2.git"
+  [dumphfdl]="https://github.com/szpajder/dumphfdl.git"
+  [vdlm2dec]="https://github.com/TLeconte/vdlm2dec.git"
+)
+
+# ===========================================================================
+# Section 3: Platform detection
+# ===========================================================================
+
+OS=""
+ARCH=""
+
+detect_platform() {
+  case "$(uname -s)" in
+    Linux)  OS="linux" ;;
+    Darwin) OS="macos" ;;
+    *)      OS="unknown" ;;
+  esac
+  ARCH="$(uname -m)"
+}
+
+get_platform_target() {
+  local os_part arch_part
+  case "$OS" in
+    linux) os_part="linux" ;;
+    macos) os_part="macos" ;;
+    *)     os_part="unknown" ;;
+  esac
+  case "$ARCH" in
+    x86_64|amd64)    arch_part="amd64" ;;
+    aarch64|arm64)   arch_part="arm64" ;;
+    armv7l|armhf)    arch_part="armhf" ;;
+    *)               arch_part="$ARCH" ;;
+  esac
+  if [ "$os_part" = "macos" ]; then
+    case "$ARCH" in
+      x86_64)        arch_part="x86_64" ;;
+      arm64|aarch64) arch_part="arm64" ;;
+    esac
+  fi
+  echo "${os_part}-${arch_part}"
+}
+
+get_latest_release_tag() {
+  local decoder="$1"
+  local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases"
+  local releases
+  releases=$(curl -fsSL "$api_url" --header "Accept: application/vnd.github.v3+json" 2>/dev/null) || return 1
+  echo "$releases" | sed -n "s/.*\"tag_name\": \"\(${decoder}-v[^\"]*\)\".*/\1/p" | head -1
+}
+
+# ===========================================================================
+# Section 4: Output utilities
+# ===========================================================================
+
+if [ -t 1 ] && [ -t 0 ]; then
+  IS_TTY=true
+else
+  IS_TTY=false
+fi
+
+if [ "$IS_TTY" = true ]; then
+  BOLD="\033[1m"
+  DIM="\033[2m"
+  CYAN="\033[36m"
+  GREEN="\033[32m"
+  YELLOW="\033[33m"
+  RED="\033[31m"
+  MAGENTA="\033[35m"
+  RESET="\033[0m"
+else
+  BOLD="" DIM="" CYAN="" GREEN="" YELLOW="" RED="" MAGENTA="" RESET=""
+fi
+
+info()    { echo -e "${CYAN}[airframes]${RESET} $*"; }
+ok()      { echo -e "${GREEN}[airframes]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[airframes]${RESET} $*"; }
+err()     { echo -e "${RED}[airframes]${RESET} $*" >&2; }
+step()    { echo -e "\n${BOLD}==> $*${RESET}"; }
+
+# ===========================================================================
+# Section 5: Config file helpers (JSON without jq)
+# ===========================================================================
+
+# Read a string value from a JSON config file (simple key:"value" extraction)
+config_get() {
+  local file="$1" key="$2"
+  if [ ! -f "$file" ]; then
+    return 1
+  fi
+  # Match "key": "value" or "key": number
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}[,}].*/\1/p" "$file" | head -1
+}
+
+# List all installed decoders (those with config files)
+installed_decoders() {
+  local -a found=()
+  for d in "${DECODER_LIST[@]}"; do
+    if [ -f "${CONFIG_DIR}/${d}.json" ]; then
+      found+=("$d")
+    fi
+  done
+  echo "${found[@]}"
+}
+
+# ===========================================================================
+# Section 6: Service backend detection & management
+# ===========================================================================
+
+# Detect what service backend is managing a decoder
+service_backend() {
+  local decoder="$1"
+  local method
+  method=$(config_get "${CONFIG_DIR}/${decoder}.json" "installMethod" 2>/dev/null || echo "")
+
+  if [ "$method" = "docker" ]; then
+    echo "docker"
+    return
+  fi
+
+  if [ "$OS" = "linux" ] && [ -f "/etc/systemd/system/airframes-${decoder}.service" ]; then
+    echo "systemd"
+    return
+  fi
+
+  if [ "$OS" = "macos" ] && [ -f "$HOME/Library/LaunchAgents/io.airframes.${decoder}.plist" ]; then
+    echo "launchd"
+    return
+  fi
+
+  echo "none"
+}
+
+# Create a service for a decoder (systemd on Linux, launchd on macOS)
+create_service() {
+  local decoder="$1"
+  local config_file="${CONFIG_DIR}/${decoder}.json"
+
+  local cmd
+  cmd=$(config_get "$config_file" "runCommand" 2>/dev/null || echo "")
+  if [ -z "$cmd" ]; then
+    err "No run command found for ${decoder}. Re-run the installer."
+    return 1
+  fi
+
+  if [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+    create_systemd_service "$decoder" "$cmd"
+  elif [ "$OS" = "macos" ]; then
+    create_launchd_service "$decoder" "$cmd"
+  else
+    err "No supported service manager found on this system"
+    return 1
+  fi
+}
+
+create_systemd_service() {
+  local decoder="$1"
+  local cmd="$2"
+  local service_name="airframes-${decoder}"
+  local service_file="/etc/systemd/system/${service_name}.service"
+
+  step "Creating systemd service: ${service_name}"
+
+  sudo tee "$service_file" >/dev/null << EOF
+[Unit]
+Description=Airframes ${decoder} decoder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${cmd}
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable "$service_name"
+  ok "Service ${service_name} created"
+}
+
+create_launchd_service() {
+  local decoder="$1"
+  local cmd="$2"
+  local service_label="io.airframes.${decoder}"
+  local plist_dir="$HOME/Library/LaunchAgents"
+  local plist_file="${plist_dir}/${service_label}.plist"
+  local logfile="/tmp/airframes-${decoder}.log"
+
+  mkdir -p "$plist_dir"
+
+  step "Creating launchd service: ${service_label}"
+
+  local bin
+  bin=$(echo "$cmd" | awk '{print $1}')
+  local bin_path
+  bin_path=$(command -v "$bin" 2>/dev/null || echo "/usr/local/bin/${bin}")
+
+  local args_xml=""
+  local first=true
+  for arg in $cmd; do
+    if [ "$first" = true ]; then
+      args_xml="${args_xml}    <string>${bin_path}</string>
+"
+      first=false
+    else
+      args_xml="${args_xml}    <string>${arg}</string>
+"
+    fi
+  done
+
+  cat > "$plist_file" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${service_label}</string>
+  <key>ProgramArguments</key>
+  <array>
+${args_xml}  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${logfile}</string>
+  <key>StandardErrorPath</key>
+  <string>${logfile}</string>
+</dict>
+</plist>
+EOF
+
+  launchctl load "$plist_file" 2>&1 || true
+  ok "Service ${service_label} created and loaded"
+  info "Log file: ${logfile}"
+}
+
+# Check if a decoder is currently running
+is_running() {
+  local decoder="$1"
+  local backend
+  backend=$(service_backend "$decoder")
+
+  case "$backend" in
+    systemd)
+      systemctl is-active "airframes-${decoder}" >/dev/null 2>&1
+      ;;
+    launchd)
+      launchctl list "io.airframes.${decoder}" >/dev/null 2>&1
+      ;;
+    docker)
+      docker ps --filter "name=airframes-${decoder}" --format '{{.Names}}' 2>/dev/null | grep -q "airframes-${decoder}"
+      ;;
+    none)
+      # Check for raw process
+      pgrep -f "$(config_get "${CONFIG_DIR}/${decoder}.json" "runCommand" 2>/dev/null | awk '{print $1}')" >/dev/null 2>&1
+      ;;
+  esac
+}
+
+# Start a decoder
+do_start() {
+  local decoder="$1"
+  local backend
+  backend=$(service_backend "$decoder")
+
+  case "$backend" in
+    systemd)
+      sudo systemctl start "airframes-${decoder}"
+      ok "${decoder} started (systemd)"
+      ;;
+    launchd)
+      local plist="$HOME/Library/LaunchAgents/io.airframes.${decoder}.plist"
+      # Check if already loaded
+      if launchctl list "io.airframes.${decoder}" >/dev/null 2>&1; then
+        # Already loaded, just start
+        launchctl stop "io.airframes.${decoder}" 2>/dev/null || true
+        launchctl start "io.airframes.${decoder}"
+      else
+        # Not loaded — load it (RunAtLoad will start it)
+        launchctl load "$plist"
+      fi
+      ok "${decoder} started (launchd)"
+      ;;
+    docker)
+      local compose_dir="${CONFIG_DIR}/${decoder}"
+      if [ -f "${compose_dir}/docker-compose.yml" ]; then
+        (cd "$compose_dir" && docker compose up -d)
+        ok "${decoder} started (docker)"
+      else
+        err "Docker compose file not found for ${decoder}"
+        return 1
+      fi
+      ;;
+    none)
+      local cmd
+      cmd=$(config_get "${CONFIG_DIR}/${decoder}.json" "runCommand" 2>/dev/null || echo "")
+      if [ -z "$cmd" ]; then
+        err "No run command found for ${decoder}. Re-run the installer."
+        return 1
+      fi
+      info "No service configured for ${decoder}. Creating one now..."
+      create_service "$decoder"
+      # create_service loads the plist (RunAtLoad starts it), or enables systemd
+      local new_backend
+      new_backend=$(service_backend "$decoder")
+      if [ "$new_backend" = "systemd" ]; then
+        sudo systemctl start "airframes-${decoder}"
+      fi
+      # launchd: already started via RunAtLoad when loaded
+      ok "${decoder} started (${new_backend})"
+      ;;
+  esac
+}
+
+# Stop a decoder
+do_stop() {
+  local decoder="$1"
+  local backend
+  backend=$(service_backend "$decoder")
+
+  case "$backend" in
+    systemd)
+      sudo systemctl stop "airframes-${decoder}"
+      ok "${decoder} stopped"
+      ;;
+    launchd)
+      launchctl stop "io.airframes.${decoder}" 2>/dev/null
+      launchctl unload "$HOME/Library/LaunchAgents/io.airframes.${decoder}.plist" 2>/dev/null || true
+      ok "${decoder} stopped"
+      ;;
+    docker)
+      local compose_dir="${CONFIG_DIR}/${decoder}"
+      if [ -f "${compose_dir}/docker-compose.yml" ]; then
+        (cd "$compose_dir" && docker compose down)
+        ok "${decoder} stopped (docker)"
+      else
+        docker stop "airframes-${decoder}" 2>/dev/null || true
+        ok "${decoder} stopped (docker)"
+      fi
+      ;;
+    none)
+      local bin
+      bin=$(config_get "${CONFIG_DIR}/${decoder}.json" "runCommand" 2>/dev/null | awk '{print $1}')
+      if [ -n "$bin" ] && pkill -f "$bin" 2>/dev/null; then
+        ok "${decoder} stopped (process killed)"
+      else
+        warn "${decoder} does not appear to be running"
+      fi
+      ;;
+  esac
+}
+
+# Restart a decoder
+do_restart() {
+  local decoder="$1"
+  local backend
+  backend=$(service_backend "$decoder")
+
+  case "$backend" in
+    systemd)
+      sudo systemctl restart "airframes-${decoder}"
+      ok "${decoder} restarted"
+      ;;
+    launchd)
+      launchctl stop "io.airframes.${decoder}" 2>/dev/null || true
+      sleep 1
+      launchctl start "io.airframes.${decoder}" 2>/dev/null || \
+        launchctl load "$HOME/Library/LaunchAgents/io.airframes.${decoder}.plist"
+      ok "${decoder} restarted"
+      ;;
+    docker)
+      local compose_dir="${CONFIG_DIR}/${decoder}"
+      if [ -f "${compose_dir}/docker-compose.yml" ]; then
+        (cd "$compose_dir" && docker compose restart)
+        ok "${decoder} restarted (docker)"
+      fi
+      ;;
+    none)
+      warn "No service manager configured for ${decoder}. Cannot restart."
+      return 1
+      ;;
+  esac
+}
+
+# Show logs for a decoder
+do_logs() {
+  local decoder="$1"
+  local follow="${2:-false}"
+  local backend
+  backend=$(service_backend "$decoder")
+
+  case "$backend" in
+    systemd)
+      if [ "$follow" = true ]; then
+        sudo journalctl -u "airframes-${decoder}" -f
+      else
+        sudo journalctl -u "airframes-${decoder}" -n 50 --no-pager
+      fi
+      ;;
+    launchd)
+      local logfile="/tmp/airframes-${decoder}.log"
+      if [ -f "$logfile" ]; then
+        if [ "$follow" = true ]; then
+          tail -f "$logfile"
+        else
+          tail -50 "$logfile"
+        fi
+      else
+        warn "No log file found at ${logfile}"
+      fi
+      ;;
+    docker)
+      if [ "$follow" = true ]; then
+        docker logs -f "airframes-${decoder}"
+      else
+        docker logs --tail 50 "airframes-${decoder}"
+      fi
+      ;;
+    none)
+      warn "No service manager configured — no logs available."
+      ;;
+  esac
+}
+
+# ===========================================================================
+# Section 7: Status display
+# ===========================================================================
+
+print_status_line() {
+  local decoder="$1"
+  local config_file="${CONFIG_DIR}/${decoder}.json"
+
+  if [ ! -f "$config_file" ]; then
+    printf "  %-12s ${DIM}not installed${RESET}\n" "$decoder"
+    return
+  fi
+
+  local backend status_color status_text
+  backend=$(service_backend "$decoder")
+
+  if is_running "$decoder"; then
+    status_color="${GREEN}"
+    status_text="running"
+  else
+    status_color="${RED}"
+    status_text="stopped"
+  fi
+
+  local method host port
+  method=$(config_get "$config_file" "installMethod" 2>/dev/null || echo "?")
+  host=$(config_get "$config_file" "feedHost" 2>/dev/null || echo "?")
+  port=$(config_get "$config_file" "feedPort" 2>/dev/null || echo "?")
+
+  printf "  %-12s ${status_color}%-8s${RESET}  %-8s  %-8s  %s:%s\n" \
+    "$decoder" "$status_text" "$backend" "$method" "$host" "$port"
+}
+
+cmd_status() {
+  local target="${1:-all}"
+
+  echo
+  echo -e "  ${BOLD}Airframes Decoder Status${RESET}"
+  printf "  ${DIM}%-12s %-8s  %-8s  %-8s  %s${RESET}\n" "DECODER" "STATUS" "SERVICE" "METHOD" "FEED"
+  echo
+
+  if [ "$target" = "all" ]; then
+    for d in "${DECODER_LIST[@]}"; do
+      print_status_line "$d"
+    done
+  else
+    print_status_line "$target"
+  fi
+  echo
+}
+
+# ===========================================================================
+# Section 8: Update decoder
+# ===========================================================================
+
+cmd_update() {
+  local decoder="$1"
+  local config_file="${CONFIG_DIR}/${decoder}.json"
+
+  if [ ! -f "$config_file" ]; then
+    err "${decoder} is not installed"
+    return 1
+  fi
+
+  local method
+  method=$(config_get "$config_file" "installMethod" 2>/dev/null || echo "binary")
+
+  if [ "$method" = "docker" ]; then
+    step "Updating ${decoder} (docker pull)"
+    local image="ghcr.io/airframes/${decoder}:latest"
+    docker pull "$image"
+    do_restart "$decoder"
+    ok "${decoder} updated"
+    return
+  fi
+
+  local was_running=false
+  if is_running "$decoder"; then
+    was_running=true
+    info "Stopping ${decoder} for update..."
+    do_stop "$decoder"
+  fi
+
+  # Try binary update first
+  if update_from_binary "$decoder"; then
+    if [ "$was_running" = true ]; then
+      info "Restarting ${decoder}..."
+      do_start "$decoder"
+    fi
+    return
+  fi
+
+  # Fall back to source rebuild
+  info "Falling back to source rebuild..."
+  update_from_source "$decoder"
+
+  if [ "$was_running" = true ]; then
+    info "Restarting ${decoder}..."
+    do_start "$decoder"
+  fi
+}
+
+update_from_binary() {
+  local decoder="$1"
+  local target
+  target=$(get_platform_target)
+
+  step "Checking for pre-built ${decoder} binary (${target})"
+
+  local tag
+  tag=$(get_latest_release_tag "$decoder")
+  if [ -z "$tag" ]; then
+    warn "No pre-built binary available"
+    return 1
+  fi
+
+  local version="${tag#${decoder}-v}"
+  local url="${GITHUB_RELEASES}/download/${tag}/${decoder}-${target}.tar.gz"
+
+  step "Downloading ${decoder} v${version}"
+  info "${url}"
+
+  local tmpdir
+  tmpdir=$(mktemp -d)
+
+  if ! curl -fsSL "$url" -o "${tmpdir}/${decoder}.tar.gz" 2>/dev/null; then
+    warn "Download failed"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  tar xzf "${tmpdir}/${decoder}.tar.gz" -C "$tmpdir"
+
+  if [ -f "${tmpdir}/bin/${decoder}" ]; then
+    sudo install -m 0755 "${tmpdir}/bin/${decoder}" "/usr/local/bin/${decoder}"
+  else
+    warn "Binary not found in archive"
+    rm -rf "$tmpdir"
+    return 1
+  fi
+
+  if [ -d "${tmpdir}/lib" ]; then
+    sudo cp -a "${tmpdir}/lib/"* /usr/local/lib/
+  fi
+
+  if [ "$OS" = "linux" ]; then
+    sudo ldconfig
+  fi
+
+  rm -rf "$tmpdir"
+  ok "${decoder} updated to v${version} (pre-built binary)"
+}
+
+update_from_source() {
+  local decoder="$1"
+
+  mkdir -p "$BUILD_DIR"
+  cd "$BUILD_DIR"
+
+  step "Rebuilding libacars"
+  rm -rf libacars
+  git clone --depth 1 "$LIBACARS_REPO"
+  cd libacars
+  mkdir build && cd build
+  # shellcheck disable=SC2086
+  cmake $(platform_cmake_flags) ..
+  make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+  sudo make install
+  if [ "$OS" = "linux" ]; then
+    sudo ldconfig
+  elif [ "$OS" = "macos" ]; then
+    fix_macos_dylib_paths
+  fi
+
+  step "Rebuilding ${decoder}"
+  cd "$BUILD_DIR"
+  rm -rf "$decoder"
+  local repo="${DECODER_REPO[$decoder]}"
+  git clone --depth 1 "$repo" "$decoder"
+  cd "$decoder"
+
+  if [ "$OS" = "macos" ]; then
+    patch_macos_sources "$decoder"
+  fi
+
+  mkdir -p build && cd build
+  # shellcheck disable=SC2086
+  cmake $(platform_cmake_flags) ..
+  make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+  sudo make install
+
+  if [ "$OS" = "macos" ]; then
+    fix_macos_binary_rpaths "$decoder"
+  fi
+
+  ok "${decoder} updated from source"
+}
+
+# Fix libacars dylib install name on macOS (@rpath -> absolute path)
+fix_macos_dylib_paths() {
+  for dylib in /usr/local/lib/libacars-2*.dylib; do
+    if [ -f "$dylib" ] && [ ! -L "$dylib" ]; then
+      local current_id
+      current_id=$(otool -D "$dylib" | tail -1)
+      if [[ "$current_id" == @rpath/* ]]; then
+        info "Fixing install name: ${dylib}"
+        sudo install_name_tool -id "$dylib" "$dylib"
+      fi
+    fi
+  done
+}
+
+# Fix @rpath references in decoder binaries on macOS
+fix_macos_binary_rpaths() {
+  local decoder="$1"
+  local bin_path
+  bin_path=$(command -v "$decoder" 2>/dev/null || echo "/usr/local/bin/${decoder}")
+  [ -f "$bin_path" ] || return
+
+  local prefix
+  prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+
+  local deps
+  deps=$(otool -L "$bin_path" | grep '@rpath/' | awk '{print $1}')
+  for dep in $deps; do
+    local libname="${dep#@rpath/}"
+    local resolved=""
+    for dir in /usr/local/lib "${prefix}/lib"; do
+      if [ -f "${dir}/${libname}" ]; then
+        resolved="${dir}/${libname}"
+        break
+      fi
+    done
+    if [ -n "$resolved" ]; then
+      info "Fixing ${decoder}: ${dep} -> ${resolved}"
+      sudo install_name_tool -change "$dep" "$resolved" "$bin_path"
+    fi
+  done
+
+  for rpath in /usr/local/lib "${prefix}/lib"; do
+    if ! otool -l "$bin_path" | grep -A2 LC_RPATH | grep -q "$rpath"; then
+      sudo install_name_tool -add_rpath "$rpath" "$bin_path" 2>/dev/null || true
+    fi
+  done
+}
+
+# Platform cmake flags (mirrors installer)
+platform_cmake_flags() {
+  local flags="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+  if [ "$OS" = "macos" ]; then
+    local prefix
+    prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+    flags="${flags} -DCMAKE_PREFIX_PATH=${prefix}"
+    flags="${flags} -DCMAKE_C_FLAGS=-DHOST_NAME_MAX=255"
+    flags="${flags} -DCMAKE_INCLUDE_PATH=${prefix}/include"
+    flags="${flags} -DCMAKE_LIBRARY_PATH=${prefix}/lib"
+    flags="${flags} -DCMAKE_INSTALL_RPATH=/usr/local/lib;${prefix}/lib"
+    flags="${flags} -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
+    flags="${flags} -DCMAKE_MACOSX_RPATH=ON"
+    flags="${flags} -DCMAKE_INSTALL_NAME_DIR=/usr/local/lib"
+    export C_INCLUDE_PATH="${prefix}/include${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}"
+    export LIBRARY_PATH="${prefix}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+    export PKG_CONFIG_PATH="${prefix}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  fi
+  echo "$flags"
+}
+
+# macOS source patches (mirrors installer)
+patch_macos_sources() {
+  local decoder="$1"
+  case "$decoder" in
+    acarsdec)
+      for src in rtl.c soapy.c; do
+        if [ -f "$src" ]; then
+          sed -i.bak 's/pthread_tryjoin_np/pthread_join/g' "$src"
+          rm -f "${src}.bak"
+        fi
+      done
+      ;;
+    vdlm2dec)
+      create_pthread_barrier_polyfill
+      sed -i.bak '/#include <pthread.h>/a\
+#ifndef PTHREAD_BARRIER_SERIAL_THREAD\
+#include "pthread_barrier.h"\
+#endif' vdlm2.h
+      rm -f vdlm2.h.bak
+      sed -i.bak 's/add_executable(vdlm2dec /add_executable(vdlm2dec pthread_barrier.c /' CMakeLists.txt
+      rm -f CMakeLists.txt.bak
+      ;;
+  esac
+}
+
+create_pthread_barrier_polyfill() {
+  cat > pthread_barrier.h << 'POLYFILL_H'
+#ifndef _PTHREAD_BARRIER_H
+#define _PTHREAD_BARRIER_H
+
+#include <pthread.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#if !defined(PTHREAD_BARRIER_SERIAL_THREAD)
+#define PTHREAD_BARRIER_SERIAL_THREAD (1)
+#endif
+
+	typedef struct {
+	} pthread_barrierattr_t;
+
+	typedef struct {
+		pthread_mutex_t mutex;
+		pthread_cond_t cond;
+		unsigned int limit;
+		unsigned int count;
+		unsigned int phase;
+	} pthread_barrier_t;
+
+	int pthread_barrier_init(pthread_barrier_t *restrict barrier,
+			const pthread_barrierattr_t *restrict attr, unsigned int count);
+
+	int pthread_barrier_wait(pthread_barrier_t *barrier);
+
+#ifdef  __cplusplus
+}
+#endif
+
+#endif /* !_PTHREAD_BARRIER_H */
+POLYFILL_H
+
+  cat > pthread_barrier.c << 'POLYFILL_C'
+#include "pthread_barrier.h"
+#include <errno.h>
+
+#define __unused __attribute__((unused))
+
+int pthread_barrier_init(pthread_barrier_t *restrict barrier,
+		const pthread_barrierattr_t *restrict attr __unused, unsigned count) {
+	if (count == 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (pthread_mutex_init(&barrier->mutex, 0) < 0) {
+		return -1;
+	}
+	if (pthread_cond_init(&barrier->cond, 0) < 0) {
+		int errno_save = errno;
+		pthread_mutex_destroy(&barrier->mutex);
+		errno = errno_save;
+		return -1;
+	}
+	barrier->limit = count;
+	barrier->count = 0;
+	barrier->phase = 0;
+	return 0;
+}
+
+int pthread_barrier_wait(pthread_barrier_t *barrier) {
+	pthread_mutex_lock(&barrier->mutex);
+	barrier->count++;
+	if (barrier->count >= barrier->limit) {
+		barrier->phase++;
+		barrier->count = 0;
+		pthread_cond_broadcast(&barrier->cond);
+		pthread_mutex_unlock(&barrier->mutex);
+		return PTHREAD_BARRIER_SERIAL_THREAD;
+	} else {
+		unsigned phase = barrier->phase;
+		do
+			pthread_cond_wait(&barrier->cond, &barrier->mutex);
+		while (phase == barrier->phase);
+		pthread_mutex_unlock(&barrier->mutex);
+		return 0;
+	}
+}
+POLYFILL_C
+}
+
+# ===========================================================================
+# Section 9: Config display / edit
+# ===========================================================================
+
+cmd_config() {
+  local decoder="$1"
+  local action="${2:-show}"
+  local config_file="${CONFIG_DIR}/${decoder}.json"
+
+  if [ ! -f "$config_file" ]; then
+    err "${decoder} is not installed (no config file)"
+    return 1
+  fi
+
+  case "$action" in
+    show)
+      echo
+      echo -e "  ${BOLD}Configuration: ${decoder}${RESET}"
+      echo
+      cat "$config_file"
+      echo
+      ;;
+    edit)
+      local editor="${EDITOR:-vi}"
+      sudo "$editor" "$config_file"
+      ok "Config updated. Restart ${decoder} to apply changes."
+      ;;
+    *)
+      err "Unknown config action: ${action}. Use 'show' or 'edit'."
+      return 1
+      ;;
+  esac
+}
+
+# ===========================================================================
+# Section 10: TUI dashboard
+# ===========================================================================
+
+HAS_GUM=false
+
+check_gum() {
+  if command -v gum >/dev/null 2>&1; then
+    HAS_GUM=true
+  fi
+}
+
+tui_dashboard() {
+  check_gum
+
+  if [ "$HAS_GUM" != true ]; then
+    # Fallback: just show status
+    cmd_status all
+    echo -e "  ${DIM}Install gum for interactive TUI: https://github.com/charmbracelet/gum${RESET}"
+    echo
+    return
+  fi
+
+  while true; do
+    clear
+    echo -e "${CYAN}"
+    cat << 'BANNER'
+
+     ___   _       __
+    /   | (_)____  / __/________ _____ ___  ___  _____
+   / /| |/ / ___/ / /_/ ___/ __ `/ __ `__ \/ _ \/ ___/
+  / ___ / / /    / __/ /  / /_/ / / / / / /  __(__  )
+ /_/  |_/_/_/   /_/ /_/   \__,_/_/ /_/ /_/\___/____/
+
+BANNER
+    echo -e "${RESET}"
+    echo -e "  ${BOLD}Airframes Manager${RESET} v${MANAGER_VERSION}"
+    echo
+
+    # Status table
+    printf "  ${DIM}%-12s %-8s  %-8s  %-8s  %s${RESET}\n" "DECODER" "STATUS" "SERVICE" "METHOD" "FEED"
+    echo
+    for d in "${DECODER_LIST[@]}"; do
+      print_status_line "$d"
+    done
+    echo
+
+    # Action menu
+    local -a actions=(
+      "Start decoder"
+      "Stop decoder"
+      "Restart decoder"
+      "View logs"
+      "Enable service"
+      "Update decoder"
+      "View config"
+      "Refresh"
+      "Quit"
+    )
+
+    local choice
+    choice=$(gum choose --header "Select action:" "${actions[@]}") || break
+
+    case "$choice" in
+      "Start decoder")
+        local target
+        target=$(tui_pick_decoder) || continue
+        do_start "$target"
+        tui_pause
+        ;;
+      "Stop decoder")
+        local target
+        target=$(tui_pick_decoder) || continue
+        do_stop "$target"
+        tui_pause
+        ;;
+      "Restart decoder")
+        local target
+        target=$(tui_pick_decoder) || continue
+        do_restart "$target"
+        tui_pause
+        ;;
+      "View logs")
+        local target
+        target=$(tui_pick_decoder) || continue
+        do_logs "$target" false
+        tui_pause
+        ;;
+      "Enable service")
+        local target
+        target=$(tui_pick_decoder) || continue
+        for_each_decoder "$target" create_service
+        tui_pause
+        ;;
+      "Update decoder")
+        local target
+        target=$(tui_pick_decoder) || continue
+        cmd_update "$target"
+        tui_pause
+        ;;
+      "View config")
+        local target
+        target=$(tui_pick_decoder) || continue
+        cmd_config "$target" show
+        tui_pause
+        ;;
+      "Refresh")
+        continue
+        ;;
+      "Quit")
+        break
+        ;;
+    esac
+  done
+}
+
+tui_pick_decoder() {
+  local -a installed=()
+  for d in "${DECODER_LIST[@]}"; do
+    if [ -f "${CONFIG_DIR}/${d}.json" ]; then
+      installed+=("$d")
+    fi
+  done
+  installed+=("all")
+
+  if [ ${#installed[@]} -le 1 ]; then
+    warn "No decoders installed"
+    return 1
+  fi
+
+  gum choose --header "Select decoder:" "${installed[@]}"
+}
+
+tui_pause() {
+  echo
+  echo -e "  ${DIM}Press enter to continue...${RESET}"
+  read -r
+}
+
+# ===========================================================================
+# Section 11: Usage / help
+# ===========================================================================
+
+usage() {
+  cat << EOF
+Airframes Manager v${MANAGER_VERSION}
+
+Usage: airframes [COMMAND] [ARGS...]
+
+Commands:
+  status [decoder|all]         Show decoder status (default: all)
+  start <decoder|all>          Start decoder(s) (creates service if needed)
+  stop <decoder|all>           Stop decoder(s)
+  restart <decoder|all>        Restart decoder(s)
+  logs <decoder> [-f]          View decoder logs (-f to follow)
+  update <decoder|all>         Update decoder(s) (binary or source)
+  config <decoder> [show|edit] View or edit decoder config
+  enable <decoder|all>         Create service for decoder(s)
+  version                      Show version info
+
+  (no command)                Launch interactive TUI dashboard
+
+Decoders: acarsdec, dumpvdl2, dumphfdl, vdlm2dec
+
+Examples:
+  airframes                        # Interactive dashboard
+  airframes status                 # Status of all decoders
+  airframes start dumpvdl2         # Start dumpvdl2
+  airframes stop all               # Stop all decoders
+  airframes logs acarsdec -f       # Follow acarsdec logs
+  airframes update dumphfdl        # Rebuild dumphfdl from source
+  airframes config dumpvdl2 edit   # Edit dumpvdl2 config
+EOF
+}
+
+# ===========================================================================
+# Section 12: Argument parsing & dispatch
+# ===========================================================================
+
+validate_decoder() {
+  local decoder="$1"
+  for d in "${DECODER_LIST[@]}"; do
+    if [ "$d" = "$decoder" ]; then
+      return 0
+    fi
+  done
+  if [ "$decoder" = "all" ]; then
+    return 0
+  fi
+  err "Unknown decoder: ${decoder}"
+  err "Valid decoders: ${DECODER_LIST[*]}"
+  return 1
+}
+
+# Run a command for one or all decoders
+for_each_decoder() {
+  local target="$1"
+  local func="$2"
+  shift 2
+
+  if [ "$target" = "all" ]; then
+    local decoders
+    decoders=$(installed_decoders)
+    if [ -z "$decoders" ]; then
+      warn "No decoders installed"
+      return 1
+    fi
+    for d in $decoders; do
+      "$func" "$d" "$@"
+    done
+  else
+    "$func" "$target" "$@"
+  fi
+}
+
+main() {
+  detect_platform
+
+  local command="${1:-}"
+
+  # No args: TUI dashboard
+  if [ -z "$command" ]; then
+    if [ "$IS_TTY" = true ]; then
+      tui_dashboard
+    else
+      cmd_status all
+    fi
+    exit 0
+  fi
+
+  shift
+
+  case "$command" in
+    status)
+      local target="${1:-all}"
+      validate_decoder "$target" || exit 1
+      cmd_status "$target"
+      ;;
+    start)
+      local target="${1:?Usage: airframes start <decoder|all>}"
+      validate_decoder "$target" || exit 1
+      for_each_decoder "$target" do_start
+      ;;
+    stop)
+      local target="${1:?Usage: airframes stop <decoder|all>}"
+      validate_decoder "$target" || exit 1
+      for_each_decoder "$target" do_stop
+      ;;
+    restart)
+      local target="${1:?Usage: airframes restart <decoder|all>}"
+      validate_decoder "$target" || exit 1
+      for_each_decoder "$target" do_restart
+      ;;
+    logs)
+      local target="${1:?Usage: airframes logs <decoder> [-f]}"
+      validate_decoder "$target" || exit 1
+      local follow=false
+      if [ "${2:-}" = "-f" ] || [ "${2:-}" = "--follow" ]; then
+        follow=true
+      fi
+      do_logs "$target" "$follow"
+      ;;
+    update)
+      local target="${1:?Usage: airframes update <decoder|all>}"
+      validate_decoder "$target" || exit 1
+      for_each_decoder "$target" cmd_update
+      ;;
+    config)
+      local target="${1:?Usage: airframes config <decoder> [show|edit]}"
+      validate_decoder "$target" || exit 1
+      cmd_config "$target" "${2:-show}"
+      ;;
+    enable)
+      local target="${1:?Usage: airframes enable <decoder|all>}"
+      validate_decoder "$target" || exit 1
+      for_each_decoder "$target" create_service
+      ;;
+    version|--version|-v)
+      echo "Airframes Manager v${MANAGER_VERSION}"
+      ;;
+    help|--help|-h)
+      usage
+      ;;
+    # Support "airframes client <action> <decoder>" form
+    client)
+      local action="${1:-}"
+      local target="${2:-}"
+      case "$action" in
+        start|stop|restart|status|update|logs|config|enable)
+          # Re-dispatch
+          main "$action" "$target" "${@:3}"
+          ;;
+        *)
+          err "Unknown client action: ${action}"
+          usage
+          exit 1
+          ;;
+      esac
+      ;;
+    *)
+      err "Unknown command: ${command}"
+      echo
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

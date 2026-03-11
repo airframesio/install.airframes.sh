@@ -1,0 +1,389 @@
+name: Build Decoders
+
+on:
+  push:
+    branches: [main]
+    paths: ['build-config.json']
+  workflow_dispatch:
+    inputs:
+      decoder:
+        description: 'Decoder to build'
+        type: choice
+        options: [all, acarsdec, dumpvdl2, dumphfdl, vdlm2dec]
+        default: all
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      decoders: ${{ steps.matrix.outputs.decoders }}
+      libacars_ref: ${{ steps.config.outputs.libacars_ref }}
+      config_json: ${{ steps.config.outputs.config_json }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse build config
+        id: config
+        run: |
+          echo "libacars_ref=$(python3 -c "import json; print(json.load(open('build-config.json'))['libacars']['ref'])")" >> "$GITHUB_OUTPUT"
+          echo "config_json=$(python3 -c "import json; print(json.dumps(json.load(open('build-config.json'))))")" >> "$GITHUB_OUTPUT"
+
+      - name: Set decoder matrix
+        id: matrix
+        env:
+          DECODER_INPUT: ${{ inputs.decoder }}
+        run: |
+          if [ -z "$DECODER_INPUT" ] || [ "$DECODER_INPUT" = "all" ]; then
+            echo 'decoders=["acarsdec","dumpvdl2","dumphfdl","vdlm2dec"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "decoders=[\"$DECODER_INPUT\"]" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        decoder: ${{ fromJson(needs.prepare.outputs.decoders) }}
+        target:
+          - platform: linux-amd64
+            os: ubuntu-22.04
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+          - platform: macos-x86_64
+            os: macos-13
+          - platform: macos-arm64
+            os: macos-14
+    runs-on: ${{ matrix.target.os }}
+    env:
+      STAGING: /tmp/decoder-staging
+      LIBACARS_REF: ${{ needs.prepare.outputs.libacars_ref }}
+      BUILD_CONFIG: ${{ needs.prepare.outputs.config_json }}
+      DECODER: ${{ matrix.decoder }}
+      PLATFORM: ${{ matrix.target.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read decoder config
+        id: cfg
+        run: |
+          python3 - "$BUILD_CONFIG" "$DECODER" << 'PYEOF'
+          import sys, json, os
+          config = json.loads(sys.argv[1])
+          decoder = sys.argv[2]
+          d = config["decoders"][decoder]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"repo={d['repo']}\n")
+              f.write(f"ref={d['ref']}\n")
+              f.write(f"version={d['version']}\n")
+              f.write(f"previous_ref={d.get('previous_ref','')}\n")
+          PYEOF
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git pkg-config \
+            librtlsdr-dev libusb-1.0-0-dev libglib2.0-dev libzmq3-dev \
+            libsqlite3-dev libxml2-dev zlib1g-dev libsoapysdr-dev \
+            libsndfile-dev libconfig++-dev libfftw3-dev
+
+          # liquid-dsp needed for dumphfdl, may not be in apt
+          if [ "$DECODER" = "dumphfdl" ]; then
+            if ! dpkg -s libliquid-dev >/dev/null 2>&1; then
+              git clone --depth 1 https://github.com/jgaeddert/liquid-dsp.git /tmp/liquid-dsp
+              cd /tmp/liquid-dsp
+              ./bootstrap.sh && ./configure --prefix=/usr && make -j"$(nproc)" && sudo make install
+              sudo ldconfig
+            fi
+          fi
+
+          # libmirisdr-dev conflicts with dumpvdl2/dumphfdl builds
+          sudo apt-get remove -y libmirisdr-dev 2>/dev/null || true
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake pkg-config librtlsdr libusb glib zeromq \
+            sqlite libxml2 soapysdr libsndfile libconfig liquid-dsp fftw
+
+      - name: Build libacars
+        run: |
+          mkdir -p "$STAGING"
+          git clone --depth 1 --branch "$LIBACARS_REF" \
+            https://github.com/szpajder/libacars.git /tmp/libacars
+          cd /tmp/libacars && mkdir build && cd build
+
+          CMAKE_FLAGS="-DCMAKE_INSTALL_PREFIX=$STAGING"
+          CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            PREFIX="$(brew --prefix)"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$PREFIX"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_NAME_DIR=/usr/local/lib"
+          fi
+
+          # shellcheck disable=SC2086
+          cmake .. $CMAKE_FLAGS
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          make install
+
+      - name: Clone decoder source
+        env:
+          UPSTREAM_REPO: ${{ steps.cfg.outputs.repo }}
+          UPSTREAM_REF: ${{ steps.cfg.outputs.ref }}
+        run: |
+          git clone --depth 1 --branch "$UPSTREAM_REF" \
+            "https://github.com/${UPSTREAM_REPO}.git" "/tmp/${DECODER}" 2>/dev/null || \
+          git clone --depth 1 \
+            "https://github.com/${UPSTREAM_REPO}.git" "/tmp/${DECODER}"
+
+      - name: Apply macOS patches
+        if: runner.os == 'macOS'
+        run: |
+          cd "/tmp/${DECODER}"
+          case "$DECODER" in
+            acarsdec)
+              for src in rtl.c soapy.c; do
+                if [ -f "$src" ]; then
+                  sed -i.bak 's/pthread_tryjoin_np/pthread_join/g' "$src"
+                  rm -f "${src}.bak"
+                fi
+              done
+              ;;
+            vdlm2dec)
+              cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.h" .
+              cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.c" .
+              sed -i.bak '/#include <pthread.h>/a\
+          #ifndef PTHREAD_BARRIER_SERIAL_THREAD\
+          #include "pthread_barrier.h"\
+          #endif' vdlm2.h
+              rm -f vdlm2.h.bak
+              sed -i.bak 's/add_executable(vdlm2dec /add_executable(vdlm2dec pthread_barrier.c /' CMakeLists.txt
+              rm -f CMakeLists.txt.bak
+              ;;
+          esac
+
+      - name: Build decoder
+        run: |
+          cd "/tmp/${DECODER}"
+          mkdir -p build && cd build
+
+          CMAKE_FLAGS="-DCMAKE_INSTALL_PREFIX=$STAGING"
+          CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            PREFIX="$(brew --prefix)"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$STAGING;$PREFIX"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_C_FLAGS=-DHOST_NAME_MAX=255"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INCLUDE_PATH=$STAGING/include;$PREFIX/include"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_LIBRARY_PATH=$STAGING/lib;$PREFIX/lib"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_RPATH=/usr/local/lib;$PREFIX/lib"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_NAME_DIR=/usr/local/lib"
+            export C_INCLUDE_PATH="$STAGING/include:$PREFIX/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+            export LIBRARY_PATH="$STAGING/lib:$PREFIX/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+            export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:$PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          else
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$STAGING"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_RPATH=/usr/local/lib"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
+            export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            export LD_LIBRARY_PATH="$STAGING/lib:${LD_LIBRARY_PATH:-}"
+          fi
+
+          # shellcheck disable=SC2086
+          cmake .. $CMAKE_FLAGS
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          make install
+
+      - name: Fix macOS dylib paths
+        if: runner.os == 'macOS'
+        run: |
+          # Fix libacars install name from @rpath to absolute
+          for dylib in "$STAGING"/lib/libacars-2*.dylib; do
+            if [ -f "$dylib" ] && [ ! -L "$dylib" ]; then
+              CURRENT=$(otool -D "$dylib" | tail -1)
+              if [[ "$CURRENT" == @rpath/* ]]; then
+                install_name_tool -id "/usr/local/lib/$(basename "$dylib")" "$dylib"
+              fi
+            fi
+          done
+
+          # Fix @rpath references in the decoder binary
+          BIN="$STAGING/bin/$DECODER"
+          if [ -f "$BIN" ]; then
+            otool -L "$BIN" | grep '@rpath/' | awk '{print $1}' | while read -r dep; do
+              LIBNAME="${dep#@rpath/}"
+              for DIR in "$STAGING/lib" /usr/local/lib "$(brew --prefix)/lib"; do
+                if [ -f "$DIR/$LIBNAME" ]; then
+                  install_name_tool -change "$dep" "/usr/local/lib/$LIBNAME" "$BIN"
+                  break
+                fi
+              done
+            done
+
+            for RPATH in /usr/local/lib "$(brew --prefix)/lib"; do
+              install_name_tool -add_rpath "$RPATH" "$BIN" 2>/dev/null || true
+            done
+          fi
+
+      - name: Package binary
+        run: |
+          ARTIFACT="${DECODER}-${PLATFORM}"
+
+          mkdir -p /tmp/package/bin /tmp/package/lib
+          cp "$STAGING/bin/$DECODER" /tmp/package/bin/
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            for f in "$STAGING"/lib/libacars-2*.dylib; do
+              [ -e "$f" ] && cp -a "$f" /tmp/package/lib/
+            done
+          else
+            for f in "$STAGING"/lib/libacars-2.so*; do
+              [ -e "$f" ] && cp -a "$f" /tmp/package/lib/
+            done
+          fi
+
+          cd /tmp/package
+          tar czf "/tmp/${ARTIFACT}.tar.gz" bin lib
+
+          echo "## Package contents"
+          ls -laR /tmp/package/
+          echo "## Archive size"
+          ls -lh "/tmp/${ARTIFACT}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.decoder }}-${{ matrix.target.platform }}
+          path: /tmp/${{ matrix.decoder }}-${{ matrix.target.platform }}.tar.gz
+          retention-days: 7
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        decoder: ${{ fromJson(needs.prepare.outputs.decoders) }}
+    env:
+      DECODER: ${{ matrix.decoder }}
+      BUILD_CONFIG: ${{ needs.prepare.outputs.config_json }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read decoder config
+        id: cfg
+        run: |
+          python3 - "$BUILD_CONFIG" "$DECODER" << 'PYEOF'
+          import sys, json, os
+          config = json.loads(sys.argv[1])
+          decoder = sys.argv[2]
+          d = config["decoders"][decoder]
+          la = config["libacars"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={d['version']}\n")
+              f.write(f"repo={d['repo']}\n")
+              f.write(f"ref={d['ref']}\n")
+              f.write(f"previous_ref={d.get('previous_ref','')}\n")
+              f.write(f"libacars_ref={la['ref']}\n")
+              f.write(f"tag={decoder}-v{d['version']}\n")
+          PYEOF
+
+      - name: Download all artifacts for this decoder
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ matrix.decoder }}-*
+          path: /tmp/artifacts
+          merge-multiple: false
+
+      - name: Collect release assets
+        run: |
+          mkdir -p /tmp/release-assets
+          find /tmp/artifacts -name "*.tar.gz" -exec cp {} /tmp/release-assets/ \;
+          echo "Release assets:"
+          ls -lh /tmp/release-assets/
+
+      - name: Generate release notes
+        env:
+          VERSION: ${{ steps.cfg.outputs.version }}
+          UPSTREAM_REPO: ${{ steps.cfg.outputs.repo }}
+          UPSTREAM_REF: ${{ steps.cfg.outputs.ref }}
+          PREV_REF: ${{ steps.cfg.outputs.previous_ref }}
+          LIBACARS_REF: ${{ steps.cfg.outputs.libacars_ref }}
+        run: |
+          # Fetch upstream commits if previous ref is known
+          CHANGES=""
+          COMPARE_LINK=""
+          if [ -n "$PREV_REF" ]; then
+            COMPARE_LINK="https://github.com/${UPSTREAM_REPO}/compare/${PREV_REF}...${UPSTREAM_REF}"
+            git clone --bare "https://github.com/${UPSTREAM_REPO}.git" /tmp/upstream 2>/dev/null || true
+            if [ -d /tmp/upstream ]; then
+              CHANGES=$(git -C /tmp/upstream log --oneline "${PREV_REF}..${UPSTREAM_REF}" 2>/dev/null | head -30) || true
+            fi
+          fi
+
+          {
+            echo "## ${DECODER} v${VERSION}"
+            echo ""
+            echo "Built from [${UPSTREAM_REPO}@\`${UPSTREAM_REF}\`](https://github.com/${UPSTREAM_REPO}/tree/${UPSTREAM_REF}) with libacars ${LIBACARS_REF}."
+            echo ""
+
+            if [ -n "$CHANGES" ]; then
+              echo "### Upstream Changes"
+              echo ""
+              echo '```'
+              echo "$CHANGES"
+              echo '```'
+              echo ""
+              echo "[Full diff](${COMPARE_LINK})"
+              echo ""
+            elif [ -n "$PREV_REF" ]; then
+              echo "### Changes"
+              echo ""
+              echo "[Compare upstream changes](${COMPARE_LINK})"
+              echo ""
+            fi
+
+            echo "### Installation"
+            echo ""
+            echo '```bash'
+            echo "bash <(curl -sSL https://install.airframes.sh/installer) ${DECODER}"
+            echo '```'
+            echo ""
+            echo "Or download the binary for your platform below and extract to \`/usr/local/\`."
+            echo ""
+            echo "### Platforms"
+            echo ""
+            echo "| Platform | Architecture | File |"
+            echo "|----------|-------------|------|"
+            echo "| Linux | AMD64 (x86_64) | \`${DECODER}-linux-amd64.tar.gz\` |"
+            echo "| Linux | ARM64 (aarch64) | \`${DECODER}-linux-arm64.tar.gz\` |"
+            echo "| macOS | Intel (x86_64) | \`${DECODER}-macos-x86_64.tar.gz\` |"
+            echo "| macOS | Apple Silicon (ARM64) | \`${DECODER}-macos-arm64.tar.gz\` |"
+            echo ""
+            echo "### Build Info"
+            echo ""
+            echo "- **Source**: [${UPSTREAM_REPO}@\`${UPSTREAM_REF}\`](https://github.com/${UPSTREAM_REPO}/tree/${UPSTREAM_REF})"
+            echo "- **libacars**: ${LIBACARS_REF}"
+            echo "- **Built**: $(date -u +%Y-%m-%d)"
+          } > /tmp/release-body.md
+
+      - name: Create release
+        env:
+          TAG: ${{ steps.cfg.outputs.tag }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          # Remove existing release with same tag if present
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git push origin --delete "refs/tags/$TAG" 2>/dev/null || true
+
+          gh release create "$TAG" \
+            --title "${DECODER} v${VERSION}" \
+            --notes-file /tmp/release-body.md \
+            /tmp/release-assets/*.tar.gz
