@@ -90,12 +90,9 @@ jobs:
             mingw-w64-x86_64-libsndfile
             mingw-w64-x86_64-libconfig
             mingw-w64-x86_64-fftw
-            make
+            mingw-w64-x86_64-make
             git
             python3
-            autoconf
-            automake
-            libtool
 
       - name: Read decoder config
         id: cfg
@@ -149,9 +146,13 @@ jobs:
             cd /tmp/liquid-dsp
             git checkout v1.6.0
             ./bootstrap.sh
-            ./configure --prefix=/mingw64
-            make -j"$(nproc)"
-            make install
+            # Use MinGW-specific makefile (autotools configure fails on MinGW)
+            mingw32-make -f makefile.mingw64 -j"$(nproc)"
+            cp -v libliquid.dll /mingw64/bin/
+            cp -v libliquid.a /mingw64/lib/
+            cp -v libliquid.dll.a /mingw64/lib/ 2>/dev/null || true
+            mkdir -p /mingw64/include/liquid
+            cp -v include/liquid/liquid.h /mingw64/include/liquid/
           fi
 
       - name: Build libacars
@@ -172,10 +173,13 @@ jobs:
             export CMAKE_GENERATOR="MinGW Makefiles"
           fi
 
+          MAKE_CMD="make"
+          [ "$RUNNER_OS" = "Windows" ] && MAKE_CMD="mingw32-make"
+
           # shellcheck disable=SC2086
           cmake .. $CMAKE_FLAGS
-          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
-          make install
+          $MAKE_CMD -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
+          $MAKE_CMD install
 
       - name: Clone decoder source
         env:
@@ -287,10 +291,13 @@ jobs:
               ;;
           esac
 
+          MAKE_CMD="make"
+          [ "$RUNNER_OS" = "Windows" ] && MAKE_CMD="mingw32-make"
+
           # shellcheck disable=SC2086
           cmake .. $CMAKE_FLAGS
-          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
-          make install
+          $MAKE_CMD -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
+          $MAKE_CMD install
 
       - name: Fix macOS dylib paths
         if: runner.os == 'macOS'
