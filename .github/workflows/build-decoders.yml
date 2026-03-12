@@ -150,11 +150,13 @@ jobs:
           git clone --depth 1 https://github.com/steve-m/librtlsdr.git /tmp/librtlsdr
           cd /tmp/librtlsdr && mkdir build && cd build
           cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DINSTALL_UDEV_RULES=OFF
-          # CLI tools may fail to link on MSYS; we only need the library
-          make -j"$NPROC" || true
-          make install || true
-          # Verify the library was built
-          ls /usr/lib/librtlsdr* /usr/include/rtl-sdr.h
+          # Build only library targets (CLI tools fail to link on MSYS)
+          make -j"$NPROC" rtlsdr rtlsdr_static
+          # Manually install library files
+          cp src/librtlsdr.* /usr/lib/
+          cp src/librtlsdr.a /usr/lib/ 2>/dev/null || true
+          cp ../include/rtl-sdr.h ../include/rtl-sdr_export.h /usr/include/
+          cp rtlsdr.pc /usr/lib/pkgconfig/ 2>/dev/null || true
 
           # Build zeromq from source (needed by dumpvdl2/dumphfdl)
           if [ "$DECODER" = "dumpvdl2" ] || [ "$DECODER" = "dumphfdl" ]; then
