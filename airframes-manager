@@ -88,11 +88,9 @@ get_platform_target() {
     armv7l|armhf)    arch_part="armhf" ;;
     *)               arch_part="$ARCH" ;;
   esac
+  # macOS: only arm64 binaries are built (Intel Macs use Rosetta 2)
   if [ "$os_part" = "macos" ]; then
-    case "$ARCH" in
-      x86_64)        arch_part="x86_64" ;;
-      arm64|aarch64) arch_part="arm64" ;;
-    esac
+    arch_part="arm64"
   fi
   echo "${os_part}-${arch_part}"
 }
