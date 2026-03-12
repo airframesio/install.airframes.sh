@@ -176,13 +176,7 @@ jobs:
             make -j"$NPROC" && make install
           fi
 
-          # Build libconfig from source (needed by acarsdec)
-          if [ "$DECODER" = "acarsdec" ]; then
-            git clone --depth 1 --branch v1.7.3 https://github.com/hyperrealm/libconfig.git /tmp/libconfig
-            cd /tmp/libconfig
-            autoreconf -fi && ./configure --prefix=/usr
-            make -j"$NPROC" && make install
-          fi
+          # Note: libsndfile and libconfig are optional for acarsdec, skipped on Windows
 
       - name: Build libacars
         run: |
