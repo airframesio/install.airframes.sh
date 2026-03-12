@@ -184,15 +184,12 @@ jobs:
                 ;;
               vdlm2dec)
                 cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.h" .
-                cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.c" .
                 sed -i.bak '/#include <pthread.h>/a\
-          #include <complex.h>\
           #ifndef PTHREAD_BARRIER_SERIAL_THREAD\
           #include "pthread_barrier.h"\
-          #endif' vdlm2.h
+          #endif\
+          #include <complex.h>' vdlm2.h
                 rm -f vdlm2.h.bak
-                sed -i.bak 's/add_executable(vdlm2dec /add_executable(vdlm2dec pthread_barrier.c /' CMakeLists.txt
-                rm -f CMakeLists.txt.bak
                 ;;
             esac
           fi

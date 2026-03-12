@@ -1,60 +1,88 @@
 /*
- * Copyright (c) 2015, Aleksey Demakov
- * All rights reserved.
+ * pthread_barrier polyfill for macOS / BSD systems.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * POSIX pthread_barrier_t and friends are not available on macOS.
+ * This header-only shim implements them on top of a mutex + condition
+ * variable, which are available everywhere.
  *
- * * Redistributions of source code must retain the above copyright notice, this
- *   list of conditions and the following disclaimer.
- *
- * * Redistributions in binary form must reproduce the above copyright notice,
- *   this list of conditions and the following disclaimer in the documentation
- *   and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * BSD 2-Clause License
+ * Same approach used by dumpvdl2 / dumphfdl.
  */
-
 #ifndef _PTHREAD_BARRIER_H
 #define _PTHREAD_BARRIER_H
 
 #include <pthread.h>
+#include <errno.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* Only activate when the platform doesn't provide barriers natively.
+ * glibc / Linux defines PTHREAD_BARRIER_SERIAL_THREAD in <pthread.h>. */
+#ifndef PTHREAD_BARRIER_SERIAL_THREAD
 
-#if !defined(PTHREAD_BARRIER_SERIAL_THREAD)
-#define PTHREAD_BARRIER_SERIAL_THREAD (1)
-#endif
+#define PTHREAD_BARRIER_SERIAL_THREAD (-1)
 
-	typedef struct {
-	} pthread_barrierattr_t;
+typedef int pthread_barrierattr_t;
 
-	typedef struct {
-		pthread_mutex_t mutex;
-		pthread_cond_t cond;
-		unsigned int limit;
-		unsigned int count;
-		unsigned int phase;
-	} pthread_barrier_t;
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    unsigned int    limit;   /* number of threads that must call wait() */
+    unsigned int    count;   /* threads currently waiting */
+    unsigned int    phase;   /* generation counter — prevents spurious wake-ups */
+} pthread_barrier_t;
 
-	int pthread_barrier_init(pthread_barrier_t *restrict barrier,
-			const pthread_barrierattr_t *restrict attr, unsigned int count);
-
-	int pthread_barrier_wait(pthread_barrier_t *barrier);
-
-#ifdef  __cplusplus
+static inline int
+pthread_barrier_init(pthread_barrier_t *barrier,
+                     const pthread_barrierattr_t *attr,
+                     unsigned int count)
+{
+    (void)attr;
+    if (count == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (pthread_mutex_init(&barrier->mutex, NULL) != 0)
+        return -1;
+    if (pthread_cond_init(&barrier->cond, NULL) != 0) {
+        int e = errno;
+        pthread_mutex_destroy(&barrier->mutex);
+        errno = e;
+        return -1;
+    }
+    barrier->limit = count;
+    barrier->count = 0;
+    barrier->phase = 0;
+    return 0;
 }
-#endif
 
-#endif /* !_PTHREAD_BARRIER_H */
+static inline int
+pthread_barrier_destroy(pthread_barrier_t *barrier)
+{
+    pthread_cond_destroy(&barrier->cond);
+    pthread_mutex_destroy(&barrier->mutex);
+    return 0;
+}
+
+static inline int
+pthread_barrier_wait(pthread_barrier_t *barrier)
+{
+    pthread_mutex_lock(&barrier->mutex);
+    barrier->count++;
+    if (barrier->count >= barrier->limit) {
+        /* Last thread to arrive — release everyone. */
+        barrier->phase++;
+        barrier->count = 0;
+        pthread_cond_broadcast(&barrier->cond);
+        pthread_mutex_unlock(&barrier->mutex);
+        return PTHREAD_BARRIER_SERIAL_THREAD;
+    } else {
+        /* Wait until the current generation advances. */
+        unsigned int phase = barrier->phase;
+        while (barrier->phase == phase)
+            pthread_cond_wait(&barrier->cond, &barrier->mutex);
+        pthread_mutex_unlock(&barrier->mutex);
+        return 0;
+    }
+}
+
+#endif /* !PTHREAD_BARRIER_SERIAL_THREAD */
+#endif /* _PTHREAD_BARRIER_H */
