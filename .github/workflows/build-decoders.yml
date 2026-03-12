@@ -194,6 +194,18 @@ jobs:
             cd /tmp/libconfig && mkdir build && cd build
             cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF
             make -j"$NPROC" && make install
+            # cmake build doesn't generate pkg-config files; create them manually
+            mkdir -p /usr/lib/pkgconfig
+            cat > /usr/lib/pkgconfig/libconfig++.pc << 'PCEOF'
+          prefix=/usr
+          libdir=${prefix}/lib
+          includedir=${prefix}/include
+          Name: libconfig++
+          Description: C++ Configuration File Library
+          Version: 1.7.3
+          Libs: -L${libdir} -lconfig++
+          Cflags: -I${includedir}
+          PCEOF
           fi
 
           # Note: libsndfile and libconfig are optional for acarsdec, skipped on Windows
