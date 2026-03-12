@@ -193,8 +193,14 @@ jobs:
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$PREFIX"
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_NAME_DIR=/usr/local/lib"
           elif [ "$RUNNER_OS" = "Windows" ]; then
-            # alloca is in alloca.h on MSYS2, not implicitly available
-            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_C_FLAGS=-include\\ alloca.h"
+            :
+          fi
+
+          # MSYS2: alloca needs explicit include
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            find /tmp/libacars -name '*.c' -exec grep -l 'alloca(' {} \; | while read -r f; do
+              sed -i '1i #include <alloca.h>' "$f"
+            done
           fi
 
           # shellcheck disable=SC2086
