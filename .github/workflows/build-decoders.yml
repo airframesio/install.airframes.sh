@@ -67,6 +67,7 @@ jobs:
       BUILD_CONFIG: ${{ needs.prepare.outputs.config_json }}
       DECODER: ${{ matrix.decoder }}
       PLATFORM: ${{ matrix.target.platform }}
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
 
@@ -148,8 +149,12 @@ jobs:
           # Build librtlsdr from source (not in MSYS repo)
           git clone --depth 1 https://github.com/steve-m/librtlsdr.git /tmp/librtlsdr
           cd /tmp/librtlsdr && mkdir build && cd build
-          cmake .. -DCMAKE_INSTALL_PREFIX=/usr
-          make -j"$NPROC" && make install
+          cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DINSTALL_UDEV_RULES=OFF
+          # CLI tools may fail to link on MSYS; we only need the library
+          make -j"$NPROC" || true
+          make install || true
+          # Verify the library was built
+          ls /usr/lib/librtlsdr* /usr/include/rtl-sdr.h
 
           # Build zeromq from source (needed by dumpvdl2/dumphfdl)
           if [ "$DECODER" = "dumpvdl2" ] || [ "$DECODER" = "dumphfdl" ]; then
@@ -186,7 +191,6 @@ jobs:
           cd /tmp/libacars && mkdir build && cd build
 
           CMAKE_FLAGS="-DCMAKE_INSTALL_PREFIX=$STAGING"
-          CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 
           if [ "$RUNNER_OS" = "macOS" ]; then
             PREFIX="$(brew --prefix)"
@@ -281,7 +285,6 @@ jobs:
           mkdir -p build && cd build
 
           CMAKE_FLAGS="-DCMAKE_INSTALL_PREFIX=$STAGING"
-          CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 
           if [ "$RUNNER_OS" = "macOS" ]; then
             PREFIX="$(brew --prefix)"
@@ -296,8 +299,8 @@ jobs:
             export LIBRARY_PATH="$STAGING/lib:$PREFIX/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
             export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:$PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           elif [ "$RUNNER_OS" = "Windows" ]; then
-            export CMAKE_GENERATOR="MinGW Makefiles"
-            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$STAGING;/mingw64"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$STAGING"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_C_FLAGS=-DHOST_NAME_MAX=255"
             export C_INCLUDE_PATH="$STAGING/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
             export LIBRARY_PATH="$STAGING/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
             export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
@@ -318,13 +321,10 @@ jobs:
               ;;
           esac
 
-          MAKE_CMD="make"
-          [ "$RUNNER_OS" = "Windows" ] && MAKE_CMD="mingw32-make"
-
           # shellcheck disable=SC2086
           cmake .. $CMAKE_FLAGS
-          $MAKE_CMD -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
-          $MAKE_CMD install
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
+          make install
 
       - name: Fix macOS dylib paths
         if: runner.os == 'macOS'
