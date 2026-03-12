@@ -193,10 +193,8 @@ jobs:
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$PREFIX"
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_NAME_DIR=/usr/local/lib"
           elif [ "$RUNNER_OS" = "Windows" ]; then
-            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$STAGING"
-            export C_INCLUDE_PATH="$STAGING/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
-            export LIBRARY_PATH="$STAGING/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
-            export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            # alloca is in alloca.h on MSYS2, not implicitly available
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_C_FLAGS=-include\\ alloca.h"
           fi
 
           # shellcheck disable=SC2086
