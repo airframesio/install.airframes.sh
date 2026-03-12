@@ -161,13 +161,14 @@ jobs:
           cp rtlsdr.pc /usr/lib/pkgconfig/ 2>/dev/null || true
 
           # Build zeromq from source (needed by dumpvdl2/dumphfdl)
+          # ZMQ is optional for both decoders; skip on Windows if build fails
           if [ "$DECODER" = "dumpvdl2" ] || [ "$DECODER" = "dumphfdl" ]; then
             git clone --depth 1 --branch v4.3.5 https://github.com/zeromq/libzmq.git /tmp/libzmq
             cd /tmp/libzmq && mkdir build && cd build
-            # -fpermissive needed: MSYS2 has strlcpy/strnlen as extern, zmq redefines as static
-            cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTS=OFF \
-              -DCMAKE_CXX_FLAGS="-fpermissive"
-            make -j"$NPROC" && make install
+            # -fpermissive: MSYS2 strlcpy/strnlen extern vs static conflict
+            cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTS=OFF -DBUILD_SHARED=OFF \
+              -DCMAKE_CXX_FLAGS="-fpermissive" || true
+            make -j"$NPROC" && make install || echo "WARNING: zeromq build failed (ZMQ output disabled)"
           fi
 
           # Build fftw from source (needed by dumphfdl)
@@ -190,8 +191,8 @@ jobs:
           # Build libconfig from source (needed by dumphfdl)
           if [ "$DECODER" = "dumphfdl" ]; then
             git clone --depth 1 --branch v1.7.3 https://github.com/hyperrealm/libconfig.git /tmp/libconfig
-            cd /tmp/libconfig
-            autoreconf -fi && ./configure --prefix=/usr
+            cd /tmp/libconfig && mkdir build && cd build
+            cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF
             make -j"$NPROC" && make install
           fi
 
