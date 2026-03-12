@@ -139,33 +139,63 @@ jobs:
           git clone --depth 1 \
             "https://github.com/${UPSTREAM_REPO}.git" "/tmp/${DECODER}"
 
-      - name: Apply macOS patches
-        if: runner.os == 'macOS'
+      - name: Apply patches
         run: |
           cd "/tmp/${DECODER}"
-          case "$DECODER" in
-            acarsdec)
-              for src in rtl.c soapy.c; do
-                if [ -f "$src" ]; then
-                  sed -i.bak 's/pthread_tryjoin_np/pthread_join/g' "$src"
-                  rm -f "${src}.bak"
-                fi
-              done
-              ;;
-            vdlm2dec)
-              cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.h" .
-              cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.c" .
-              # Add missing complex.h and pthread_barrier polyfill
-              sed -i.bak '/#include <pthread.h>/a\
+
+          # dumphfdl: fix liquid-dsp version check for v1.7.0+ compatibility
+          # v1.7.0 removed LIQUID_VERSION_NUMBER and LIQUID_VALIDATE_LIBVERSION
+          if [ "$DECODER" = "dumphfdl" ] && [ -f src/CMakeLists.txt ]; then
+            python3 << 'PYEOF'
+          import re
+          with open("src/CMakeLists.txt") as f:
+              content = f.read()
+          new_check = '''check_c_source_runs("
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <liquid/liquid.h>
+          int main(void) {
+              int v = 0;
+          #if defined(LIQUID_VERSION_MAJOR) && defined(LIQUID_VERSION_MINOR) && defined(LIQUID_VERSION_PATCH)
+              v = LIQUID_VERSION_MAJOR * 1000000 + LIQUID_VERSION_MINOR * 1000 + LIQUID_VERSION_PATCH;
+          #elif defined(LIQUID_VERSION_NUMBER)
+              v = LIQUID_VERSION_NUMBER;
+          #endif
+              return (v >= ${LIQUID_VERSION_NUMBER_MIN}) ? 0 : 1;
+          }" LIQUIDDSP_VERSION_CHECK)'''
+          content = re.sub(
+              r'check_c_source_runs\(".*?" LIQUIDDSP_VERSION_CHECK\)',
+              new_check, content, flags=re.DOTALL)
+          with open("src/CMakeLists.txt", "w") as f:
+              f.write(content)
+          PYEOF
+          fi
+
+          # macOS-specific patches
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            case "$DECODER" in
+              acarsdec)
+                for src in rtl.c soapy.c; do
+                  if [ -f "$src" ]; then
+                    sed -i.bak 's/pthread_tryjoin_np/pthread_join/g' "$src"
+                    rm -f "${src}.bak"
+                  fi
+                done
+                ;;
+              vdlm2dec)
+                cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.h" .
+                cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.c" .
+                sed -i.bak '/#include <pthread.h>/a\
           #include <complex.h>\
           #ifndef PTHREAD_BARRIER_SERIAL_THREAD\
           #include "pthread_barrier.h"\
           #endif' vdlm2.h
-              rm -f vdlm2.h.bak
-              sed -i.bak 's/add_executable(vdlm2dec /add_executable(vdlm2dec pthread_barrier.c /' CMakeLists.txt
-              rm -f CMakeLists.txt.bak
-              ;;
-          esac
+                rm -f vdlm2.h.bak
+                sed -i.bak 's/add_executable(vdlm2dec /add_executable(vdlm2dec pthread_barrier.c /' CMakeLists.txt
+                rm -f CMakeLists.txt.bak
+                ;;
+            esac
+          fi
 
       - name: Build decoder
         run: |
@@ -196,6 +226,13 @@ jobs:
             export LD_LIBRARY_PATH="$STAGING/lib:${LD_LIBRARY_PATH:-}"
             export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           fi
+
+          # Decoder-specific cmake flags
+          case "$DECODER" in
+            acarsdec|vdlm2dec)
+              CMAKE_FLAGS="$CMAKE_FLAGS -Drtl=ON"
+              ;;
+          esac
 
           # shellcheck disable=SC2086
           cmake .. $CMAKE_FLAGS
