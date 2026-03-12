@@ -160,16 +160,8 @@ jobs:
           cp ../include/rtl-sdr.h ../include/rtl-sdr_export.h /usr/include/
           cp rtlsdr.pc /usr/lib/pkgconfig/ 2>/dev/null || true
 
-          # Build zeromq from source (needed by dumpvdl2/dumphfdl)
-          # ZMQ is optional for both decoders; skip on Windows if build fails
-          if [ "$DECODER" = "dumpvdl2" ] || [ "$DECODER" = "dumphfdl" ]; then
-            git clone --depth 1 --branch v4.3.5 https://github.com/zeromq/libzmq.git /tmp/libzmq
-            cd /tmp/libzmq && mkdir build && cd build
-            # -fpermissive: MSYS2 strlcpy/strnlen extern vs static conflict
-            cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTS=OFF -DBUILD_SHARED=OFF \
-              -DCMAKE_CXX_FLAGS="-fpermissive" || true
-            make -j"$NPROC" && make install || echo "WARNING: zeromq build failed (ZMQ output disabled)"
-          fi
+          # ZMQ is optional for dumpvdl2/dumphfdl; skip on Windows
+          # (C++ static lib linking issues with C programs on MSYS2)
 
           # Build fftw from source (needed by dumphfdl)
           if [ "$DECODER" = "dumphfdl" ]; then
@@ -354,6 +346,11 @@ jobs:
               CMAKE_FLAGS="$CMAKE_FLAGS -Drtl=ON"
               ;;
           esac
+
+          # ZMQ not available on Windows (skipped in deps)
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            CMAKE_FLAGS="$CMAKE_FLAGS -DZMQ=OFF"
+          fi
 
           # shellcheck disable=SC2086
           cmake .. $CMAKE_FLAGS
