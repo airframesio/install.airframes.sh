@@ -96,7 +96,7 @@ jobs:
             sudo apt-get install -y autoconf automake libtool
             git clone https://github.com/jgaeddert/liquid-dsp.git /tmp/liquid-dsp
             cd /tmp/liquid-dsp
-            git checkout v1.7.0
+            git checkout v1.6.0
             ./bootstrap.sh && ./configure --prefix=/usr && make -j"$(nproc)" && sudo make install
             sudo ldconfig
           fi

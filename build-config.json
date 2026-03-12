@@ -24,7 +24,7 @@
     },
     "vdlm2dec": {
       "repo": "TLeconte/vdlm2dec",
-      "ref": "master",
+      "ref": "v2.3",
       "version": "2.3",
       "previous_ref": ""
     }
