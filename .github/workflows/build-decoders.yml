@@ -87,6 +87,8 @@ jobs:
             autoconf
             automake
             libtool
+            bison
+            flex
             glib2-devel
             libxml2-devel
             sqlite
