@@ -74,25 +74,23 @@ jobs:
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: MSYS
           update: false
           install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-pkg-config
-            mingw-w64-x86_64-rtl-sdr
-            mingw-w64-x86_64-libusb
-            mingw-w64-x86_64-glib2
-            mingw-w64-x86_64-zeromq
-            mingw-w64-x86_64-sqlite3
-            mingw-w64-x86_64-libxml2
-            mingw-w64-x86_64-zlib
-            mingw-w64-x86_64-libsndfile
-            mingw-w64-x86_64-libconfig
-            mingw-w64-x86_64-fftw
-            mingw-w64-x86_64-make
+            gcc
+            make
+            cmake
+            pkg-config
             git
             python3
+            autoconf
+            automake
+            libtool
+            libusb-devel
+            libglib2.0-devel
+            libxml2-devel
+            libsqlite-devel
+            zlib-devel
 
       - name: Read decoder config
         id: cfg
@@ -140,19 +138,45 @@ jobs:
       - name: Install system dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
-          # liquid-dsp not available as MSYS2 package, build from source for dumphfdl
+          NPROC=$(nproc)
+
+          # Build librtlsdr from source (not in MSYS repo)
+          git clone --depth 1 https://github.com/steve-m/librtlsdr.git /tmp/librtlsdr
+          cd /tmp/librtlsdr && mkdir build && cd build
+          cmake .. -DCMAKE_INSTALL_PREFIX=/usr
+          make -j"$NPROC" && make install
+
+          # Build zeromq from source (needed by dumpvdl2/dumphfdl)
+          if [ "$DECODER" = "dumpvdl2" ] || [ "$DECODER" = "dumphfdl" ]; then
+            git clone --depth 1 --branch v4.3.5 https://github.com/zeromq/libzmq.git /tmp/libzmq
+            cd /tmp/libzmq && mkdir build && cd build
+            cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_TESTS=OFF
+            make -j"$NPROC" && make install
+          fi
+
+          # Build fftw from source (needed by dumphfdl)
+          if [ "$DECODER" = "dumphfdl" ]; then
+            curl -sSL https://www.fftw.org/fftw-3.3.10.tar.gz | tar xz -C /tmp
+            cd /tmp/fftw-3.3.10
+            ./configure --prefix=/usr --enable-float --enable-shared
+            make -j"$NPROC" && make install
+          fi
+
+          # Build liquid-dsp from source (needed by dumphfdl)
           if [ "$DECODER" = "dumphfdl" ]; then
             git clone https://github.com/jgaeddert/liquid-dsp.git /tmp/liquid-dsp
             cd /tmp/liquid-dsp
             git checkout v1.6.0
-            ./bootstrap.sh
-            # Use MinGW-specific makefile (autotools configure fails on MinGW)
-            mingw32-make -f makefile.mingw64 -j"$(nproc)"
-            cp -v libliquid.dll /mingw64/bin/
-            cp -v libliquid.a /mingw64/lib/
-            cp -v libliquid.dll.a /mingw64/lib/ 2>/dev/null || true
-            mkdir -p /mingw64/include/liquid
-            cp -v include/liquid/liquid.h /mingw64/include/liquid/
+            ./bootstrap.sh && ./configure --prefix=/usr
+            make -j"$NPROC" && make install
+          fi
+
+          # Build libconfig from source (needed by acarsdec)
+          if [ "$DECODER" = "acarsdec" ]; then
+            git clone --depth 1 --branch v1.7.3 https://github.com/hyperrealm/libconfig.git /tmp/libconfig
+            cd /tmp/libconfig
+            autoreconf -fi && ./configure --prefix=/usr
+            make -j"$NPROC" && make install
           fi
 
       - name: Build libacars
@@ -170,16 +194,16 @@ jobs:
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$PREFIX"
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_NAME_DIR=/usr/local/lib"
           elif [ "$RUNNER_OS" = "Windows" ]; then
-            export CMAKE_GENERATOR="MinGW Makefiles"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$STAGING"
+            export C_INCLUDE_PATH="$STAGING/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+            export LIBRARY_PATH="$STAGING/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+            export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           fi
-
-          MAKE_CMD="make"
-          [ "$RUNNER_OS" = "Windows" ] && MAKE_CMD="mingw32-make"
 
           # shellcheck disable=SC2086
           cmake .. $CMAKE_FLAGS
-          $MAKE_CMD -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
-          $MAKE_CMD install
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
+          make install
 
       - name: Clone decoder source
         env:
@@ -346,14 +370,15 @@ jobs:
               [ -e "$f" ] && cp -a "$f" /tmp/package/lib/
             done
           elif [ "$RUNNER_OS" = "Windows" ]; then
-            # Copy libacars DLL
-            for f in "$STAGING"/bin/libacars-2*.dll "$STAGING"/lib/libacars-2*.dll; do
+            # Copy libacars DLL (MSYS builds produce msys-*.dll or cyg-*.dll)
+            for f in "$STAGING"/bin/msys-acars*.dll "$STAGING"/lib/msys-acars*.dll \
+                     "$STAGING"/bin/libacars*.dll "$STAGING"/lib/libacars*.dll; do
               [ -e "$f" ] && cp -a "$f" /tmp/package/bin/
             done
-            # Bundle required MinGW runtime DLLs alongside the binary
+            # Bundle required MSYS2 runtime DLLs alongside the binary
             EXE="/tmp/package/bin/${DECODER}.exe"
             if [ -f "$EXE" ]; then
-              ldd "$EXE" | grep '/mingw64/' | awk '{print $3}' | while read -r dll; do
+              ldd "$EXE" | grep -E '/usr/(bin|lib)/' | awk '{print $3}' | while read -r dll; do
                 [ -f "$dll" ] && cp -n "$dll" /tmp/package/bin/
               done
             fi
