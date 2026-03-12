@@ -55,7 +55,12 @@ jobs:
             os: ubuntu-24.04-arm
           - platform: macos-arm64
             os: macos-14
+          - platform: windows-amd64
+            os: windows-latest
     runs-on: ${{ matrix.target.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.target.os == 'windows-latest' && 'msys2 {0}' || 'bash' }}
     env:
       STAGING: /tmp/decoder-staging
       LIBACARS_REF: ${{ needs.prepare.outputs.libacars_ref }}
@@ -64,6 +69,33 @@ jobs:
       PLATFORM: ${{ matrix.target.platform }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-rtl-sdr
+            mingw-w64-x86_64-libusb
+            mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-zeromq
+            mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-libsndfile
+            mingw-w64-x86_64-libconfig
+            mingw-w64-x86_64-fftw
+            make
+            git
+            python3
+            autoconf
+            automake
+            libtool
 
       - name: Read decoder config
         id: cfg
@@ -108,6 +140,20 @@ jobs:
           brew install cmake pkg-config librtlsdr libusb glib zeromq \
             sqlite libxml2 soapysdr libsndfile libconfig liquid-dsp fftw
 
+      - name: Install system dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # liquid-dsp not available as MSYS2 package, build from source for dumphfdl
+          if [ "$DECODER" = "dumphfdl" ]; then
+            git clone https://github.com/jgaeddert/liquid-dsp.git /tmp/liquid-dsp
+            cd /tmp/liquid-dsp
+            git checkout v1.6.0
+            ./bootstrap.sh
+            ./configure --prefix=/mingw64
+            make -j"$(nproc)"
+            make install
+          fi
+
       - name: Build libacars
         run: |
           mkdir -p "$STAGING"
@@ -122,11 +168,13 @@ jobs:
             PREFIX="$(brew --prefix)"
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$PREFIX"
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_NAME_DIR=/usr/local/lib"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            CMAKE_FLAGS="$CMAKE_FLAGS -G 'MinGW Makefiles'"
           fi
 
           # shellcheck disable=SC2086
           cmake .. $CMAKE_FLAGS
-          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
           make install
 
       - name: Clone decoder source
@@ -171,10 +219,11 @@ jobs:
           PYEOF
           fi
 
-          # macOS-specific patches
-          if [ "$RUNNER_OS" = "macOS" ]; then
+          # Non-Linux patches (macOS and Windows lack GNU/POSIX extensions)
+          if [ "$RUNNER_OS" != "Linux" ]; then
             case "$DECODER" in
               acarsdec)
+                # pthread_tryjoin_np is a GNU extension, not available on macOS/Windows
                 for src in rtl.c soapy.c; do
                   if [ -f "$src" ]; then
                     sed -i.bak 's/pthread_tryjoin_np/pthread_join/g' "$src"
@@ -183,6 +232,7 @@ jobs:
                 done
                 ;;
               vdlm2dec)
+                # pthread_barrier_t polyfill + complex.h for non-Linux platforms
                 cp "${GITHUB_WORKSPACE}/patches/pthread_barrier.h" .
                 sed -i.bak '/#include <pthread.h>/a\
           #ifndef PTHREAD_BARRIER_SERIAL_THREAD\
@@ -214,6 +264,12 @@ jobs:
             export C_INCLUDE_PATH="$STAGING/include:$PREFIX/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
             export LIBRARY_PATH="$STAGING/lib:$PREFIX/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
             export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:$PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            CMAKE_FLAGS="$CMAKE_FLAGS -G 'MinGW Makefiles'"
+            CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$STAGING;/mingw64"
+            export C_INCLUDE_PATH="$STAGING/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+            export LIBRARY_PATH="$STAGING/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+            export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           else
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$STAGING"
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_RPATH=/usr/local/lib"
@@ -233,7 +289,7 @@ jobs:
 
           # shellcheck disable=SC2086
           cmake .. $CMAKE_FLAGS
-          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+          make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)"
           make install
 
       - name: Fix macOS dylib paths
@@ -272,12 +328,28 @@ jobs:
           ARTIFACT="${DECODER}-${PLATFORM}"
 
           mkdir -p /tmp/package/bin /tmp/package/lib
-          cp "$STAGING/bin/$DECODER" /tmp/package/bin/
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "$STAGING/bin/${DECODER}.exe" /tmp/package/bin/
+          else
+            cp "$STAGING/bin/$DECODER" /tmp/package/bin/
+          fi
 
           if [ "$RUNNER_OS" = "macOS" ]; then
             for f in "$STAGING"/lib/libacars-2*.dylib; do
               [ -e "$f" ] && cp -a "$f" /tmp/package/lib/
             done
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            # Copy libacars DLL
+            for f in "$STAGING"/bin/libacars-2*.dll "$STAGING"/lib/libacars-2*.dll; do
+              [ -e "$f" ] && cp -a "$f" /tmp/package/bin/
+            done
+            # Bundle required MinGW runtime DLLs alongside the binary
+            EXE="/tmp/package/bin/${DECODER}.exe"
+            if [ -f "$EXE" ]; then
+              ldd "$EXE" | grep '/mingw64/' | awk '{print $3}' | while read -r dll; do
+                [ -f "$dll" ] && cp -n "$dll" /tmp/package/bin/
+              done
+            fi
           else
             for f in "$STAGING"/lib/libacars-2.so*; do
               [ -e "$f" ] && cp -a "$f" /tmp/package/lib/
@@ -401,6 +473,7 @@ jobs:
             echo "| Linux | AMD64 (x86_64) | \`${DECODER}-linux-amd64.tar.gz\` |"
             echo "| Linux | ARM64 (aarch64) | \`${DECODER}-linux-arm64.tar.gz\` |"
             echo "| macOS | Apple Silicon (ARM64) | \`${DECODER}-macos-arm64.tar.gz\` |"
+            echo "| Windows | AMD64 (x86_64) | \`${DECODER}-windows-amd64.tar.gz\` |"
             echo ""
             echo "### Build Info"
             echo ""
