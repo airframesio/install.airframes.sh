@@ -87,10 +87,10 @@ jobs:
             automake
             libtool
             libusb-devel
-            libglib2.0-devel
+            glib2-devel
             libxml2-devel
-            libsqlite-devel
-            zlib-devel
+            sqlite
+            zlib
 
       - name: Read decoder config
         id: cfg
