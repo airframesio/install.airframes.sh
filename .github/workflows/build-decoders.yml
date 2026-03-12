@@ -169,7 +169,7 @@ jobs:
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$PREFIX"
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_INSTALL_NAME_DIR=/usr/local/lib"
           elif [ "$RUNNER_OS" = "Windows" ]; then
-            CMAKE_FLAGS="$CMAKE_FLAGS -G 'MinGW Makefiles'"
+            export CMAKE_GENERATOR="MinGW Makefiles"
           fi
 
           # shellcheck disable=SC2086
@@ -265,7 +265,7 @@ jobs:
             export LIBRARY_PATH="$STAGING/lib:$PREFIX/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
             export PKG_CONFIG_PATH="$STAGING/lib/pkgconfig:$PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           elif [ "$RUNNER_OS" = "Windows" ]; then
-            CMAKE_FLAGS="$CMAKE_FLAGS -G 'MinGW Makefiles'"
+            export CMAKE_GENERATOR="MinGW Makefiles"
             CMAKE_FLAGS="$CMAKE_FLAGS -DCMAKE_PREFIX_PATH=$STAGING;/mingw64"
             export C_INCLUDE_PATH="$STAGING/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
             export LIBRARY_PATH="$STAGING/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
@@ -308,7 +308,7 @@ jobs:
           # Fix @rpath references in the decoder binary
           BIN="$STAGING/bin/$DECODER"
           if [ -f "$BIN" ]; then
-            otool -L "$BIN" | grep '@rpath/' | awk '{print $1}' | while read -r dep; do
+            otool -L "$BIN" | { grep '@rpath/' || true; } | awk '{print $1}' | while read -r dep; do
               LIBNAME="${dep#@rpath/}"
               for DIR in "$STAGING/lib" /usr/local/lib "$(brew --prefix)/lib"; do
                 if [ -f "$DIR/$LIBNAME" ]; then
