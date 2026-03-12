@@ -86,7 +86,6 @@ jobs:
             autoconf
             automake
             libtool
-            libusb-devel
             glib2-devel
             libxml2-devel
             sqlite
@@ -139,6 +138,12 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           NPROC=$(nproc)
+
+          # Build libusb from source (not in MSYS repo)
+          git clone --depth 1 --branch v1.0.27 https://github.com/libusb/libusb.git /tmp/libusb
+          cd /tmp/libusb
+          ./bootstrap.sh && ./configure --prefix=/usr
+          make -j"$NPROC" && make install
 
           # Build librtlsdr from source (not in MSYS repo)
           git clone --depth 1 https://github.com/steve-m/librtlsdr.git /tmp/librtlsdr
