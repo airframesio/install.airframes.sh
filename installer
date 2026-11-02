@@ -1472,9 +1472,20 @@ build_run_command() {
   local freqs="${FREQUENCIES:-$(get_frequencies "$decoder" "${SELECTED_REGION:-north_america}")}"
   local sdr="${SELECTED_SDR:-rtlsdr}"
 
+  # Decoders must send the station's exact ident, or Airframes files their
+  # messages under a separate auto-created station. The command is also used
+  # in a systemd unit and a JSON config, so only pass shell-safe idents.
+  local id_flag="" station_id_flag=""
+  if [[ "${STATION_IDENT:-}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    id_flag=" -i ${STATION_IDENT}"
+    station_id_flag=" --station-id ${STATION_IDENT}"
+  elif [ -n "${STATION_IDENT:-}" ]; then
+    warn "Station ident '${STATION_IDENT}' has characters a decoder command line can't carry safely; set it in the decoder manually." >&2
+  fi
+
   case "$decoder" in
     acarsdec)
-      echo "acarsdec -v -o 4 -g 42 -r 0 ${freqs} -j ${host}:${port}"
+      echo "acarsdec -v${id_flag} -o 4 -g 42 -r 0 ${freqs} -j ${host}:${port}"
       ;;
     dumpvdl2)
       # dumpvdl2 takes frequencies in Hz
@@ -1487,9 +1498,9 @@ build_run_command() {
         fi
       done
       case "$sdr" in
-        rtlsdr)  echo "dumpvdl2 --rtlsdr 0${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
-        airspy)  echo "dumpvdl2 --airspy 0${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
-        sdrplay) echo "dumpvdl2 --soapysdr driver=sdrplay${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
+        rtlsdr)  echo "dumpvdl2${station_id_flag} --rtlsdr 0${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
+        airspy)  echo "dumpvdl2${station_id_flag} --airspy 0${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
+        sdrplay) echo "dumpvdl2${station_id_flag} --soapysdr driver=sdrplay${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
       esac
       ;;
     dumphfdl)
@@ -1498,13 +1509,13 @@ build_run_command() {
         freq_args+=" ${f}"
       done
       case "$sdr" in
-        rtlsdr)  echo "dumphfdl --soapysdr driver=rtlsdr --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
-        airspy)  echo "dumphfdl --soapysdr driver=airspy --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
-        sdrplay) echo "dumphfdl --soapysdr driver=sdrplay --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
+        rtlsdr)  echo "dumphfdl${station_id_flag} --soapysdr driver=rtlsdr --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
+        airspy)  echo "dumphfdl${station_id_flag} --soapysdr driver=airspy --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
+        sdrplay) echo "dumphfdl${station_id_flag} --soapysdr driver=sdrplay --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
       esac
       ;;
     vdlm2dec)
-      echo "vdlm2dec -v -r 0 -G -E -U -j ${host}:${port} ${freqs}"
+      echo "vdlm2dec -v${id_flag} -r 0 -G -E -U -j ${host}:${port} ${freqs}"
       ;;
   esac
 }
