@@ -1472,9 +1472,24 @@ build_run_command() {
   local freqs="${FREQUENCIES:-$(get_frequencies "$decoder" "${SELECTED_REGION:-north_america}")}"
   local sdr="${SELECTED_SDR:-rtlsdr}"
 
+  # The station ident, as an option for each decoder. Airframes files incoming
+  # data under the ident the decoder sends: without it the feed lands on an
+  # anonymous station named after this machine's hostname or IP address, and
+  # the station registered on the website stays "pending". Idents are free
+  # text, so anything beyond plain characters is single-quoted.
+  local ident="${STATION_IDENT:-}"
+  local id_short="" id_long=""
+  if [ -n "$ident" ]; then
+    if [[ ! "$ident" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      ident="'${ident//\'/\'\\\'\'}'"
+    fi
+    id_short=" -i ${ident}"
+    id_long=" --station-id ${ident}"
+  fi
+
   case "$decoder" in
     acarsdec)
-      echo "acarsdec -v -o 4 -g 42 -r 0 ${freqs} -j ${host}:${port}"
+      echo "acarsdec -v -o 4 -g 42${id_short} -j ${host}:${port} -r 0 ${freqs}"
       ;;
     dumpvdl2)
       # dumpvdl2 takes frequencies in Hz
@@ -1487,9 +1502,9 @@ build_run_command() {
         fi
       done
       case "$sdr" in
-        rtlsdr)  echo "dumpvdl2 --rtlsdr 0${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
-        airspy)  echo "dumpvdl2 --airspy 0${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
-        sdrplay) echo "dumpvdl2 --soapysdr driver=sdrplay${freqs_hz} --output decoded:json:udp:address=${host},port=${port}" ;;
+        rtlsdr)  echo "dumpvdl2 --rtlsdr 0${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
+        airspy)  echo "dumpvdl2 --airspy 0${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
+        sdrplay) echo "dumpvdl2 --soapysdr driver=sdrplay${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
       esac
       ;;
     dumphfdl)
@@ -1498,13 +1513,13 @@ build_run_command() {
         freq_args+=" ${f}"
       done
       case "$sdr" in
-        rtlsdr)  echo "dumphfdl --soapysdr driver=rtlsdr --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
-        airspy)  echo "dumphfdl --soapysdr driver=airspy --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
-        sdrplay) echo "dumphfdl --soapysdr driver=sdrplay --sample-rate 250000 --output decoded:json:udp:address=${host},port=${port}${freq_args}" ;;
+        rtlsdr)  echo "dumphfdl --soapysdr driver=rtlsdr --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
+        airspy)  echo "dumphfdl --soapysdr driver=airspy --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
+        sdrplay) echo "dumphfdl --soapysdr driver=sdrplay --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
       esac
       ;;
     vdlm2dec)
-      echo "vdlm2dec -v -r 0 -G -E -U -j ${host}:${port} ${freqs}"
+      echo "vdlm2dec -v -G -E -U${id_short} -j ${host}:${port} -r 0 ${freqs}"
       ;;
   esac
 }
@@ -1599,9 +1614,15 @@ create_launchd_service() {
   local bin_path
   bin_path=$(command -v "$bin" 2>/dev/null || echo "/usr/local/bin/${bin}")
 
+  # The command quotes a station ident that has spaces, so split it the way a
+  # shell would. Its only free text is that ident, quoted by build_run_command.
+  local -a cmd_args
+  eval "cmd_args=($cmd)"
+
   local args_xml=""
   local first=true
-  for arg in $cmd; do
+  local arg
+  for arg in "${cmd_args[@]}"; do
     if [ "$first" = true ]; then
       args_xml="${args_xml}    <string>${bin_path}</string>
 "
