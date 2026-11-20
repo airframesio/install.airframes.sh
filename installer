@@ -898,6 +898,17 @@ api_fetch_config() {
     return 1
   fi
 
+  # These two go into service files and commands, so accept only what a host
+  # name and a port can look like.
+  if [ -n "$feed_host" ] && [[ ! "$feed_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+    err "Invalid feed host received from API"
+    return 1
+  fi
+  if [ -n "$feed_port" ] && [[ ! "$feed_port" =~ ^[0-9]{1,5}$ ]]; then
+    err "Invalid feed port received from API"
+    return 1
+  fi
+
   SELECTED_DECODERS=("$decoder")
   FEED_HOST="${feed_host:-$AIRFRAMES_FEED_HOST}"
   FEED_PORT="${feed_port:-${DECODER_FEED_PORT[$decoder]:-5550}}"
@@ -1477,10 +1488,14 @@ build_run_command() {
   # anonymous station named after this machine's hostname or IP address, and
   # the station registered on the website stays "pending". Idents are free
   # text, so anything beyond plain characters is single-quoted.
+  # A caller that writes the command somewhere other than a shell passes the
+  # ident as the second argument, already written for that place.
   local ident="${STATION_IDENT:-}"
   local id_short="" id_long=""
   if [ -n "$ident" ]; then
-    if [[ ! "$ident" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    if [ -n "${2:-}" ]; then
+      ident="$2"
+    elif [[ ! "$ident" =~ ^[A-Za-z0-9._-]+$ ]]; then
       ident="'${ident//\'/\'\\\'\'}'"
     fi
     id_short=" -i ${ident}"
@@ -1544,7 +1559,17 @@ show_run_command() {
 create_systemd_service() {
   local decoder="$1"
   local cmd
-  cmd=$(build_run_command "$decoder")
+  # systemd reads ExecStart with its own rules, not a shell's: inside double
+  # quotes it still decodes backslash escapes, and it expands % and $ anywhere.
+  local unit_ident=""
+  if [ -n "${STATION_IDENT:-}" ] && [[ ! "$STATION_IDENT" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    unit_ident="${STATION_IDENT//\\/\\\\}"
+    unit_ident="${unit_ident//\"/\\\"}"
+    unit_ident="${unit_ident//%/%%}"
+    unit_ident="${unit_ident//\$/\$\$}"
+    unit_ident="\"${unit_ident}\""
+  fi
+  cmd=$(build_run_command "$decoder" "$unit_ident")
 
   if [ "$OS" != "linux" ]; then
     warn "Systemd services are only supported on Linux"
@@ -1592,7 +1617,10 @@ EOF
 create_launchd_service() {
   local decoder="$1"
   local cmd
-  cmd=$(build_run_command "$decoder")
+  # Build the command around a placeholder so it can be split on spaces, then
+  # put the real ident back as one argument. Nothing is evaluated as shell.
+  local ident_slot="__AIRFRAMES_STATION_IDENT__"
+  cmd=$(build_run_command "$decoder" "$ident_slot")
 
   if [ "$OS" != "macos" ]; then
     warn "launchd services are only supported on macOS"
@@ -1614,10 +1642,8 @@ create_launchd_service() {
   local bin_path
   bin_path=$(command -v "$bin" 2>/dev/null || echo "/usr/local/bin/${bin}")
 
-  # The command quotes a station ident that has spaces, so split it the way a
-  # shell would. Its only free text is that ident, quoted by build_run_command.
   local -a cmd_args
-  eval "cmd_args=($cmd)"
+  read -ra cmd_args <<< "$cmd"
 
   local args_xml=""
   local first=true
@@ -1628,6 +1654,13 @@ create_launchd_service() {
 "
       first=false
     else
+      if [ "$arg" = "$ident_slot" ]; then
+        arg="$STATION_IDENT"
+      fi
+      # The plist is XML
+      arg="${arg//&/\&amp;}"
+      arg="${arg//</\&lt;}"
+      arg="${arg//>/\&gt;}"
       args_xml="${args_xml}    <string>${arg}</string>
 "
     fi
