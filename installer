@@ -6,6 +6,8 @@
 # One-command setup for aviation decoders and Airframes feeding.
 #
 # Usage:
+#   curl -sSL https://install.airframes.sh/installer | bash
+#   curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
 #   bash <(curl -sSL https://install.airframes.sh/installer)
 #   bash <(curl -sSL https://install.airframes.sh/installer) acarsdec
 #   bash <(curl -sSL https://install.airframes.sh/installer) --token <TOKEN>
@@ -42,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
@@ -56,13 +58,12 @@ GITHUB_RELEASES="https://github.com/airframesio/install.airframes.sh/releases"
 # Section 3: Color & output utilities
 # ===========================================================================
 
-if [ -t 1 ] && [ -t 0 ]; then
-  IS_TTY=true
-else
-  IS_TTY=false
-fi
+# IS_TTY says whether there is someone to answer prompts. main() sets it,
+# after the entry point has pointed stdin at the terminal (see the end of the
+# file). Colors only need stdout to be a terminal.
+IS_TTY=false
 
-if [ "$IS_TTY" = true ]; then
+if [ -t 1 ]; then
   BOLD="\033[1m"
   DIM="\033[2m"
   ITALIC="\033[3m"
@@ -105,6 +106,8 @@ SELECTED_DECODERS=()
 SELECTED_METHOD="binary" # binary, source, docker, package
 SELECTED_REGION=""
 SELECTED_SDR="rtlsdr"
+SDR_DEVICE=""            # RTL-SDR index or serial; empty = pick automatically
+SDR_DEVICE_SET_BY_USER=false
 STATION_IDENT=""
 FEED_HOST=""
 FEED_PORT=""
@@ -114,6 +117,18 @@ SHOW_RUN_CMD=true
 
 # Detected SDRs
 declare -a DETECTED_SDRS=()
+
+# Detected software already on this machine (see detect_existing_setup)
+declare -a ADSB_SOFTWARE=()
+declare -a ACARS_SOFTWARE=()
+declare -a ADSB_DEVICES=()   # RTL-SDR indexes/serials named in ADS-B configs
+declare -a RTLSDR_SERIALS=() # serials of plugged-in RTL-SDRs, in USB order
+
+# Running as root without sudo (minimal images, some Pi setups): run the
+# commands directly instead of failing on every "sudo ...".
+if [ "$(id -u)" -eq 0 ] && ! command -v sudo >/dev/null 2>&1; then
+  sudo() { "$@"; }
+fi
 
 # ===========================================================================
 # Section 5: Package manager abstraction
@@ -355,8 +370,11 @@ detect_distro() {
 
   # Linux distro detection
   if [ -f /etc/os-release ]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
+    # Read only ID and ID_LIKE: sourcing the file would overwrite our VERSION
+    # (it sets VERSION="12 (bookworm)" and friends).
+    local ID ID_LIKE
+    ID=$(. /etc/os-release && echo "${ID:-}")
+    ID_LIKE=$(. /etc/os-release && echo "${ID_LIKE:-}")
     case "$ID" in
       debian)    DISTRO="debian" ;;
       ubuntu)    DISTRO="ubuntu" ;;
@@ -509,6 +527,13 @@ ui_choose() {
   shift
   local -a options=("$@")
 
+  # Nobody to ask: take the first (default) option.
+  if [ "$IS_TTY" != true ]; then
+    info "${prompt} ${options[0]} (default)" >&2
+    echo "${options[0]}"
+    return 0
+  fi
+
   if [ "$HAS_GUM" = true ]; then
     gum choose --header "$prompt" "${options[@]}"
   else
@@ -522,7 +547,7 @@ ui_choose() {
     local choice
     while true; do
       echo -ne "  ${BOLD}Select [1-${#options[@]}]: ${RESET}" >&2
-      read -r choice
+      read -r choice || { echo >&2; err "No answer, stopping."; exit 1; }
       if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
         echo "${options[$((choice-1))]}"
         return 0
@@ -567,6 +592,12 @@ ui_confirm() {
     return 0
   fi
 
+  # Nobody to ask: go with the default.
+  if [ "$IS_TTY" != true ]; then
+    [ "$default" = "yes" ]
+    return
+  fi
+
   if [ "$HAS_GUM" = true ]; then
     if [ "$default" = "yes" ]; then
       gum confirm --default=yes "$prompt"
@@ -577,11 +608,11 @@ ui_confirm() {
     local yn
     if [ "$default" = "yes" ]; then
       echo -ne "  ${prompt} [Y/n] " >&2
-      read -r yn
+      read -r yn || yn=""
       [[ ! "$yn" =~ ^[Nn] ]]
     else
       echo -ne "  ${prompt} [y/N] " >&2
-      read -r yn
+      read -r yn || yn=""
       [[ "$yn" =~ ^[Yy] ]]
     fi
   fi
@@ -590,6 +621,11 @@ ui_confirm() {
 ui_input() {
   local prompt="$1"
   local default="${2:-}"
+
+  if [ "$IS_TTY" != true ]; then
+    echo "$default"
+    return 0
+  fi
 
   if [ "$HAS_GUM" = true ]; then
     if [ -n "$default" ]; then
@@ -711,6 +747,220 @@ get_sdr_type() {
   else
     echo "rtlsdr"
   fi
+}
+
+# --- Software already on this machine -------------------------------------
+#
+# Many people run this on a box that already feeds ADS-B (PiAware, readsb,
+# FR24, ...). Airframes takes ACARS, VDL2 and HFDL, not ADS-B, so the decoder
+# installed here needs an SDR of its own, and must not grab the dongle the
+# ADS-B decoder is using.
+
+process_running() {
+  local name="$1"
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$name" 2>/dev/null; then
+    return 0
+  fi
+  # Process names in /proc are cut to 15 characters
+  grep -qxF "${name:0:15}" /proc/[0-9]*/comm 2>/dev/null
+}
+
+# RTL-SDR serial numbers from sysfs, in USB bus order (librtlsdr numbers
+# devices in about the same order). Works without librtlsdr installed.
+detect_rtlsdr_serials() {
+  RTLSDR_SERIALS=()
+  local usb="${AIRFRAMES_SYSFS_USB:-/sys/bus/usb/devices}"
+  [ -d "$usb" ] || return 0
+  local dev vid pid serial
+  for dev in "$usb"/*; do
+    [ -f "$dev/idVendor" ] && [ -f "$dev/idProduct" ] || continue
+    vid=$(cat "$dev/idVendor" 2>/dev/null) || continue
+    pid=$(cat "$dev/idProduct" 2>/dev/null) || continue
+    case "${vid}:${pid}" in
+      0bda:2838|0bda:2832)
+        serial=$(cat "$dev/serial" 2>/dev/null || true)
+        RTLSDR_SERIALS+=("${serial:-unknown}")
+        ;;
+    esac
+  done
+}
+
+# RTL-SDR devices (index or serial) that ADS-B decoder configs ask for.
+detect_adsb_devices() {
+  ADSB_DEVICES=()
+  local f line
+  for f in /etc/default/dump1090-fa /etc/default/dump978-fa /etc/default/readsb \
+           /etc/default/dump1090-mutability /etc/default/dump1090 \
+           /boot/piaware-config.txt /boot/firmware/piaware-config.txt; do
+    [ -r "$f" ] || continue
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      # RECEIVER_SERIAL=00001090, --device 1090, --device-index 0,
+      # --sdr driver=rtlsdr,serial=00000978, rtlsdr-device-index 0
+      if [[ "$line" =~ RECEIVER_SERIAL=\"?([A-Za-z0-9._-]+) ]] ||
+         [[ "$line" =~ --device(-index)?[=[:space:]]+\"?([A-Za-z0-9._-]+) ]] ||
+         [[ "$line" =~ serial=([A-Za-z0-9._-]+) ]] ||
+         [[ "$line" =~ rtlsdr-device-index[[:space:]]+([0-9]+) ]]; then
+        local m="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
+        [ -n "$m" ] && ADSB_DEVICES+=("$m")
+      fi
+    done < "$f"
+  done
+}
+
+detect_existing_setup() {
+  ADSB_SOFTWARE=()
+  ACARS_SOFTWARE=()
+  [ "$OS" = "linux" ] || return 0
+
+  local name
+  for name in piaware dump1090-fa dump1090-mutability dump1090 readsb dump978-fa \
+              fr24feed rbfeeder pfclient adsbexchange-feed mlat-client tar1090; do
+    process_running "$name" && ADSB_SOFTWARE+=("$name")
+  done
+  for name in acarsdec dumpvdl2 dumphfdl vdlm2dec acars_router; do
+    process_running "$name" && ACARS_SOFTWARE+=("$name")
+  done
+
+  # Docker setups (sdr-enthusiasts ultrafeeder, ACARS Hub, ...), if docker
+  # can be asked without a password.
+  if command -v docker >/dev/null 2>&1; then
+    local line
+    while IFS= read -r line; do
+      case "$line" in
+        *ultrafeeder*|*readsb*|*piaware*|*dump978*|*fr24*|*tar1090*|*adsb*)
+          ADSB_SOFTWARE+=("docker:${line%% *}") ;;
+        *acarshub*|*acarsdec*|*dumpvdl2*|*dumphfdl*|*vdlm2dec*|*acars_router*)
+          ACARS_SOFTWARE+=("docker:${line%% *}") ;;
+      esac
+    done < <(timeout 5 docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null || true)
+  fi
+
+  detect_rtlsdr_serials
+  detect_adsb_devices
+}
+
+# Is this RTL-SDR (index $1, serial $2) one an ADS-B decoder is set to use?
+rtlsdr_used_by_adsb() {
+  local idx="$1" serial="$2" d
+  for d in "${ADSB_DEVICES[@]}"; do
+    [ "$d" = "$idx" ] && return 0
+    [ "$d" = "$serial" ] && return 0
+  done
+  # Common naming for dedicated ADS-B / UAT dongles
+  case "$serial" in
+    *1090*|*978*) return 0 ;;
+  esac
+  return 1
+}
+
+# Choose which RTL-SDR the Airframes decoder should open. Prefers a serial
+# (stable across reboots) when the serials are unique, else an index.
+pick_sdr_device() {
+  [ "$SDR_DEVICE_SET_BY_USER" = true ] && return 0
+  [ "${SELECTED_SDR:-rtlsdr}" = "rtlsdr" ] || return 0
+
+  local count=${#RTLSDR_SERIALS[@]}
+  if [ "$count" -eq 0 ]; then
+    SDR_DEVICE="0"
+    return 0
+  fi
+
+  local unique=true
+  if [ "$(printf '%s\n' "${RTLSDR_SERIALS[@]}" | sort | uniq -d | wc -l)" -gt 0 ] ||
+     printf '%s\n' "${RTLSDR_SERIALS[@]}" | grep -qx unknown; then
+    unique=false
+  fi
+
+  local i free_idx="" free_serial=""
+  for i in "${!RTLSDR_SERIALS[@]}"; do
+    if [ ${#ADSB_SOFTWARE[@]} -gt 0 ] && rtlsdr_used_by_adsb "$i" "${RTLSDR_SERIALS[$i]}"; then
+      continue
+    fi
+    free_idx="$i"
+    free_serial="${RTLSDR_SERIALS[$i]}"
+    break
+  done
+
+  if [ -z "$free_idx" ]; then
+    SDR_DEVICE=""
+    return 1
+  fi
+
+  # With ADS-B running and look-alike serials we cannot tell the dongles
+  # apart: say so rather than guess silently.
+  if [ ${#ADSB_SOFTWARE[@]} -gt 0 ] && [ "$unique" = false ] && [ ${#ADSB_DEVICES[@]} -eq 0 ]; then
+    warn "Can't tell which RTL-SDR the ADS-B decoder uses (the serial numbers look alike)."
+    warn "Using device index ${free_idx}; pass --device <index|serial> to choose another."
+  fi
+
+  if [ "$unique" = true ]; then
+    SDR_DEVICE="$free_serial"
+  else
+    SDR_DEVICE="$free_idx"
+  fi
+  return 0
+}
+
+join_by() {
+  local sep="$1" out="" item
+  shift
+  for item in "$@"; do out+="${out:+$sep}${item}"; done
+  echo "$out"
+}
+
+# Explain what was found. Returns 1 when ADS-B software holds every RTL-SDR
+# (nothing left for an Airframes decoder).
+show_existing_setup() {
+  local blocked=0
+
+  if [ ${#ADSB_SOFTWARE[@]} -gt 0 ]; then
+    echo
+    info "Found ADS-B software on this machine: ${BOLD}$(join_by ', ' "${ADSB_SOFTWARE[@]}")${RESET}"
+    echo -e "  Airframes collects ${BOLD}ACARS, VDL2 and HFDL${RESET} messages, not ADS-B. Your ADS-B"
+    echo -e "  feeding stays as it is; this installer adds a decoder next to it, and that"
+    echo -e "  decoder needs its own SDR (an unfiltered one tuned to VHF or HF)."
+  fi
+
+  if [ ${#ACARS_SOFTWARE[@]} -gt 0 ]; then
+    echo
+    info "Found ACARS/VDL2/HFDL software already running: ${BOLD}$(join_by ', ' "${ACARS_SOFTWARE[@]}")${RESET}"
+    echo -e "  If it already decodes, you can feed Airframes from it without reinstalling:"
+    echo -e "  ${DIM}https://docs.airframes.io/docs/feeding/how${RESET}"
+  fi
+
+  if [ "${SELECTED_SDR:-rtlsdr}" = "rtlsdr" ] && [ ${#ADSB_SOFTWARE[@]} -gt 0 ]; then
+    local n=${#RTLSDR_SERIALS[@]}
+    if [ "$n" -eq 0 ]; then
+      warn "No RTL-SDR found over USB. Plug in a second SDR for Airframes before starting the decoder."
+    elif [ -z "$SDR_DEVICE" ]; then
+      warn "Found ${n} RTL-SDR(s) (serial $(join_by ', ' "${RTLSDR_SERIALS[@]}")), and the ADS-B decoder appears to use all of them."
+      warn "Plug in another SDR for Airframes, or pass --device <index|serial> if this is wrong."
+      blocked=1
+    else
+      ok "RTL-SDRs: $(join_by ', ' "${RTLSDR_SERIALS[@]}"). Airframes will use ${BOLD}${SDR_DEVICE}${RESET}, leaving the ADS-B one alone."
+    fi
+  fi
+
+  return $blocked
+}
+
+# Detect and report what is on the machine before installing. Asks whether
+# to go on when ADS-B holds every SDR; does not stop a non-interactive run.
+check_existing_setup() {
+  detect_existing_setup
+  local blocked=0
+  pick_sdr_device || blocked=1
+  show_existing_setup || blocked=1
+  if [ "$blocked" -eq 1 ] && [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ]; then
+    echo
+    if ! ui_confirm "Install anyway (you can plug in another SDR later)?" "yes"; then
+      info "Stopped. Nothing was installed."
+      exit 0
+    fi
+  fi
+  [ -n "$SDR_DEVICE" ] || SDR_DEVICE="0"
+  return 0
 }
 
 # ===========================================================================
@@ -1322,6 +1572,12 @@ install_with_docker() {
       ;;
   esac
 
+  # sdr-enthusiasts images pick the RTL-SDR by serial
+  if [ "${SELECTED_SDR:-rtlsdr}" = "rtlsdr" ] && [ -n "$SDR_DEVICE" ] && [[ ! "$SDR_DEVICE" =~ ^[0-9]$ ]]; then
+    env_block+="
+      SERIAL: \"${SDR_DEVICE}\""
+  fi
+
   sudo tee "$compose_file" >/dev/null << EOF
 version: '3.8'
 services:
@@ -1434,6 +1690,22 @@ install_from_binary() {
 
   tar xzf "${tmpdir}/${decoder}.tar.gz" -C "$tmpdir"
 
+  # A binary built against a newer glibc, or missing a library, fails at
+  # start with "GLIBC_2.38 not found" and the like. Check before installing
+  # and build from source instead.
+  if [ -f "${tmpdir}/bin/${decoder}" ] && [ "$OS" = "linux" ] && command -v ldd >/dev/null 2>&1; then
+    local missing
+    missing=$(LD_LIBRARY_PATH="${tmpdir}/lib" ldd "${tmpdir}/bin/${decoder}" 2>&1 | grep "not found" || true)
+    if [ -n "$missing" ]; then
+      warn "The pre-built ${decoder} doesn't run on this system:"
+      echo "$missing" | sed 's/^[[:space:]]*/    /' >&2
+      info "Falling back to compile from source..."
+      rm -rf "$tmpdir"
+      install_from_source "$decoder"
+      return
+    fi
+  fi
+
   # Install binary
   if [ -f "${tmpdir}/bin/${decoder}" ]; then
     sudo install -m 0755 "${tmpdir}/bin/${decoder}" "/usr/local/bin/${decoder}"
@@ -1482,6 +1754,14 @@ build_run_command() {
   local port="${FEED_PORT:-${DECODER_FEED_PORT[$decoder]}}"
   local freqs="${FREQUENCIES:-$(get_frequencies "$decoder" "${SELECTED_REGION:-north_america}")}"
   local sdr="${SELECTED_SDR:-rtlsdr}"
+  local dev="${SDR_DEVICE:-0}"
+  # SoapySDR selects RTL-SDRs by serial or index with different keys
+  local soapy_rtl="driver=rtlsdr"
+  if [[ "$dev" =~ ^[0-9]$ ]]; then
+    [ "$dev" != "0" ] && soapy_rtl+=",rtl=${dev}"
+  else
+    soapy_rtl+=",serial=${dev}"
+  fi
 
   # The station ident, as an option for each decoder. Airframes files incoming
   # data under the ident the decoder sends: without it the feed lands on an
@@ -1504,7 +1784,7 @@ build_run_command() {
 
   case "$decoder" in
     acarsdec)
-      echo "acarsdec -v -o 4 -g 42${id_short} -j ${host}:${port} -r 0 ${freqs}"
+      echo "acarsdec -v -o 4 -g 42${id_short} -j ${host}:${port} -r ${dev} ${freqs}"
       ;;
     dumpvdl2)
       # dumpvdl2 takes frequencies in Hz
@@ -1517,7 +1797,7 @@ build_run_command() {
         fi
       done
       case "$sdr" in
-        rtlsdr)  echo "dumpvdl2 --rtlsdr 0${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
+        rtlsdr)  echo "dumpvdl2 --rtlsdr ${dev}${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
         airspy)  echo "dumpvdl2 --airspy 0${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
         sdrplay) echo "dumpvdl2 --soapysdr driver=sdrplay${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
       esac
@@ -1528,13 +1808,13 @@ build_run_command() {
         freq_args+=" ${f}"
       done
       case "$sdr" in
-        rtlsdr)  echo "dumphfdl --soapysdr driver=rtlsdr --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
+        rtlsdr)  echo "dumphfdl --soapysdr ${soapy_rtl} --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
         airspy)  echo "dumphfdl --soapysdr driver=airspy --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
         sdrplay) echo "dumphfdl --soapysdr driver=sdrplay --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
       esac
       ;;
     vdlm2dec)
-      echo "vdlm2dec -v -G -E -U${id_short} -j ${host}:${port} -r 0 ${freqs}"
+      echo "vdlm2dec -v -G -E -U${id_short} -j ${host}:${port} -r ${dev} ${freqs}"
       ;;
   esac
 }
@@ -1782,17 +2062,22 @@ Options:
   --token TOKEN           Use station token from web wizard
   --region REGION         Set region (north_america, europe, asia_pacific)
   --sdr TYPE              Set SDR type (rtlsdr, airspy, sdrplay)
+  --device ID             RTL-SDR to use, by index or serial (default: the
+                          first one an ADS-B decoder isn't using)
   --method METHOD         Install method (binary, source, docker)
   --no-tui                Disable gum TUI, use plain menus
   --no-service            Don't offer to create systemd service
   --freq "F1 F2 ..."      Override frequencies
 
 Examples:
-  bash <(curl -sSL https://install.airframes.sh/installer)
-  bash <(curl -sSL https://install.airframes.sh/installer) acarsdec
-  bash <(curl -sSL https://install.airframes.sh/installer) --token abc123
-  bash <(curl -sSL https://install.airframes.sh/installer) -y all --region north_america
-  bash <(curl -sSL https://install.airframes.sh/installer) dumpvdl2 --sdr airspy --method docker
+  curl -sSL https://install.airframes.sh/installer | bash
+  curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
+  curl -sSL https://install.airframes.sh/installer | bash -s -- --token abc123
+  curl -sSL https://install.airframes.sh/installer | bash -s -- -y all --region north_america
+  curl -sSL https://install.airframes.sh/installer | bash -s -- dumpvdl2 --device 00000002
+
+Airframes collects ACARS, VDL2 and HFDL. It does not take ADS-B: on a
+PiAware or other ADS-B box, use a second SDR for the decoder installed here.
 EOF
 }
 
@@ -1825,6 +2110,11 @@ parse_args() {
         ;;
       --method)
         SELECTED_METHOD="$2"
+        shift 2
+        ;;
+      --device)
+        SDR_DEVICE="$2"
+        SDR_DEVICE_SET_BY_USER=true
         shift 2
         ;;
       --no-tui)
@@ -2005,6 +2295,9 @@ tui_confirm_install() {
   echo -e "  ${BOLD}Method:${RESET}    ${SELECTED_METHOD}"
   echo -e "  ${BOLD}Region:${RESET}    ${SELECTED_REGION}"
   echo -e "  ${BOLD}SDR:${RESET}       ${SELECTED_SDR}"
+  if [ "$SELECTED_SDR" = "rtlsdr" ] && [ -n "$SDR_DEVICE" ]; then
+    echo -e "  ${BOLD}Device:${RESET}    ${SDR_DEVICE}"
+  fi
   if [ -n "$STATION_IDENT" ]; then
     echo -e "  ${BOLD}Station:${RESET}   ${STATION_IDENT}"
   fi
@@ -2071,8 +2364,11 @@ tui_flow() {
 
   # Install gum for TUI
   if [ "$USE_GUM" = true ]; then
-    install_gum
+    install_gum || { warn "Could not install gum, using plain menus"; HAS_GUM=false; }
   fi
+
+  # ADS-B / decoders already on this machine
+  check_existing_setup
 
   # Decoder selection
   tui_select_decoders
@@ -2118,6 +2414,8 @@ tui_flow() {
 # ===========================================================================
 
 main() {
+  if [ -t 0 ]; then IS_TTY=true; else IS_TTY=false; fi
+
   parse_args "$@"
   detect_platform
 
@@ -2146,6 +2444,8 @@ main() {
     if [ -z "$SELECTED_REGION" ]; then
       SELECTED_REGION=$(detect_region_from_timezone)
     fi
+
+    check_existing_setup
 
     install_base_deps
     mkdir -p "$BUILD_DIR"
@@ -2194,6 +2494,8 @@ main() {
       SELECTED_REGION=$(detect_region_from_timezone)
     fi
 
+    check_existing_setup
+
     if [ "$AUTO_YES" = false ]; then
       if ! ui_confirm "Install ${SELECTED_DECODERS[*]}?"; then
         info "Aborted."
@@ -2228,12 +2530,34 @@ main() {
   if [ "$IS_TTY" = true ]; then
     tui_flow
   else
-    # Piped without args and without a TTY — show help
-    err "No decoder specified and no interactive terminal detected."
+    # No terminal to ask on (cron, CI, ssh without -t, docker without -t)
+    # and no decoder named. Say exactly what to run instead.
+    show_banner
+    detect_existing_setup
+    pick_sdr_device || true
+    show_existing_setup || true
     echo
-    usage
+    echo -e "${RED}[airframes]${RESET} There is no terminal to ask questions on, and no decoder was named."
+    echo
+    echo "  Run it from a terminal to pick from a menu:"
+    echo "    curl -sSL https://install.airframes.sh/installer | bash"
+    echo
+    echo "  Or name what to install (acarsdec, dumpvdl2, dumphfdl, vdlm2dec or all):"
+    echo "    curl -sSL https://install.airframes.sh/installer | bash -s -- -y acarsdec"
+    echo
+    echo "  More options: curl -sSL https://install.airframes.sh/installer | bash -s -- --help"
     exit 1
   fi
 }
 
-main "$@"
+# Entry point. With "curl ... | bash", bash reads this script from stdin, so
+# prompts would read the script instead of the keyboard. When a terminal is
+# there (/dev/tty opens), give main() the terminal as stdin; bash keeps
+# reading the rest of the script (only "exit" below) from the pipe.
+# AIRFRAMES_NO_TTY=1 skips this, for tests and automation.
+if [ ! -t 0 ] && [ -z "${AIRFRAMES_NO_TTY:-}" ] && { : </dev/tty; } 2>/dev/null; then
+  main "$@" </dev/tty
+else
+  main "$@"
+fi
+exit $?

@@ -55,11 +55,24 @@
 
         <div class="install-section">
           <h3>Quick Start</h3>
+          <p class="install-step">Run this in a terminal on the machine with your SDR. It asks which decoder to install and sets up feeding to Airframes.</p>
           <div class="code-block">
-            <code>curl -sSL https://install.airframes.sh/installer | bash</code>
-            <button class="copy-btn" onclick="navigator.clipboard.writeText('curl -sSL https://install.airframes.sh/installer | bash')">Copy</button>
+            <code>curl -sSL https://install.airframes.sh/installer <span class="nowrap">| bash</span></code>
+            <button class="copy-btn" data-copy="curl -sSL https://install.airframes.sh/installer | bash">Copy</button>
           </div>
-          <p class="install-note">Supports Linux, macOS, and Windows (WSL)</p>
+
+          <p class="install-step">Know what you want? Name the decoder (<code>acarsdec</code>, <code>dumpvdl2</code>, <code>dumphfdl</code>, <code>vdlm2dec</code> or <code>all</code>) and skip the questions:</p>
+          <div class="code-block">
+            <code>curl -sSL https://install.airframes.sh/installer <span class="nowrap">| bash -s -- -y acarsdec</span></code>
+            <button class="copy-btn" data-copy="curl -sSL https://install.airframes.sh/installer | bash -s -- -y acarsdec">Copy</button>
+          </div>
+
+          <div class="install-callout">
+            <strong>Already feeding ADS-B?</strong> (PiAware, ADS-B Exchange, FR24, readsb)
+            Airframes collects ACARS, VDL2 and HFDL messages, not ADS-B. Plug in a second SDR for Airframes and run the same command: the installer finds your ADS-B setup and leaves its SDR alone.
+          </div>
+
+          <p class="install-note">Supports Linux, macOS, and Windows (WSL). See all options with <code class="nowrap">| bash -s -- --help</code>, or read the <a href="https://docs.airframes.io/docs/feeding/how">feeding guide</a>.</p>
         </div>
       </main>
 
@@ -76,5 +89,15 @@
       </footer>
     </div>
     <div id="bg"></div>
+    <script>
+      document.querySelectorAll('.copy-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          navigator.clipboard.writeText(btn.dataset.copy).then(function () {
+            btn.textContent = 'Copied';
+            setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+          });
+        });
+      });
+    </script>
   </body>
 </html>
