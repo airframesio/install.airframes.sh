@@ -2147,8 +2147,13 @@ install_xng_native() {
     if curl -fsSL "${base}/xng-${ver}-${debarch}.deb" -o "${tmp}/xng.deb" 2>/dev/null; then
       chmod 644 "${tmp}/xng.deb"
       if sudo apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
-        local deb_bin
-        deb_bin=$(command -v xng 2>/dev/null || true)
+        # The package's own binary, not the first xng on PATH (an older
+        # tarball install in /usr/local/bin would win there)
+        local deb_bin="" pkg_name
+        pkg_name=$(dpkg-deb -f "${tmp}/xng.deb" Package 2>/dev/null || echo xng)
+        deb_bin=$(dpkg -L "$pkg_name" 2>/dev/null | grep -E '/s?bin/xng$' | head -1 || true)
+        [ -n "$deb_bin" ] || deb_bin=/usr/bin/xng
+        [ -x "$deb_bin" ] || deb_bin=""
         if [ -n "$deb_bin" ] && "$deb_bin" --version >/dev/null 2>&1; then
           XNG_BIN="$deb_bin"
           rm -rf "$tmp"
