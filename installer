@@ -44,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
@@ -2124,35 +2124,61 @@ blacklist_dvb() {
   sudo modprobe -r dvb_usb_rtl28xxu 2>/dev/null || true
 }
 
-# Native install: the release .deb or tarball when it runs here (glibc and
-# libraries), else 1 so the caller can use Docker.
+# Native install: the release .deb on apt systems (it brings SoapySDR and the
+# SDR libraries), else the tarball, when the binary runs here; else 1 so the
+# caller can use Docker. Releases from 0.23.2 have amd64, arm64 and armhf
+# builds for glibc 2.35 and up (Bookworm, Ubuntu 22.04, Pi OS 32-bit).
+XNG_BIN=/usr/local/bin/xng
 install_xng_native() {
-  local ver="$1" target
+  local ver="$1" target debarch
   case "$ARCH" in
-    amd64) target="x86_64-unknown-linux-gnu" ;;
-    arm64) target="aarch64-unknown-linux-gnu" ;;
+    amd64) target="x86_64-unknown-linux-gnu";      debarch=amd64 ;;
+    arm64) target="aarch64-unknown-linux-gnu";     debarch=arm64 ;;
+    armv7) target="armv7-unknown-linux-gnueabihf"; debarch=armhf ;;
     *) return 1 ;;
   esac
   [ "$OS" = "linux" ] || return 1
-  install_xng_runtime
-  local tmp url
+  local tmp base="https://github.com/airframesio/xng/releases/download/v${ver}"
   tmp=$(mktemp -d)
-  url="https://github.com/airframesio/xng/releases/download/v${ver}/xng-v${ver}-${target}.tar.gz"
+
+  if [ "$PKG" = "apt" ] && command -v dpkg >/dev/null 2>&1 &&
+     [ "$(dpkg --print-architecture 2>/dev/null)" = "$debarch" ]; then
+    substep "Downloading xng ${ver} (${debarch}.deb)"
+    if curl -fsSL "${base}/xng-${ver}-${debarch}.deb" -o "${tmp}/xng.deb" 2>/dev/null; then
+      chmod 644 "${tmp}/xng.deb"
+      if sudo apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
+        local deb_bin
+        deb_bin=$(command -v xng 2>/dev/null || true)
+        if [ -n "$deb_bin" ] && "$deb_bin" --version >/dev/null 2>&1; then
+          XNG_BIN="$deb_bin"
+          rm -rf "$tmp"
+          ok "Installed $("$XNG_BIN" --version 2>/dev/null | head -1) (package)"
+          return 0
+        fi
+        substep "The xng ${ver} package doesn't run here; trying the tarball"
+      else
+        substep "apt couldn't install the xng ${ver} package; trying the tarball"
+      fi
+    fi
+  fi
+
+  install_xng_runtime
   substep "Downloading xng ${ver} (${target})"
-  if ! curl -fsSL "$url" -o "${tmp}/xng.tgz" || ! tar xzf "${tmp}/xng.tgz" -C "$tmp"; then
+  if ! curl -fsSL "${base}/xng-v${ver}-${target}.tar.gz" -o "${tmp}/xng.tgz" || ! tar xzf "${tmp}/xng.tgz" -C "$tmp"; then
     rm -rf "$tmp"; return 1
   fi
   local bin
   bin=$(find "$tmp" -type f -name xng -perm -u+x | head -1)
   if [ -z "$bin" ] || ! "$bin" --version >/dev/null 2>&1; then
-    local why
-    why=$("$bin" --version 2>&1 | grep -o "GLIBC_[0-9.]*\|lib[A-Za-z0-9_.-]*: cannot open" | head -1)
+    local why=""
+    [ -n "$bin" ] && why=$("$bin" --version 2>&1 | grep -o "GLIBC_[0-9.]*\|lib[A-Za-z0-9_.-]*: cannot open" | head -1)
     substep "The xng ${ver} binary doesn't run on this system${why:+ (${why})}"
     rm -rf "$tmp"; return 1
   fi
   sudo install -m 755 "$bin" /usr/local/bin/xng
+  XNG_BIN=/usr/local/bin/xng
   rm -rf "$tmp"
-  ok "Installed $(/usr/local/bin/xng --version 2>/dev/null | head -1)"
+  ok "Installed $("$XNG_BIN" --version 2>/dev/null | head -1)"
 }
 
 install_xng_service_native() {
@@ -2169,7 +2195,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/xng station ${XNG_CONFIG_DIR}/station.toml
+ExecStart=${XNG_BIN} station ${XNG_CONFIG_DIR}/station.toml
 Restart=on-failure
 RestartSec=10
 User=xng
