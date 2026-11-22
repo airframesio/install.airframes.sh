@@ -42,10 +42,16 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="2.1.0"
+VERSION="2.1.1"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
-BUILD_DIR="/tmp/airframes-build"
+# Private per-run build directory. A fixed path under /tmp let any other local
+# user plant sources there before we run `sudo make install` on them.
+BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/airframes-build.XXXXXX")" || {
+  echo "Could not create a temporary build directory" >&2
+  exit 1
+}
+trap 'rm -rf "$BUILD_DIR"' EXIT
 CONFIG_DIR="/opt/airframes/config"
 LIBACARS_REPO="https://github.com/szpajder/libacars.git"
 GUM_VERSION="0.14.5"
@@ -484,9 +490,8 @@ install_gum_binary() {
   [ "$gum_arch" = "armv7" ] && gum_arch="armv7"
 
   local url="https://github.com/charmbracelet/gum/releases/download/v${GUM_VERSION}/gum_${GUM_VERSION}_${gum_os}_${gum_arch}.tar.gz"
-  local tmp="/tmp/gum-install"
-
-  mkdir -p "$tmp"
+  local tmp
+  tmp=$(mktemp -d) || return 1
   if curl -fsSL "$url" | tar xz -C "$tmp" 2>/dev/null; then
     sudo install -m 755 "$tmp/gum" /usr/local/bin/gum 2>/dev/null || {
       install -m 755 "$tmp/gum" "$HOME/.local/bin/gum" 2>/dev/null
@@ -1630,9 +1635,9 @@ create_launchd_service() {
   local service_label="io.airframes.${decoder}"
   local plist_dir="$HOME/Library/LaunchAgents"
   local plist_file="${plist_dir}/${service_label}.plist"
-  local logfile="/tmp/airframes-${decoder}.log"
+  local logfile="${HOME}/Library/Logs/airframes-${decoder}.log"
 
-  mkdir -p "$plist_dir"
+  mkdir -p "$plist_dir" "${HOME}/Library/Logs"
 
   step "Creating launchd service: ${service_label}"
 
@@ -1703,7 +1708,7 @@ install_manager_script() {
   local manager_path="${install_dir}/airframes"
 
   # Try to download from repo; fall back to bundled copy from build dir
-  local tmp_script="/tmp/airframes-manager-download"
+  local tmp_script="${BUILD_DIR}/airframes-manager-download"
   if curl -fsSL "$script_url" -o "$tmp_script" 2>/dev/null; then
     sudo install -m 0755 "$tmp_script" "$manager_path"
     rm -f "$tmp_script"
