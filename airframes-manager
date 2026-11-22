@@ -245,6 +245,15 @@ EOF
   ok "Service ${service_name} created"
 }
 
+# Escape &, < and > for a plist <string>.
+xml_escape() {
+  local s="$1"
+  s="${s//&/\&amp;}"
+  s="${s//</\&lt;}"
+  s="${s//>/\&gt;}"
+  printf '%s' "$s"
+}
+
 create_launchd_service() {
   local decoder="$1"
   local cmd="$2"
@@ -266,11 +275,11 @@ create_launchd_service() {
   local first=true
   for arg in $cmd; do
     if [ "$first" = true ]; then
-      args_xml="${args_xml}    <string>${bin_path}</string>
+      args_xml="${args_xml}    <string>$(xml_escape "$bin_path")</string>
 "
       first=false
     else
-      args_xml="${args_xml}    <string>${arg}</string>
+      args_xml="${args_xml}    <string>$(xml_escape "$arg")</string>
 "
     fi
   done
@@ -290,9 +299,9 @@ ${args_xml}  </array>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${logfile}</string>
+  <string>$(xml_escape "$logfile")</string>
   <key>StandardErrorPath</key>
-  <string>${logfile}</string>
+  <string>$(xml_escape "$logfile")</string>
 </dict>
 </plist>
 EOF
