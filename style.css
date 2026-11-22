@@ -250,6 +250,16 @@ header {
   text-align: left;
 }
 
+.install-callout code {
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  color: var(--accent-primary);
+  font-size: 0.9em;
+}
+
+.install-callout a {
+  color: var(--accent-primary);
+}
+
 .install-callout strong {
   color: var(--text-primary, #fff);
 }

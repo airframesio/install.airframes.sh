@@ -108,6 +108,13 @@ SELECTED_REGION=""
 SELECTED_SDR="rtlsdr"
 SDR_DEVICE=""            # RTL-SDR index or serial; empty = pick automatically
 SDR_DEVICE_SET_BY_USER=false
+WANT_ADSB=false          # feed ADS-B to Airframes' partners (Airframes doesn't ingest it)
+ADSB_LAT=""
+ADSB_LON=""
+ADSB_ALT=""
+ADSB_NAME=""
+ADSB_SDR_DEVICE=""
+PLANEWATCH_KEY=""
 STATION_IDENT=""
 FEED_HOST=""
 FEED_PORT=""
@@ -874,7 +881,7 @@ pick_sdr_device() {
 
   local i free_idx="" free_serial=""
   for i in "${!RTLSDR_SERIALS[@]}"; do
-    if [ ${#ADSB_SOFTWARE[@]} -gt 0 ] && rtlsdr_used_by_adsb "$i" "${RTLSDR_SERIALS[$i]}"; then
+    if { [ ${#ADSB_SOFTWARE[@]} -gt 0 ] || [ "$WANT_ADSB" = true ]; } && rtlsdr_used_by_adsb "$i" "${RTLSDR_SERIALS[$i]}"; then
       continue
     fi
     free_idx="$i"
@@ -909,17 +916,15 @@ join_by() {
   echo "$out"
 }
 
-# Explain what was found. Returns 1 when ADS-B software holds every RTL-SDR
-# (nothing left for an Airframes decoder).
+# Explain what is already on the machine.
 show_existing_setup() {
-  local blocked=0
-
   if [ ${#ADSB_SOFTWARE[@]} -gt 0 ]; then
     echo
     info "Found ADS-B software on this machine: ${BOLD}$(join_by ', ' "${ADSB_SOFTWARE[@]}")${RESET}"
-    echo -e "  Airframes collects ${BOLD}ACARS, VDL2 and HFDL${RESET} messages, not ADS-B. Your ADS-B"
-    echo -e "  feeding stays as it is; this installer adds a decoder next to it, and that"
-    echo -e "  decoder needs its own SDR (an unfiltered one tuned to VHF or HF)."
+    echo -e "  Airframes doesn't ingest ADS-B itself; ADS-B goes to Airframes' partner"
+    echo -e "  networks, ${BOLD}Airplanes.Live${RESET} and ${BOLD}Plane Watch${RESET}. Pick \"ADS-B\" below (or pass"
+    echo -e "  ${BOLD}adsb${RESET}) to feed them from the decoder you already run."
+    echo -e "  Feeding Airframes ACARS, VDL2 or HFDL needs another SDR (unfiltered, for VHF or HF)."
   fi
 
   if [ ${#ACARS_SOFTWARE[@]} -gt 0 ]; then
@@ -928,30 +933,46 @@ show_existing_setup() {
     echo -e "  If it already decodes, you can feed Airframes from it without reinstalling:"
     echo -e "  ${DIM}https://docs.airframes.io/docs/feeding/how${RESET}"
   fi
+  return 0
+}
 
-  if [ "${SELECTED_SDR:-rtlsdr}" = "rtlsdr" ] && [ ${#ADSB_SOFTWARE[@]} -gt 0 ]; then
-    local n=${#RTLSDR_SERIALS[@]}
-    if [ "$n" -eq 0 ]; then
-      warn "No RTL-SDR found over USB. Plug in a second SDR for Airframes before starting the decoder."
-    elif [ -z "$SDR_DEVICE" ]; then
-      warn "Found ${n} RTL-SDR(s) (serial $(join_by ', ' "${RTLSDR_SERIALS[@]}")), and the ADS-B decoder appears to use all of them."
-      warn "Plug in another SDR for Airframes, or pass --device <index|serial> if this is wrong."
+check_existing_setup() {
+  detect_existing_setup
+  show_existing_setup
+}
+
+# Once the decoders are chosen: pick the RTL-SDR for the ACARS/VDL2/HFDL
+# decoders, leaving ADS-B dongles alone. Asks whether to go on when nothing
+# is free; does not stop a non-interactive run.
+check_sdr_for_decoders() {
+  [ ${#SELECTED_DECODERS[@]} -gt 0 ] || return 0
+  if [ "${SELECTED_SDR:-rtlsdr}" != "rtlsdr" ]; then
+    [ -n "$SDR_DEVICE" ] || SDR_DEVICE="0"
+    return 0
+  fi
+
+  local blocked=0
+  pick_sdr_device || blocked=1
+
+  # A new ADS-B decoder installed in this run needs a dongle too
+  local adsb_needs_sdr=false
+  if [ "$WANT_ADSB" = true ] && ! adsb_source_ready; then
+    adsb_needs_sdr=true
+  fi
+
+  local n=${#RTLSDR_SERIALS[@]}
+  if [ "$n" -gt 0 ] && { [ ${#ADSB_SOFTWARE[@]} -gt 0 ] || [ "$adsb_needs_sdr" = true ]; }; then
+    if [ "$blocked" -eq 1 ]; then
+      warn "Found ${n} RTL-SDR(s) (serial $(join_by ', ' "${RTLSDR_SERIALS[@]}")), and ADS-B appears to use all of them."
+      warn "Plug in another SDR for ${SELECTED_DECODERS[*]}, or pass --device <index|serial> if this is wrong."
+    elif [ "$adsb_needs_sdr" = true ] && [ "$n" -lt 2 ]; then
+      warn "ADS-B and ${SELECTED_DECODERS[*]} each need their own SDR, and only ${n} RTL-SDR is plugged in."
       blocked=1
     else
-      ok "RTL-SDRs: $(join_by ', ' "${RTLSDR_SERIALS[@]}"). Airframes will use ${BOLD}${SDR_DEVICE}${RESET}, leaving the ADS-B one alone."
+      ok "RTL-SDRs: $(join_by ', ' "${RTLSDR_SERIALS[@]}"). ${SELECTED_DECODERS[*]} will use ${BOLD}${SDR_DEVICE}${RESET}, leaving ADS-B its own."
     fi
   fi
 
-  return $blocked
-}
-
-# Detect and report what is on the machine before installing. Asks whether
-# to go on when ADS-B holds every SDR; does not stop a non-interactive run.
-check_existing_setup() {
-  detect_existing_setup
-  local blocked=0
-  pick_sdr_device || blocked=1
-  show_existing_setup || blocked=1
   if [ "$blocked" -eq 1 ] && [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ]; then
     echo
     if ! ui_confirm "Install anyway (you can plug in another SDR later)?" "yes"; then
@@ -961,6 +982,289 @@ check_existing_setup() {
   fi
   [ -n "$SDR_DEVICE" ] || SDR_DEVICE="0"
   return 0
+}
+
+# ===========================================================================
+# Section 8b: ADS-B for Airframes' partner networks
+# ===========================================================================
+#
+# Airframes does not ingest ADS-B. When asked for "adsb", this installer
+# feeds Airframes' ADS-B partners instead:
+#   - Airplanes.Live: their feed client (github.com/airplanes-live/feed),
+#     Beast to feed.airplanes.live:30004 and MLAT to :31090. On the docker
+#     path, ultrafeeder sends both itself.
+#   - Plane Watch: their docker feeder, which needs an API key from
+#     https://atc.plane.watch.
+# The Beast data comes from the ADS-B decoder already on the machine
+# (127.0.0.1:30005), or from readsb (wiedehopf's installer) or ultrafeeder
+# installed here when there is none.
+
+AIRPLANES_LIVE_REPO="https://github.com/airplanes-live/feed.git"
+AIRPLANES_LIVE_DIR="/usr/local/share/airplanes"
+READSB_INSTALL_URL="https://raw.githubusercontent.com/wiedehopf/adsb-scripts/master/readsb-install.sh"
+PLANEWATCH_IMAGE="ghcr.io/plane-watch/docker-plane-watch:latest"
+ULTRAFEEDER_IMAGE="ghcr.io/sdr-enthusiasts/docker-adsb-ultrafeeder:latest"
+
+# Is a Beast stream already served on 127.0.0.1:30005?
+adsb_source_ready() {
+  (exec 3<>/dev/tcp/127.0.0.1/30005) 2>/dev/null && return 0
+  [ ${#ADSB_SOFTWARE[@]} -gt 0 ]
+}
+
+# "120", "120m", "394ft" -> "120m" / "394ft" (what mlat-client and the
+# partner feeders expect). Empty on bad input.
+normalize_altitude() {
+  local a="${1// /}"
+  if [[ "$a" =~ ^-?[0-9]+(\.[0-9]+)?(m|ft)$ ]]; then echo "$a"
+  elif [[ "$a" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then echo "${a}m"
+  fi
+}
+
+valid_coord() {  # valid_coord <value> <limit>
+  [[ "$1" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]] && awk -v v="$1" -v l="$2" 'BEGIN { exit !(v >= -l && v <= l && v != 0) }'
+}
+
+# Antenna location and MLAT name: from options, else asked. Exits when they
+# are missing and there is nobody to ask, before anything is installed.
+adsb_collect_location() {
+  local tries
+  if [ "$IS_TTY" = true ]; then
+    if [ -z "$ADSB_LAT" ] || [ -z "$ADSB_LON" ] || [ -z "$ADSB_ALT" ]; then
+      echo
+      info "ADS-B feeding and MLAT need your antenna's position (it's never shown exactly)."
+    fi
+    tries=0
+    until valid_coord "$ADSB_LAT" 90; do
+      [ $((tries++)) -lt 5 ] || { err "No valid latitude, stopping."; exit 1; }
+      ADSB_LAT=$(ui_input "Antenna latitude, decimal degrees (e.g. 38.68001)")
+    done
+    tries=0
+    until valid_coord "$ADSB_LON" 180; do
+      [ $((tries++)) -lt 5 ] || { err "No valid longitude, stopping."; exit 1; }
+      ADSB_LON=$(ui_input "Antenna longitude, decimal degrees (e.g. -120.99436)")
+    done
+    tries=0
+    until [ -n "$(normalize_altitude "$ADSB_ALT")" ]; do
+      [ $((tries++)) -lt 5 ] || { err "No valid altitude, stopping."; exit 1; }
+      ADSB_ALT=$(ui_input "Antenna altitude above sea level, with m or ft (e.g. 120m)")
+    done
+    if [ -z "$ADSB_NAME" ]; then
+      ADSB_NAME=$(ui_input "Name for the MLAT map (no spaces)" "${STATION_IDENT:-$(hostname -s 2>/dev/null || echo airframes)}")
+    fi
+  fi
+
+  local missing=()
+  valid_coord "$ADSB_LAT" 90 || missing+=("--lat")
+  valid_coord "$ADSB_LON" 180 || missing+=("--lon")
+  [ -n "$(normalize_altitude "$ADSB_ALT")" ] || missing+=("--alt")
+  if [ ${#missing[@]} -gt 0 ]; then
+    err "ADS-B feeding needs the antenna position: $(join_by ', ' "${missing[@]}")"
+    echo "  e.g. curl -sSL https://install.airframes.sh/installer | bash -s -- -y adsb --lat 38.68001 --lon -120.99436 --alt 120m"
+    exit 1
+  fi
+  ADSB_ALT=$(normalize_altitude "$ADSB_ALT")
+  ADSB_NAME="${ADSB_NAME:-${STATION_IDENT:-$(hostname -s 2>/dev/null || echo airframes)}}"
+  ADSB_NAME="${ADSB_NAME//[^A-Za-z0-9._-]/_}"
+
+  if [ -z "$PLANEWATCH_KEY" ] && [ "$IS_TTY" = true ]; then
+    echo
+    info "Plane Watch needs a free API key: create a feeder at ${BOLD}https://atc.plane.watch${RESET}"
+    PLANEWATCH_KEY=$(ui_input "Plane Watch API key (leave blank to skip)")
+  fi
+  return 0
+}
+
+# RTL-SDR for a readsb/ultrafeeder installed here: --adsb-device, else a
+# serial that says 1090, else the first one the other decoders don't use.
+adsb_pick_device() {
+  [ -n "$ADSB_SDR_DEVICE" ] && return 0
+  local i serial
+  for i in "${!RTLSDR_SERIALS[@]}"; do
+    serial="${RTLSDR_SERIALS[$i]}"
+    if [[ "$serial" == *1090* ]] && [ "$serial" != "$SDR_DEVICE" ]; then
+      ADSB_SDR_DEVICE="$serial"; return 0
+    fi
+  done
+  for i in "${!RTLSDR_SERIALS[@]}"; do
+    serial="${RTLSDR_SERIALS[$i]}"
+    if [ ${#SELECTED_DECODERS[@]} -gt 0 ] && { [ "$serial" = "$SDR_DEVICE" ] || [ "$i" = "$SDR_DEVICE" ]; }; then
+      continue
+    fi
+    if [ "$serial" != "unknown" ] && [ "$(printf '%s\n' "${RTLSDR_SERIALS[@]}" | grep -cx "$serial")" -eq 1 ]; then
+      ADSB_SDR_DEVICE="$serial"
+    else
+      ADSB_SDR_DEVICE="$i"
+    fi
+    return 0
+  done
+  ADSB_SDR_DEVICE="0"
+}
+
+install_readsb_native() {
+  step "Installing readsb (ADS-B decoder) with wiedehopf's installer"
+  local tmp
+  tmp=$(mktemp -d)
+  curl -fsSL "$READSB_INSTALL_URL" -o "${tmp}/readsb-install.sh"
+  sudo bash "${tmp}/readsb-install.sh"
+  rm -rf "$tmp"
+
+  if [ -f /etc/default/readsb ]; then
+    sudo sed -i -E "/^[[:space:]]*#/b; s/--device[ =][^ \"]*/--device ${ADSB_SDR_DEVICE}/" /etc/default/readsb
+    substep "readsb uses RTL-SDR ${ADSB_SDR_DEVICE}"
+  fi
+  if command -v readsb-set-location >/dev/null 2>&1 || [ -x /usr/local/bin/readsb-set-location ]; then
+    sudo /usr/local/bin/readsb-set-location "$ADSB_LAT" "$ADSB_LON" >/dev/null
+  fi
+  sudo systemctl restart readsb 2>/dev/null || true
+  ok "readsb installed (map at http://$(hostname -I 2>/dev/null | awk '{print $1}')/tar1090)"
+}
+
+feed_airplanes_live_native() {
+  step "Feeding Airplanes.Live"
+  if [ -f /etc/default/airplanes ]; then
+    ok "Already set up for Airplanes.Live (/etc/default/airplanes); leaving it as it is."
+    return 0
+  fi
+  if [ -f /boot/airplanes-config.txt ]; then
+    ok "This is an Airplanes.Live image, which already feeds Airplanes.Live."
+    return 0
+  fi
+
+  command -v git >/dev/null 2>&1 || pkg_install git
+  sudo mkdir -p "$AIRPLANES_LIVE_DIR"
+  if [ ! -d "${AIRPLANES_LIVE_DIR}/git/.git" ]; then
+    sudo git clone --depth 1 "$AIRPLANES_LIVE_REPO" "${AIRPLANES_LIVE_DIR}/git"
+  fi
+
+  # Same settings the Airplanes.Live setup dialogs write
+  sudo tee /etc/default/airplanes >/dev/null << EOF
+INPUT="127.0.0.1:30005"
+REDUCE_INTERVAL="0.5"
+
+# feed name for checking MLAT sync, also shown on the MLAT map
+USER="${ADSB_NAME}"
+
+LATITUDE="${ADSB_LAT}"
+LONGITUDE="${ADSB_LON}"
+
+ALTITUDE="${ADSB_ALT}"
+
+# source for 978 data (dump978 --raw-port); harmless when not receiving 978
+UAT_INPUT="127.0.0.1:30978"
+
+RESULTS="--results beast,connect,127.0.0.1:30104"
+RESULTS2="--results basestation,listen,31015"
+RESULTS3="--results beast,listen,30157"
+RESULTS4="--results beast,connect,127.0.0.1:30187"
+# add --privacy between the quotes below to hide the feed name on the mlat map
+PRIVACY=""
+INPUT_TYPE="dump1090"
+
+MLATSERVER="feed.airplanes.live:31090"
+TARGET="--net-connector feed.airplanes.live,30004,beast_reduce_plus_out,feed.airplanes.live,64004"
+NET_OPTIONS="--net-heartbeat 60 --net-ro-size 1280 --net-ro-interval 0.2 --net-ro-port 0 --net-sbs-port 0 --net-bi-port 30187 --net-bo-port 0 --net-ri-port 0 --write-json-every 1 --uuid-file /usr/local/share/airplanes/airplanes-uuid"
+JSON_OPTIONS="--max-range 450 --json-location-accuracy 2 --range-outline-hours 24"
+EOF
+
+  (cd "${AIRPLANES_LIVE_DIR}/git" && sudo bash ./update.sh)
+  ok "Feeding Airplanes.Live. Check it at ${BOLD}https://airplanes.live/myfeed${RESET}"
+}
+
+feed_planewatch_docker() {
+  [ -n "$PLANEWATCH_KEY" ] || return 0
+  step "Feeding Plane Watch"
+  if ! ensure_docker; then
+    warn "Plane Watch's feeder runs in Docker; skipping it."
+    return 0
+  fi
+  local dir="${CONFIG_DIR}/planewatch"
+  sudo mkdir -p "$dir"
+  sudo tee "${dir}/docker-compose.yml" >/dev/null << EOF
+services:
+  planewatch:
+    image: ${PLANEWATCH_IMAGE}
+    container_name: airframes-planewatch
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      API_KEY: "${PLANEWATCH_KEY}"
+      BEASTHOST: "127.0.0.1"
+      BEASTPORT: "30005"
+      LAT: "${ADSB_LAT}"
+      LONG: "${ADSB_LON}"
+      ALT: "${ADSB_ALT}"
+      ENABLE_MLAT: "true"
+      TZ: "${TZ:-UTC}"
+EOF
+  sudo chmod 600 "${dir}/docker-compose.yml"
+  (cd "$dir" && sudo docker compose up -d)
+  ok "Feeding Plane Watch. Check it at ${BOLD}https://atc.plane.watch${RESET}"
+}
+
+# Docker path with no ADS-B decoder yet: ultrafeeder decodes and feeds
+# Airplanes.Live (Beast + MLAT) itself.
+install_ultrafeeder_docker() {
+  ensure_docker || return 1
+  step "Setting up ADS-B Ultrafeeder (Docker)"
+  local dev="$ADSB_SDR_DEVICE"
+  local dir="${CONFIG_DIR}/adsb"
+  sudo mkdir -p "$dir"
+  sudo tee "${dir}/docker-compose.yml" >/dev/null << EOF
+services:
+  ultrafeeder:
+    image: ${ULTRAFEEDER_IMAGE}
+    container_name: airframes-ultrafeeder
+    restart: unless-stopped
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    ports:
+      - "8080:80"
+      - "30005:30005"
+    environment:
+      READSB_DEVICE_TYPE: "rtlsdr"
+      READSB_RTLSDR_DEVICE: "${dev}"
+      READSB_GAIN: "autogain"
+      READSB_LAT: "${ADSB_LAT}"
+      READSB_LON: "${ADSB_LON}"
+      READSB_ALT: "${ADSB_ALT}"
+      MLAT_USER: "${ADSB_NAME}"
+      TZ: "${TZ:-UTC}"
+      ULTRAFEEDER_CONFIG: "adsb,feed.airplanes.live,30004,beast_reduce_plus_out;mlat,feed.airplanes.live,31090,39003"
+    tmpfs:
+      - /run:exec,size=256M
+      - /tmp:size=128M
+      - /var/log:size=32M
+EOF
+  (cd "$dir" && sudo docker compose up -d)
+  ok "Ultrafeeder is decoding ADS-B and feeding Airplanes.Live (map at http://localhost:8080)"
+}
+
+setup_adsb() {
+  [ "$WANT_ADSB" = true ] || return 0
+  echo
+  step "ADS-B for Airframes' partners (Airplanes.Live, Plane Watch)"
+
+  if adsb_source_ready; then
+    if [ ${#ADSB_SOFTWARE[@]} -gt 0 ]; then
+      ok "Using your ADS-B decoder (${ADSB_SOFTWARE[*]}) on port 30005."
+    else
+      ok "Using the ADS-B data already served on port 30005."
+    fi
+    feed_airplanes_live_native
+  elif [ "$SELECTED_METHOD" = "docker" ]; then
+    adsb_pick_device
+    install_ultrafeeder_docker
+  else
+    adsb_pick_device
+    install_readsb_native
+    feed_airplanes_live_native
+  fi
+
+  feed_planewatch_docker
+
+  if [ -z "$PLANEWATCH_KEY" ]; then
+    info "To feed Plane Watch too: create a feeder at https://atc.plane.watch, then run this again with --planewatch-key <key>."
+  fi
 }
 
 # ===========================================================================
@@ -1088,6 +1392,7 @@ declare -A DECODER_DOCKER_IMAGE=(
 )
 
 DECODER_LIST=("acarsdec" "dumpvdl2" "dumphfdl" "vdlm2dec")
+ADSB_MENU_LABEL="ADS-B — fed to Airframes' partners Airplanes.Live and Plane Watch"
 
 get_cmake_flags_for_sdr() {
   local decoder="$1"
@@ -2054,6 +2359,9 @@ Decoders:
   dumphfdl    HF Data Link decoder
   vdlm2dec    VDL Mode 2 decoder (alternative)
   all         Install all decoders
+  adsb        ADS-B (1090 MHz) for Airframes' partners Airplanes.Live and
+              Plane Watch (Airframes doesn't ingest ADS-B itself). Uses the
+              ADS-B decoder already running, or installs readsb.
 
 Options:
   -h, --help              Show this help message
@@ -2069,15 +2377,24 @@ Options:
   --no-service            Don't offer to create systemd service
   --freq "F1 F2 ..."      Override frequencies
 
+ADS-B options:
+  --lat DEG / --lon DEG   Antenna position, decimal degrees
+  --alt ALT               Antenna altitude, e.g. 120m or 394ft
+  --mlat-name NAME        Name on the MLAT map (default: hostname)
+  --planewatch-key KEY    Also feed Plane Watch (key from atc.plane.watch)
+  --adsb-device ID        RTL-SDR for a new ADS-B decoder (index or serial)
+
 Examples:
   curl -sSL https://install.airframes.sh/installer | bash
   curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
   curl -sSL https://install.airframes.sh/installer | bash -s -- --token abc123
   curl -sSL https://install.airframes.sh/installer | bash -s -- -y all --region north_america
   curl -sSL https://install.airframes.sh/installer | bash -s -- dumpvdl2 --device 00000002
+  curl -sSL https://install.airframes.sh/installer | bash -s -- -y adsb --lat 38.68 --lon -120.99 --alt 120m
 
-Airframes collects ACARS, VDL2 and HFDL. It does not take ADS-B: on a
-PiAware or other ADS-B box, use a second SDR for the decoder installed here.
+Airframes collects ACARS, VDL2 and HFDL. ADS-B goes to Airframes' partner
+networks. On a PiAware or other ADS-B box, "adsb" adds those feeds from the
+decoder you already run; ACARS/VDL2/HFDL need a second SDR.
 EOF
 }
 
@@ -2138,6 +2455,16 @@ parse_args() {
         SELECTED_DECODERS=("${DECODER_LIST[@]}")
         shift
         ;;
+      adsb|ads-b|ADSB)
+        WANT_ADSB=true
+        shift
+        ;;
+      --lat)            ADSB_LAT="$2"; shift 2 ;;
+      --lon)            ADSB_LON="$2"; shift 2 ;;
+      --alt)            ADSB_ALT="$2"; shift 2 ;;
+      --mlat-name)      ADSB_NAME="$2"; shift 2 ;;
+      --planewatch-key) PLANEWATCH_KEY="$2"; shift 2 ;;
+      --adsb-device)    ADSB_SDR_DEVICE="$2"; shift 2 ;;
       *)
         err "Unknown argument: $1"
         usage
@@ -2170,21 +2497,23 @@ BANNER
 
 tui_select_decoders() {
   if [ "$HAS_GUM" = true ]; then
-    step "Select decoders to install"
+    step "Select what to install"
 
     local -a labels=()
     for d in "${DECODER_LIST[@]}"; do
       labels+=("${DECODER_LABEL[$d]}")
     done
+    labels+=("$ADSB_MENU_LABEL")
 
     local selections
-    selections=$(gum choose --no-limit --header "Select decoders to install:" "${labels[@]}") || {
-      info "No decoders selected"
+    selections=$(gum choose --no-limit --header "Select what to install (space to pick, enter to go on):" "${labels[@]}") || {
+      info "Nothing selected"
       exit 0
     }
 
     SELECTED_DECODERS=()
     while IFS= read -r line; do
+      [[ "$line" == "$ADSB_MENU_LABEL" ]] && WANT_ADSB=true
       for d in "${DECODER_LIST[@]}"; do
         if [[ "$line" == "${DECODER_LABEL[$d]}" ]]; then
           SELECTED_DECODERS+=("$d")
@@ -2192,7 +2521,7 @@ tui_select_decoders() {
       done
     done <<< "$selections"
   else
-    step "Select decoders to install"
+    step "Select what to install"
     echo -e "  ${DIM}(Enter numbers separated by spaces, e.g., 1 3)${RESET}"
     echo
 
@@ -2201,28 +2530,36 @@ tui_select_decoders() {
       echo -e "  ${CYAN}${i}${RESET})  ${DECODER_LABEL[$d]}"
       ((i++))
     done
-    echo -e "  ${CYAN}5${RESET})  All of the above"
+    echo -e "  ${CYAN}5${RESET})  All four of the above"
+    echo -e "  ${CYAN}6${RESET})  ${ADSB_MENU_LABEL}"
     echo
 
     local choices
     echo -ne "  ${BOLD}Select: ${RESET}"
-    read -r choices
+    read -r choices || choices=""
 
     SELECTED_DECODERS=()
     for idx in $choices; do
       case "$idx" in
-        5) SELECTED_DECODERS=("${DECODER_LIST[@]}"); break ;;
+        5) SELECTED_DECODERS=("${DECODER_LIST[@]}") ;;
+        6) WANT_ADSB=true ;;
         [1-4]) SELECTED_DECODERS+=("${DECODER_LIST[$((idx-1))]}") ;;
       esac
     done
+    # de-duplicate (e.g. "1 5")
+    if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+      mapfile -t SELECTED_DECODERS < <(printf '%s\n' "${SELECTED_DECODERS[@]}" | awk '!seen[$0]++')
+    fi
   fi
 
-  if [ ${#SELECTED_DECODERS[@]} -eq 0 ]; then
-    info "No decoders selected. Bye!"
+  if [ ${#SELECTED_DECODERS[@]} -eq 0 ] && [ "$WANT_ADSB" = false ]; then
+    info "Nothing selected. Bye!"
     exit 0
   fi
 
-  ok "Selected: ${SELECTED_DECODERS[*]}"
+  local picked=("${SELECTED_DECODERS[@]}")
+  [ "$WANT_ADSB" = true ] && picked+=("adsb")
+  ok "Selected: ${picked[*]}"
 }
 
 tui_select_method() {
@@ -2291,12 +2628,23 @@ tui_confirm_install() {
   echo
   step "Installation Summary"
   echo
-  echo -e "  ${BOLD}Decoders:${RESET}  ${SELECTED_DECODERS[*]}"
-  echo -e "  ${BOLD}Method:${RESET}    ${SELECTED_METHOD}"
-  echo -e "  ${BOLD}Region:${RESET}    ${SELECTED_REGION}"
-  echo -e "  ${BOLD}SDR:${RESET}       ${SELECTED_SDR}"
-  if [ "$SELECTED_SDR" = "rtlsdr" ] && [ -n "$SDR_DEVICE" ]; then
-    echo -e "  ${BOLD}Device:${RESET}    ${SDR_DEVICE}"
+  if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    echo -e "  ${BOLD}Decoders:${RESET}  ${SELECTED_DECODERS[*]}"
+    echo -e "  ${BOLD}Method:${RESET}    ${SELECTED_METHOD}"
+    echo -e "  ${BOLD}Region:${RESET}    ${SELECTED_REGION}"
+    echo -e "  ${BOLD}SDR:${RESET}       ${SELECTED_SDR}"
+    if [ "$SELECTED_SDR" = "rtlsdr" ] && [ -n "$SDR_DEVICE" ]; then
+      echo -e "  ${BOLD}Device:${RESET}    ${SDR_DEVICE}"
+    fi
+  fi
+  if [ "$WANT_ADSB" = true ]; then
+    local partners="Airplanes.Live"
+    [ -n "$PLANEWATCH_KEY" ] && partners+=", Plane Watch"
+    local source="existing decoder on port 30005"
+    adsb_source_ready || source="new readsb"
+    [ "$SELECTED_METHOD" = "docker" ] && ! adsb_source_ready && source="new ultrafeeder (Docker)"
+    echo -e "  ${BOLD}ADS-B:${RESET}     ${partners} (from ${source})"
+    echo -e "  ${BOLD}Antenna:${RESET}   ${ADSB_LAT}, ${ADSB_LON}, ${ADSB_ALT}  (MLAT name ${ADSB_NAME})"
   fi
   if [ -n "$STATION_IDENT" ]; then
     echo -e "  ${BOLD}Station:${RESET}   ${STATION_IDENT}"
@@ -2373,22 +2721,26 @@ tui_flow() {
   # Decoder selection
   tui_select_decoders
 
-  # Installation method
-  tui_select_method
+  if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    tui_select_method
+    tui_select_region
+    tui_select_sdr
+    check_sdr_for_decoders
+  fi
 
-  # Region selection
-  tui_select_region
-
-  # SDR selection
-  tui_select_sdr
+  # ADS-B: antenna position, MLAT name, Plane Watch key
+  if [ "$WANT_ADSB" = true ]; then
+    adsb_collect_location
+  fi
 
   # Confirmation
   tui_confirm_install
 
   # Install
-  install_base_deps
-
-  mkdir -p "$BUILD_DIR"
+  if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    install_base_deps
+    mkdir -p "$BUILD_DIR"
+  fi
 
   for decoder in "${SELECTED_DECODERS[@]}"; do
     case "$SELECTED_METHOD" in
@@ -2402,7 +2754,9 @@ tui_flow() {
     tui_post_install "$decoder"
   done
 
-  install_manager_script
+  setup_adsb
+
+  [ ${#SELECTED_DECODERS[@]} -gt 0 ] && install_manager_script
 
   echo
   ok "Done! Thank you for feeding Airframes."
@@ -2485,7 +2839,7 @@ main() {
   fi
 
   # CLI mode: decoder(s) passed as arguments
-  if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+  if [ ${#SELECTED_DECODERS[@]} -gt 0 ] || [ "$WANT_ADSB" = true ]; then
     show_banner
     info "Detected: ${OS} / ${ARCH} / ${DISTRO} / ${PKG}"
     echo
@@ -2495,16 +2849,22 @@ main() {
     fi
 
     check_existing_setup
+    check_sdr_for_decoders
+    [ "$WANT_ADSB" = true ] && adsb_collect_location
 
     if [ "$AUTO_YES" = false ]; then
-      if ! ui_confirm "Install ${SELECTED_DECODERS[*]}?"; then
+      local what=("${SELECTED_DECODERS[@]}")
+      [ "$WANT_ADSB" = true ] && what+=("ADS-B feeds for Airplanes.Live${PLANEWATCH_KEY:+ and Plane Watch}")
+      if ! ui_confirm "Install $(join_by ', ' "${what[@]}")?"; then
         info "Aborted."
         exit 0
       fi
     fi
 
-    install_base_deps
-    mkdir -p "$BUILD_DIR"
+    if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+      install_base_deps
+      mkdir -p "$BUILD_DIR"
+    fi
 
     for decoder in "${SELECTED_DECODERS[@]}"; do
       case "$SELECTED_METHOD" in
@@ -2518,7 +2878,9 @@ main() {
       show_run_command "$decoder"
     done
 
-    install_manager_script
+    setup_adsb
+
+    [ ${#SELECTED_DECODERS[@]} -gt 0 ] && install_manager_script
 
     echo
     ok "Done! Thank you for feeding Airframes."
@@ -2534,8 +2896,7 @@ main() {
     # and no decoder named. Say exactly what to run instead.
     show_banner
     detect_existing_setup
-    pick_sdr_device || true
-    show_existing_setup || true
+    show_existing_setup
     echo
     echo -e "${RED}[airframes]${RESET} There is no terminal to ask questions on, and no decoder was named."
     echo
@@ -2544,6 +2905,9 @@ main() {
     echo
     echo "  Or name what to install (acarsdec, dumpvdl2, dumphfdl, vdlm2dec or all):"
     echo "    curl -sSL https://install.airframes.sh/installer | bash -s -- -y acarsdec"
+    echo
+    echo "  ADS-B, fed to Airframes' partners Airplanes.Live and Plane Watch:"
+    echo "    curl -sSL https://install.airframes.sh/installer | bash -s -- -y adsb --lat 38.68 --lon -120.99 --alt 120m"
     echo
     echo "  More options: curl -sSL https://install.airframes.sh/installer | bash -s -- --help"
     exit 1
