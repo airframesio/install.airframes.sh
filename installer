@@ -108,6 +108,9 @@ SELECTED_REGION=""
 SELECTED_SDR="rtlsdr"
 SDR_DEVICE=""            # RTL-SDR index or serial; empty = pick automatically
 SDR_DEVICE_SET_BY_USER=false
+SDR_INDEX=""             # resolved from SDR_DEVICE; empty = unknown
+SDR_SERIAL=""
+RTLSDR_ORDER_KNOWN=false # true when rtl_test gave librtlsdr's own order
 WANT_ADSB=false          # feed ADS-B to Airframes' partners (Airframes doesn't ingest it)
 ADSB_LAT=""
 ADSB_LON=""
@@ -120,6 +123,7 @@ FEED_HOST=""
 FEED_PORT=""
 FREQUENCIES=""
 CREATE_SERVICE=false
+NO_SERVICE=false         # --no-service: print the run command, create no service
 SHOW_RUN_CMD=true
 
 # Detected SDRs
@@ -772,10 +776,25 @@ process_running() {
   grep -qxF "${name:0:15}" /proc/[0-9]*/comm 2>/dev/null
 }
 
-# RTL-SDR serial numbers from sysfs, in USB bus order (librtlsdr numbers
-# devices in about the same order). Works without librtlsdr installed.
+# RTL-SDR serial numbers in librtlsdr's index order. rtl_test lists them in
+# that order (even ones another program holds); without it, sysfs gives the
+# USB bus order, which is usually but not always the same.
 detect_rtlsdr_serials() {
   RTLSDR_SERIALS=()
+  RTLSDR_ORDER_KNOWN=false
+  if [ -z "${AIRFRAMES_SYSFS_USB:-}" ] && command -v rtl_test >/dev/null 2>&1; then
+    local line
+    while IFS= read -r line; do
+      # "  0:  Realtek, RTL2838UHIDIR, SN: 00001090"
+      if [[ "$line" =~ ^[[:space:]]*[0-9]+:.*SN:[[:space:]]*([^[:space:]]*) ]]; then
+        RTLSDR_SERIALS+=("${BASH_REMATCH[1]:-unknown}")
+      fi
+    done < <(timeout 5 rtl_test -d 9999 2>&1 || true)
+    if [ ${#RTLSDR_SERIALS[@]} -gt 0 ]; then
+      RTLSDR_ORDER_KNOWN=true
+      return 0
+    fi
+  fi
   local usb="${AIRFRAMES_SYSFS_USB:-/sys/bus/usb/devices}"
   [ -d "$usb" ] || return 0
   local dev vid pid serial
@@ -861,32 +880,34 @@ rtlsdr_used_by_adsb() {
   return 1
 }
 
-# Choose which RTL-SDR the Airframes decoder should open. Prefers a serial
-# (stable across reboots) when the serials are unique, else an index.
+# Choose which RTL-SDR the Airframes decoder should open, leaving the ADS-B
+# dongle alone. Sets SDR_DEVICE to an index (librtlsdr numbering).
+# Returns 1 when ADS-B appears to use every RTL-SDR, 2 when ADS-B runs but
+# we can't tell which dongle it holds.
 pick_sdr_device() {
-  [ "$SDR_DEVICE_SET_BY_USER" = true ] && return 0
+  if [ "$SDR_DEVICE_SET_BY_USER" = true ]; then
+    resolve_sdr_device
+    return 0
+  fi
   [ "${SELECTED_SDR:-rtlsdr}" = "rtlsdr" ] || return 0
 
   local count=${#RTLSDR_SERIALS[@]}
   if [ "$count" -eq 0 ]; then
     SDR_DEVICE="0"
+    resolve_sdr_device
     return 0
   fi
 
-  local unique=true
-  if [ "$(printf '%s\n' "${RTLSDR_SERIALS[@]}" | sort | uniq -d | wc -l)" -gt 0 ] ||
-     printf '%s\n' "${RTLSDR_SERIALS[@]}" | grep -qx unknown; then
-    unique=false
-  fi
+  local adsb_active=false
+  { [ ${#ADSB_SOFTWARE[@]} -gt 0 ] || [ "$WANT_ADSB" = true ]; } && adsb_active=true
 
-  local i free_idx="" free_serial=""
+  local i free_idx="" claimed=0
   for i in "${!RTLSDR_SERIALS[@]}"; do
-    if { [ ${#ADSB_SOFTWARE[@]} -gt 0 ] || [ "$WANT_ADSB" = true ]; } && rtlsdr_used_by_adsb "$i" "${RTLSDR_SERIALS[$i]}"; then
+    if [ "$adsb_active" = true ] && rtlsdr_used_by_adsb "$i" "${RTLSDR_SERIALS[$i]}"; then
+      claimed=$((claimed + 1))
       continue
     fi
-    free_idx="$i"
-    free_serial="${RTLSDR_SERIALS[$i]}"
-    break
+    [ -z "$free_idx" ] && free_idx="$i"
   done
 
   if [ -z "$free_idx" ]; then
@@ -894,19 +915,92 @@ pick_sdr_device() {
     return 1
   fi
 
-  # With ADS-B running and look-alike serials we cannot tell the dongles
-  # apart: say so rather than guess silently.
-  if [ ${#ADSB_SOFTWARE[@]} -gt 0 ] && [ "$unique" = false ] && [ ${#ADSB_DEVICES[@]} -eq 0 ]; then
-    warn "Can't tell which RTL-SDR the ADS-B decoder uses (the serial numbers look alike)."
-    warn "Using device index ${free_idx}; pass --device <index|serial> to choose another."
+  # A running ADS-B decoder holds one of several dongles: be sure which.
+  if [ ${#ADSB_SOFTWARE[@]} -gt 0 ] && [ "$count" -ge 2 ]; then
+    # Nothing names the ADS-B dongle (Docker, or a config without a device)
+    [ "$claimed" -eq 0 ] && return 2
+    # A config names it by index, and the index order is a guess
+    if [ "$RTLSDR_ORDER_KNOWN" != true ]; then
+      local d s known
+      for d in "${ADSB_DEVICES[@]}"; do
+        [[ "$d" =~ ^[0-9]+$ ]] || continue
+        known=false
+        for s in "${RTLSDR_SERIALS[@]}"; do [ "$s" = "$d" ] && known=true; done
+        [ "$known" = true ] || return 2
+      done
+    fi
   fi
 
-  if [ "$unique" = true ]; then
-    SDR_DEVICE="$free_serial"
-  else
-    SDR_DEVICE="$free_idx"
-  fi
+  SDR_DEVICE="$free_idx"
+  resolve_sdr_device
   return 0
+}
+
+# Is serial $1 one only one dongle has?
+rtlsdr_serial_unique() {
+  local s="$1"
+  [ -n "$s" ] && [ "$s" != "unknown" ] || return 1
+  [ "$(printf '%s\n' "${RTLSDR_SERIALS[@]}" | grep -cxF -- "$s")" -eq 1 ]
+}
+
+# Split SDR_DEVICE (an index or a serial) into SDR_INDEX and SDR_SERIAL,
+# each empty when unknown.
+resolve_sdr_device() {
+  SDR_INDEX=""
+  SDR_SERIAL=""
+  local dev="$SDR_DEVICE" i
+  [ -n "$dev" ] || return 0
+  # A serial wins over an index: "00000001" is a serial when a dongle has it
+  for i in "${!RTLSDR_SERIALS[@]}"; do
+    if [ "${RTLSDR_SERIALS[$i]}" = "$dev" ]; then
+      SDR_SERIAL="$dev"
+      rtlsdr_serial_unique "$dev" && SDR_INDEX="$i"
+      return 0
+    fi
+  done
+  if [[ "$dev" =~ ^[0-9]+$ ]]; then
+    SDR_INDEX="$dev"
+    if [ "$dev" -lt ${#RTLSDR_SERIALS[@]} ] && rtlsdr_serial_unique "${RTLSDR_SERIALS[$dev]}"; then
+      SDR_SERIAL="${RTLSDR_SERIALS[$dev]}"
+    fi
+  else
+    SDR_SERIAL="$dev"
+  fi
+}
+
+# What to pass to acarsdec -r, vdlm2dec -r, dumpvdl2 --rtlsdr and readsb
+# --device. They read an all-digit value as an index, so a serial such as
+# 00000001 is only passed when it has a letter in it.
+rtl_device_arg() {
+  if [ -n "$SDR_SERIAL" ] && [[ ! "$SDR_SERIAL" =~ ^[0-9]+$ ]]; then
+    echo "$SDR_SERIAL"
+  elif [ -n "$SDR_INDEX" ]; then
+    echo "$SDR_INDEX"
+  elif [ -n "$SDR_SERIAL" ]; then
+    echo "$SDR_SERIAL"
+  else
+    echo "0"
+  fi
+}
+
+# SoapySDR (dumphfdl) picks an RTL-SDR by serial only.
+soapy_rtl_arg() {
+  if [ -n "$SDR_SERIAL" ]; then
+    echo "driver=rtlsdr,serial=${SDR_SERIAL}"
+  else
+    echo "driver=rtlsdr"
+  fi
+}
+
+# For messages: "0 (serial 00000001)"
+sdr_device_label() {
+  if [ -n "$SDR_INDEX" ] && [ -n "$SDR_SERIAL" ]; then
+    echo "${SDR_INDEX} (serial ${SDR_SERIAL})"
+  elif [ -n "$SDR_SERIAL" ]; then
+    echo "serial ${SDR_SERIAL}"
+  else
+    echo "${SDR_INDEX:-0}"
+  fi
 }
 
 join_by() {
@@ -942,8 +1036,8 @@ check_existing_setup() {
 }
 
 # Once the decoders are chosen: pick the RTL-SDR for the ACARS/VDL2/HFDL
-# decoders, leaving ADS-B dongles alone. Asks whether to go on when nothing
-# is free; does not stop a non-interactive run.
+# decoders, leaving ADS-B dongles alone. Asks when it can't tell; an
+# unattended run stops instead of guessing (--device overrides).
 check_sdr_for_decoders() {
   [ ${#SELECTED_DECODERS[@]} -gt 0 ] || return 0
   if [ "${SELECTED_SDR:-rtlsdr}" != "rtlsdr" ]; then
@@ -951,8 +1045,32 @@ check_sdr_for_decoders() {
     return 0
   fi
 
-  local blocked=0
-  pick_sdr_device || blocked=1
+  local interactive=false
+  [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ] && interactive=true
+
+  local rc=0
+  pick_sdr_device || rc=$?
+  local n=${#RTLSDR_SERIALS[@]}
+
+  if [ "$rc" -eq 2 ]; then
+    warn "Found ${n} RTL-SDRs and ADS-B software (${ADSB_SOFTWARE[*]}), but can't tell which dongle ADS-B uses."
+    if [ "$interactive" = true ]; then
+      local -a opts=()
+      local i
+      for i in "${!RTLSDR_SERIALS[@]}"; do
+        opts+=("Device ${i}, serial ${RTLSDR_SERIALS[$i]}")
+      done
+      local pick
+      pick=$(ui_choose "Which RTL-SDR should ${SELECTED_DECODERS[*]} use (not the ADS-B one)?" "${opts[@]}")
+      pick="${pick#Device }"
+      SDR_DEVICE="${pick%%,*}"
+      resolve_sdr_device
+      ok "${SELECTED_DECODERS[*]} will use RTL-SDR $(sdr_device_label)"
+      return 0
+    fi
+    err "Stopped so the ADS-B dongle isn't taken. Pass --device <index|serial> to choose one."
+    exit 1
+  fi
 
   # A new ADS-B decoder installed in this run needs a dongle too
   local adsb_needs_sdr=false
@@ -960,27 +1078,38 @@ check_sdr_for_decoders() {
     adsb_needs_sdr=true
   fi
 
-  local n=${#RTLSDR_SERIALS[@]}
-  if [ "$n" -gt 0 ] && { [ ${#ADSB_SOFTWARE[@]} -gt 0 ] || [ "$adsb_needs_sdr" = true ]; }; then
-    if [ "$blocked" -eq 1 ]; then
-      warn "Found ${n} RTL-SDR(s) (serial $(join_by ', ' "${RTLSDR_SERIALS[@]}")), and ADS-B appears to use all of them."
-      warn "Plug in another SDR for ${SELECTED_DECODERS[*]}, or pass --device <index|serial> if this is wrong."
-    elif [ "$adsb_needs_sdr" = true ] && [ "$n" -lt 2 ]; then
-      warn "ADS-B and ${SELECTED_DECODERS[*]} each need their own SDR, and only ${n} RTL-SDR is plugged in."
-      blocked=1
-    else
-      ok "RTL-SDRs: $(join_by ', ' "${RTLSDR_SERIALS[@]}"). ${SELECTED_DECODERS[*]} will use ${BOLD}${SDR_DEVICE}${RESET}, leaving ADS-B its own."
-    fi
+  local blocked=false
+  if [ "$rc" -eq 1 ]; then
+    warn "Found ${n} RTL-SDR(s) (serial $(join_by ', ' "${RTLSDR_SERIALS[@]}")), and ADS-B appears to use all of them."
+    warn "Plug in another SDR for ${SELECTED_DECODERS[*]}, or pass --device <index|serial> if this is wrong."
+    blocked=true
+  elif [ "$adsb_needs_sdr" = true ] && [ "$n" -lt 2 ] && [ "$SDR_DEVICE_SET_BY_USER" = false ]; then
+    warn "ADS-B and ${SELECTED_DECODERS[*]} each need their own SDR, and only ${n} RTL-SDR is plugged in."
+    blocked=true
+  elif [ "$SDR_DEVICE_SET_BY_USER" = true ]; then
+    info "${SELECTED_DECODERS[*]} will use RTL-SDR $(sdr_device_label), as set with --device."
+  elif [ "$n" -gt 0 ] && { [ ${#ADSB_SOFTWARE[@]} -gt 0 ] || [ "$adsb_needs_sdr" = true ]; }; then
+    ok "RTL-SDRs: $(join_by ', ' "${RTLSDR_SERIALS[@]}"). ${SELECTED_DECODERS[*]} will use $(sdr_device_label), leaving ADS-B its own."
   fi
 
-  if [ "$blocked" -eq 1 ] && [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ]; then
-    echo
-    if ! ui_confirm "Install anyway (you can plug in another SDR later)?" "yes"; then
-      info "Stopped. Nothing was installed."
-      exit 0
+  if [ "$blocked" = true ]; then
+    if [ "$interactive" = true ]; then
+      echo
+      if ! ui_confirm "Install anyway (you can plug in another SDR later)?" "yes"; then
+        info "Stopped. Nothing was installed."
+        exit 0
+      fi
+    else
+      err "Stopped so the ADS-B dongle isn't taken. Pass --device <index|serial> to use one anyway."
+      exit 1
     fi
   fi
   [ -n "$SDR_DEVICE" ] || SDR_DEVICE="0"
+  resolve_sdr_device
+  if [[ " ${SELECTED_DECODERS[*]} " == *" dumphfdl "* ]] && [ -z "$SDR_SERIAL" ] && [ "${SDR_INDEX:-0}" != "0" ]; then
+    warn "dumphfdl (SoapySDR) picks an RTL-SDR by serial, and the serial of device ${SDR_INDEX} isn't known."
+    warn "It will open the first free RTL-SDR; pass --device <serial> to be sure."
+  fi
   return 0
 }
 
@@ -1076,28 +1205,38 @@ adsb_collect_location() {
 
 # RTL-SDR for a readsb/ultrafeeder installed here: --adsb-device, else a
 # serial that says 1090, else the first one the other decoders don't use.
+# readsb reads an all-digit value as an index, so such serials become one.
 adsb_pick_device() {
   [ -n "$ADSB_SDR_DEVICE" ] && return 0
-  local i serial
+  local i serial taken
   for i in "${!RTLSDR_SERIALS[@]}"; do
+    taken=false
+    if [ ${#SELECTED_DECODERS[@]} -gt 0 ] &&
+       { [ "$i" = "$SDR_INDEX" ] || { [ -n "$SDR_SERIAL" ] && [ "${RTLSDR_SERIALS[$i]}" = "$SDR_SERIAL" ]; }; }; then
+      taken=true
+    fi
     serial="${RTLSDR_SERIALS[$i]}"
-    if [[ "$serial" == *1090* ]] && [ "$serial" != "$SDR_DEVICE" ]; then
-      ADSB_SDR_DEVICE="$serial"; return 0
+    if [[ "$serial" == *1090* ]] && [ "$taken" = false ]; then
+      adsb_set_device "$i"; return 0
     fi
   done
   for i in "${!RTLSDR_SERIALS[@]}"; do
-    serial="${RTLSDR_SERIALS[$i]}"
-    if [ ${#SELECTED_DECODERS[@]} -gt 0 ] && { [ "$serial" = "$SDR_DEVICE" ] || [ "$i" = "$SDR_DEVICE" ]; }; then
+    if [ ${#SELECTED_DECODERS[@]} -gt 0 ] &&
+       { [ "$i" = "$SDR_INDEX" ] || { [ -n "$SDR_SERIAL" ] && [ "${RTLSDR_SERIALS[$i]}" = "$SDR_SERIAL" ]; }; }; then
       continue
     fi
-    if [ "$serial" != "unknown" ] && [ "$(printf '%s\n' "${RTLSDR_SERIALS[@]}" | grep -cx "$serial")" -eq 1 ]; then
-      ADSB_SDR_DEVICE="$serial"
-    else
-      ADSB_SDR_DEVICE="$i"
-    fi
-    return 0
+    adsb_set_device "$i"; return 0
   done
   ADSB_SDR_DEVICE="0"
+}
+
+adsb_set_device() {
+  local i="$1" serial="${RTLSDR_SERIALS[$1]}"
+  if rtlsdr_serial_unique "$serial" && [[ ! "$serial" =~ ^[0-9]+$ ]]; then
+    ADSB_SDR_DEVICE="$serial"
+  else
+    ADSB_SDR_DEVICE="$i"
+  fi
 }
 
 install_readsb_native() {
@@ -1877,10 +2016,15 @@ install_with_docker() {
       ;;
   esac
 
-  # sdr-enthusiasts images pick the RTL-SDR by serial
-  if [ "${SELECTED_SDR:-rtlsdr}" = "rtlsdr" ] && [ -n "$SDR_DEVICE" ] && [[ ! "$SDR_DEVICE" =~ ^[0-9]$ ]]; then
-    env_block+="
-      SERIAL: \"${SDR_DEVICE}\""
+  # sdr-enthusiasts images pick the RTL-SDR by serial only
+  if [ "${SELECTED_SDR:-rtlsdr}" = "rtlsdr" ]; then
+    if [ -n "$SDR_SERIAL" ]; then
+      env_block+="
+      SERIAL: \"${SDR_SERIAL}\""
+    elif [ "${SDR_INDEX:-0}" != "0" ] || [ ${#RTLSDR_SERIALS[@]} -gt 1 ]; then
+      warn "The ${decoder} container picks its RTL-SDR by serial, and the serial of device ${SDR_INDEX:-0} isn't known."
+      warn "Set SERIAL in ${compose_file} to the dongle's serial (see rtl_test) before starting it."
+    fi
   fi
 
   sudo tee "$compose_file" >/dev/null << EOF
@@ -2059,14 +2203,10 @@ build_run_command() {
   local port="${FEED_PORT:-${DECODER_FEED_PORT[$decoder]}}"
   local freqs="${FREQUENCIES:-$(get_frequencies "$decoder" "${SELECTED_REGION:-north_america}")}"
   local sdr="${SELECTED_SDR:-rtlsdr}"
-  local dev="${SDR_DEVICE:-0}"
-  # SoapySDR selects RTL-SDRs by serial or index with different keys
-  local soapy_rtl="driver=rtlsdr"
-  if [[ "$dev" =~ ^[0-9]$ ]]; then
-    [ "$dev" != "0" ] && soapy_rtl+=",rtl=${dev}"
-  else
-    soapy_rtl+=",serial=${dev}"
-  fi
+  [ -n "$SDR_INDEX$SDR_SERIAL" ] || resolve_sdr_device
+  local dev soapy_rtl
+  dev=$(rtl_device_arg)
+  soapy_rtl=$(soapy_rtl_arg)
 
   # The station ident, as an option for each decoder. Airframes files incoming
   # data under the ident the decoder sends: without it the feed lands on an
@@ -2376,6 +2516,7 @@ Options:
   --no-tui                Disable gum TUI, use plain menus
   --no-service            Don't offer to create systemd service
   --freq "F1 F2 ..."      Override frequencies
+  --station-id ID         Station ID from your station page on airframes.io
 
 ADS-B options:
   --lat DEG / --lon DEG   Antenna position, decimal degrees
@@ -2387,6 +2528,7 @@ ADS-B options:
 Examples:
   curl -sSL https://install.airframes.sh/installer | bash
   curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
+  curl -sSL https://install.airframes.sh/installer | bash -s -- -y acarsdec --station-id MY-STATION
   curl -sSL https://install.airframes.sh/installer | bash -s -- --token abc123
   curl -sSL https://install.airframes.sh/installer | bash -s -- -y all --region north_america
   curl -sSL https://install.airframes.sh/installer | bash -s -- dumpvdl2 --device 00000002
@@ -2440,11 +2582,16 @@ parse_args() {
         ;;
       --no-service)
         CREATE_SERVICE=false
+        NO_SERVICE=true
         SHOW_RUN_CMD=true
         shift
         ;;
       --freq)
         FREQUENCIES="$2"
+        shift 2
+        ;;
+      --station-id)
+        STATION_IDENT="$2"
         shift 2
         ;;
       acarsdec|dumpvdl2|dumphfdl|vdlm2dec)
@@ -2624,6 +2771,18 @@ tui_select_sdr() {
   ok "SDR: ${SELECTED_SDR}"
 }
 
+# The station ID from the station's page on airframes.io. Without it the feed
+# lands on an anonymous station named after this machine.
+tui_station_id() {
+  [ -n "$STATION_IDENT" ] && return 0
+  [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ] || return 0
+  echo
+  echo -e "  ${DIM}Add a station at https://app.airframes.io and copy its Station ID here.${RESET}"
+  echo -e "  ${DIM}Leave it blank to feed without one (run again with --station-id later).${RESET}"
+  STATION_IDENT=$(ui_input "Station ID" "")
+  STATION_IDENT="${STATION_IDENT//[[:space:]]/}"
+}
+
 tui_confirm_install() {
   echo
   step "Installation Summary"
@@ -2634,7 +2793,7 @@ tui_confirm_install() {
     echo -e "  ${BOLD}Region:${RESET}    ${SELECTED_REGION}"
     echo -e "  ${BOLD}SDR:${RESET}       ${SELECTED_SDR}"
     if [ "$SELECTED_SDR" = "rtlsdr" ] && [ -n "$SDR_DEVICE" ]; then
-      echo -e "  ${BOLD}Device:${RESET}    ${SDR_DEVICE}"
+      echo -e "  ${BOLD}Device:${RESET}    RTL-SDR $(sdr_device_label)"
     fi
   fi
   if [ "$WANT_ADSB" = true ]; then
@@ -2657,11 +2816,46 @@ tui_confirm_install() {
   fi
 }
 
+# Is systemd running here (not just installed, as in many containers)?
+have_systemd() {
+  [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+# CLI mode: run the decoder as a service unless --no-service. -y, or no
+# terminal to ask, means yes: the person asked for the decoder to be set up.
+cli_post_install() {
+  local decoder="$1"
+  [ "$SELECTED_METHOD" = "docker" ] && return 0
+  if [ "$NO_SERVICE" = true ]; then
+    show_run_command "$decoder"
+    return 0
+  fi
+  if have_systemd; then
+    if ui_confirm "Start ${decoder} now and on every boot (systemd service)?" "yes"; then
+      create_systemd_service "$decoder"
+      return 0
+    fi
+  elif [ "$OS" = "macos" ]; then
+    if ui_confirm "Start ${decoder} now and at login (launchd service)?" "yes"; then
+      create_launchd_service "$decoder"
+      return 0
+    fi
+  else
+    warn "systemd isn't running here, so ${decoder} won't start by itself."
+  fi
+  show_run_command "$decoder"
+}
+
 tui_post_install() {
   local decoder="$1"
 
+  [ "$SELECTED_METHOD" = "docker" ] && return 0
+  if [ "$NO_SERVICE" = true ]; then
+    show_run_command "$decoder"
+    return 0
+  fi
   echo
-  if [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+  if have_systemd; then
     local actions=("Show run command" "Create systemd service (auto-start on boot)" "Both")
     local choice
     choice=$(ui_choose "How would you like to run ${decoder}?" "${actions[@]}")
@@ -2726,6 +2920,7 @@ tui_flow() {
     tui_select_region
     tui_select_sdr
     check_sdr_for_decoders
+    tui_station_id
   fi
 
   # ADS-B: antenna position, MLAT name, Plane Watch key
@@ -2817,7 +3012,9 @@ main() {
       api_report_status "configuring" "Configuring ${decoder}" 80
       show_run_command "$decoder"
 
-      if [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+      if [ "$NO_SERVICE" = true ]; then
+        :
+      elif have_systemd; then
         if [ "$AUTO_YES" = true ] || ui_confirm "Create systemd service for ${decoder}?"; then
           create_systemd_service "$decoder"
           api_report_status "feeding" "${decoder} is feeding" 95
@@ -2875,7 +3072,7 @@ main() {
       esac
 
       save_config "$decoder"
-      show_run_command "$decoder"
+      cli_post_install "$decoder"
     done
 
     setup_adsb

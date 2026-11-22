@@ -61,7 +61,7 @@
             <button class="copy-btn" data-copy="curl -sSL https://install.airframes.sh/installer | bash">Copy</button>
           </div>
 
-          <p class="install-step">Know what you want? Name the decoder (<code>acarsdec</code>, <code>dumpvdl2</code>, <code>dumphfdl</code>, <code>vdlm2dec</code>, <code>all</code> or <code>adsb</code>) and skip the questions:</p>
+          <p class="install-step">Know what you want? Name the decoder (<code>acarsdec</code>, <code>dumpvdl2</code>, <code>dumphfdl</code>, <code>vdlm2dec</code>, <code>all</code> or <code>adsb</code>) and skip the questions. It sets the decoder up as a service that starts on boot; add <code>--station-id</code> with the ID from your station page.</p>
           <div class="code-block">
             <code>curl -sSL https://install.airframes.sh/installer <span class="nowrap">| bash -s -- -y acarsdec</span></code>
             <button class="copy-btn" data-copy="curl -sSL https://install.airframes.sh/installer | bash -s -- -y acarsdec">Copy</button>
