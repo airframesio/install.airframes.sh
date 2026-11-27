@@ -177,6 +177,7 @@ pkg_translate() {
         zlib-dev)        echo "zlib1g-dev" ;;
         docker)          echo "docker.io" ;;
         docker-compose)  echo "docker-compose" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     dnf)
@@ -201,6 +202,7 @@ pkg_translate() {
         zlib-dev)        echo "zlib-devel" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     pacman)
@@ -225,6 +227,7 @@ pkg_translate() {
         zlib-dev)        echo "zlib" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     apk)
@@ -249,6 +252,7 @@ pkg_translate() {
         zlib-dev)        echo "zlib-dev" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     brew)
@@ -273,6 +277,7 @@ pkg_translate() {
         zlib-dev)        echo "" ;; # system provided
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
   esac
