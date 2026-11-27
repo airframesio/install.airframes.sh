@@ -2,9 +2,9 @@
 # Stand-in for curl in the end-to-end tests: serves the installer, GitHub
 # release info, a fake Airframes API (device sign-in, station registration,
 # ATC directory) and a fake xng dashboard (/tmp/fake/state.json).
-import json, os, sys, shutil
+import json, os, sys, shutil, time, email.utils
 args = sys.argv[1:]
-url = None; out = None; wfmt = None; data = None; method = "GET"; hdrs = []
+url = None; out = None; wfmt = None; data = None; method = "GET"; hdrs = []; head = False
 i = 0
 while i < len(args):
     a = args[i]
@@ -14,12 +14,18 @@ while i < len(args):
     if a in ("--data", "-d"): data = args[i+1]; i += 2; continue
     if a in ("-H",): hdrs.append(args[i+1]); i += 2; continue
     if a in ("-m", "--max-time"): i += 2; continue
+    if a in ("-I", "--head"): head = True
     if a.startswith("http"): url = a
     i += 1
 state = "/tmp/fakeapi"; os.makedirs(state, exist_ok=True)
 log = open(state + "/requests.log", "a")
 log.write("%s %s %s %s\n" % (method, url, data or "", " ".join(h for h in hdrs if h.startswith("Authorization"))))
 def reply(code, body):
+    if head:
+        # FAKE_DATE_OFFSET: how far the server's clock is ahead of ours
+        when = time.time() + int(os.environ.get("FAKE_DATE_OFFSET", "0"))
+        sys.stdout.write("HTTP/2 %d\r\ndate: %s\r\n\r\n" % (code, email.utils.formatdate(when, usegmt=True)))
+        sys.exit(0)
     s = body if isinstance(body, str) else json.dumps(body)
     if out:
         open(out, "w").write(s)
@@ -36,6 +42,20 @@ if url == "https://install.airframes.sh/installer":
     sys.stdout.write(open(os.environ.get("INSTALLER", "/t/installer")).read()); sys.exit(0)
 if url and "api.github.com/repos/airframesio/xng/releases/latest" in url:
     reply(200, {"tag_name": os.environ.get("XNG_LATEST", "v0.23.1")})
+if url and "github.com/airframesio/xng/releases/download" in url and url.endswith("/SHA256SUMS"):
+    # XNG_SUMS: "good" lists the tarball's real hash, "bad" a wrong one, unset: no file
+    mode = os.environ.get("XNG_SUMS", "")
+    if not mode: sys.stderr.write("curl: (22) 404\n"); sys.exit(22)
+    import hashlib, glob
+    src = os.environ.get("XNG_TARBALL", "/tmp/fake/xng.tgz")
+    h = hashlib.sha256(open(src, "rb").read()).hexdigest() if mode == "good" else "0" * 64
+    name = os.environ.get("XNG_TARBALL_NAME", "")
+    lines = "%s  %s\n" % (h, name) if name else ""
+    if not name:
+        ver = url.split("/download/")[1].split("/")[0]
+        for arch in ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "armv7-unknown-linux-gnueabihf"):
+            lines += "%s  xng-%s-%s.tar.gz\n" % (h, ver, arch)
+    open(out, "w").write(lines); sys.exit(0)
 if url and "github.com/airframesio/xng/releases/download" in url:
     src = os.environ.get("XNG_TARBALL", "/tmp/fake/xng.tgz")
     if not os.path.exists(src): sys.stderr.write("curl: (22) 404\n"); sys.exit(22)
@@ -58,6 +78,13 @@ if url and url.startswith(api):
         if body["ident"] in os.environ.get("TAKEN", "").split(","):
             reply(409, {"error": "station_ident_taken"})
         reply(201, {"created": True, "claimed": False, "station": {"ident": body["ident"]}})
+    if path.startswith("/stations/ident/"):
+        # /tmp/fake/stations.json: {"IDENT-ACARS": seconds since last report, ...}
+        known = json.load(open("/tmp/fake/stations.json")) if os.path.exists("/tmp/fake/stations.json") else {}
+        ident = path[len("/stations/ident/"):]
+        if ident not in known: reply(200, "")
+        at = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - known[ident]))
+        reply(200, {"ident": ident, "status": "active", "lastReportAt": at})
     if path.startswith("/v1/atc/frequencies"):
         rows = [
             (120.500, "KMHR", "TWR", 9), (127.400, "KMHR", "GND", 9), (119.100, "KMCC", "TWR", 18),
