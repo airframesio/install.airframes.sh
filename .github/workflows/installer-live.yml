@@ -1,0 +1,40 @@
+name: Installer live
+
+# Runs the installer for real: the latest xng release from GitHub on a fresh
+# Debian Bookworm, on amd64, arm64 and armhf (32-bit Raspberry Pi OS) under
+# QEMU. Only the SDRs are faked. Nightly it also runs the published
+# one-liner (install.airframes.sh), so a new xng release or an API change
+# that breaks setup shows up here before users hit it.
+
+on:
+  pull_request:
+    paths:
+      - installer
+      - tests/live/**
+      - .github/workflows/installer-live.yml
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  real-release:
+    name: ${{ matrix.source }} on ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64, linux/arm/v7]
+        source: [checkout, one-liner]
+        exclude:
+          # Pull requests test their own installer; the published one is checked nightly
+          - source: ${{ github.event_name == 'pull_request' && 'one-liner' || 'none' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.platform != 'linux/amd64'
+      - name: Install and run xng
+        run: |
+          src=/t/installer
+          if [ "${{ matrix.source }}" = one-liner ]; then src=online; fi
+          docker run --rm --platform ${{ matrix.platform }} -v "$PWD:/t:ro" debian:bookworm bash /t/tests/live/run.sh "$src"
