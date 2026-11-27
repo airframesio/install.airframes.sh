@@ -44,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="3.2.0"
+VERSION="3.3.0"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
@@ -2136,6 +2136,38 @@ blacklist_dvb() {
 # caller can use Docker. Releases from 0.23.2 have amd64, arm64 and armhf
 # builds for glibc 2.35 and up (Bookworm, Ubuntu 22.04, Pi OS 32-bit).
 XNG_BIN=/usr/local/bin/xng
+# Check a downloaded release file against the release's SHA256SUMS.
+# Stops the installer on a mismatch; carries on (with a note) when the
+# release publishes no checksums (xng before 0.24.0).
+verify_release_file() {
+  local base="$1" name="$2" file="$3" sums="${XNG_SUMS_FILE:-}" want got
+  [ "$sums" = none ] && return 0
+  if [ -z "$sums" ]; then
+    sums=$(mktemp)
+    if ! curl -fsSL "${base}/SHA256SUMS" -o "$sums" 2>/dev/null || [ ! -s "$sums" ]; then
+      rm -f "$sums"
+      XNG_SUMS_FILE=none
+      substep "This xng release has no SHA256SUMS; not checking the download"
+      return 0
+    fi
+    XNG_SUMS_FILE="$sums"
+  fi
+  want=$(awk -v n="$name" '$2 == n || $2 == "*"n {print $1}' "$sums" | head -1)
+  if [ -z "$want" ]; then
+    substep "SHA256SUMS doesn't list ${name}; not checking it"
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$file" | awk '{print $1}')
+  else got=$(shasum -a 256 "$file" | awk '{print $1}'); fi
+  if [ "$got" != "$want" ]; then
+    warn "${name} doesn't match the release's SHA256SUMS (got ${got}, expected ${want})."
+    warn "The download was corrupted or changed on the way, so it isn't installed."
+    return 1
+  fi
+  substep "Checked ${name} (SHA-256)"
+  return 0
+}
+
 install_xng_native() {
   local ver="$1" target debarch
   case "$ARCH" in
@@ -2152,8 +2184,9 @@ install_xng_native() {
      [ "$(dpkg --print-architecture 2>/dev/null)" = "$debarch" ]; then
     substep "Downloading xng ${ver} (${debarch}.deb)"
     if curl -fsSL "${base}/xng-${ver}-${debarch}.deb" -o "${tmp}/xng.deb" 2>/dev/null; then
-      chmod 644 "${tmp}/xng.deb"
-      if sudo apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
+      if ! verify_release_file "$base" "xng-${ver}-${debarch}.deb" "${tmp}/xng.deb"; then
+        substep "Trying the tarball instead"
+      elif chmod 644 "${tmp}/xng.deb" && sudo apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
         # The package's own binary, not the first xng on PATH (an older
         # tarball install in /usr/local/bin would win there)
         local deb_bin="" pkg_name
@@ -2176,7 +2209,13 @@ install_xng_native() {
 
   install_xng_runtime
   substep "Downloading xng ${ver} (${target})"
-  if ! curl -fsSL "${base}/xng-v${ver}-${target}.tar.gz" -o "${tmp}/xng.tgz" || ! tar xzf "${tmp}/xng.tgz" -C "$tmp"; then
+  if ! curl -fsSL "${base}/xng-v${ver}-${target}.tar.gz" -o "${tmp}/xng.tgz"; then
+    rm -rf "$tmp"; return 1
+  fi
+  if ! verify_release_file "$base" "xng-v${ver}-${target}.tar.gz" "${tmp}/xng.tgz"; then
+    rm -rf "$tmp"; return 1
+  fi
+  if ! tar xzf "${tmp}/xng.tgz" -C "$tmp"; then
     rm -rf "$tmp"; return 1
   fi
   local bin
@@ -2383,9 +2422,43 @@ xng_summary() {
   echo -e "  Check it:   ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- status${RESET}"
 }
 
+# ---------------------------------------------------------------------------
+# Before installing: disk space, network, clock. Warnings only.
+# ---------------------------------------------------------------------------
+preflight_checks() {
+  local free code hdr remote now skew
+  free=$(df -Pk / 2>/dev/null | awk 'NR == 2 {print int($4 / 1024)}' || true)
+  if [ -n "$free" ] && [ "$free" -lt 300 ]; then
+    warn "Only ${free} MB free on /. xng needs about 100 MB, plus room for logs; free some space if the install fails."
+  fi
+  code=$(curl -sS -o /dev/null -m 15 -w '%{http_code}' https://api.github.com/repos/airframesio/xng/releases/latest 2>/dev/null || true)
+  case "$code" in
+    ""|000) warn "Can't reach GitHub, where xng is downloaded from. Check this machine's internet connection and DNS." ;;
+  esac
+  hdr=$(curl -sS -I -m 15 "${AIRFRAMES_API}/" 2>/dev/null | tr -d '\r' || true)
+  if [ -z "$hdr" ]; then
+    warn "Can't reach ${AIRFRAMES_API}. Signing in and feeding need it."
+    return 0
+  fi
+  remote=$(printf '%s\n' "$hdr" | sed -n 's/^[Dd]ate: *//p' | head -1)
+  [ -n "$remote" ] || return 0
+  remote=$(date -u -d "$remote" +%s 2>/dev/null || true)
+  [ -n "$remote" ] || return 0
+  now=$(date -u +%s)
+  skew=$(( now > remote ? now - remote : remote - now ))
+  if [ "$skew" -gt 300 ]; then
+    warn "This machine's clock is off by $(( skew / 60 )) minutes. Sign-in and downloads can fail, and message times will be wrong."
+    if command -v timedatectl >/dev/null 2>&1; then
+      info "Turn on time sync with: sudo timedatectl set-ntp true"
+    fi
+  fi
+  return 0
+}
+
 # Whole xng flow, after the menu: sign in, station, hardware, jobs.
 plan_xng_station() {
   ensure_python3 || exit 1
+  preflight_checks
   signin_step
   detect_station_location
   choose_station_ident
@@ -2701,6 +2774,10 @@ cmd_status() {
   local busy
   busy=$(sdr_programs_running)
   [ -n "$busy" ] && echo "  Also running: ${busy}"
+  if [ -n "$ident" ]; then
+    local fed; fed=$(airframes_feed_lines "$ident")
+    if [ -n "$fed" ]; then echo "  Airframes:"; echo "$fed"; fi
+  fi
   local adsb; adsb=$(adsb_status_lines)
   if [ -n "$adsb" ]; then echo "  ADS-B:"; echo "$adsb"; fi
   lsmod 2>/dev/null | grep -q '^dvb_usb_rtl28xxu' && echo "  Warning:  the dvb_usb_rtl28xxu kernel driver is loaded (reboot to release RTL-SDRs)"
@@ -2977,6 +3054,74 @@ cmd_auto_update() {
     no)  disable_auto_update; ok "Automatic updates are off" ;;
     *)   if auto_update_enabled; then info "Automatic updates are on (weekly)"; else info "Automatic updates are off"; fi ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Is Airframes hearing this station? One line per mode xng feeds it
+# ---------------------------------------------------------------------------
+# xng's auto-suffix: the station id per mode Airframes ingests
+feed_suffix() {
+  case "$1" in
+    acars) echo ACARS ;; vdl2) echo VDL2 ;; hfdl) echo HFDL ;;
+    ais) echo AIS ;; iridium) echo IRDM ;;
+  esac
+}
+
+feed_ident() {
+  local base="$1" sfx="$2" last
+  last="${base##*-}"; last="${last%%[0-9]*}"
+  case "$last" in
+    ACARS|VDL2|HFDL|AIS|IMSL|IRDM|STDC|ADSB|UAT|SARSAT|DSC|NAVTEX|SONDE|ADSL|ATCS)
+      [ "$base" != "${base%-*}" ] && base="${base%-*}" ;;
+  esac
+  echo "${base}-${sfx}"
+}
+
+airframes_feed_lines() {
+  local base="$1" m sfx id out code body
+  command -v python3 >/dev/null 2>&1 || return 0
+  [ -r "${XNG_CONFIG_DIR}/station.toml" ] || return 0
+  local suffix=true
+  grep -q '^auto-suffix *= *true' "${XNG_CONFIG_DIR}/station.toml" || suffix=false
+  for m in $(sed -n 's/^mode *= *"\(.*\)"/\1/p' "${XNG_CONFIG_DIR}/station.toml" | sort -u); do
+    sfx=$(feed_suffix "$m"); [ -n "$sfx" ] || continue
+    if [ "$suffix" = true ]; then id=$(feed_ident "$base" "$sfx"); else id="$base"; fi
+    out=$(curl -sS -m 10 -w '\n%{http_code}' "${AIRFRAMES_API}/stations/ident/${id}" 2>/dev/null || true)
+    code="${out##*$'\n'}"; body="${out%$'\n'*}"
+    case "$code" in
+      2??) ;;
+      *) echo "            ${id}: couldn't ask Airframes (no answer from ${AIRFRAMES_API})"; continue ;;
+    esac
+    printf '%s' "$body" | python3 -c '
+import json, sys, datetime
+ident = sys.argv[1]
+try:
+    d = json.loads(sys.stdin.read() or "null")
+except Exception:
+    d = None
+if not isinstance(d, dict):
+    print("            %s: not seen yet (it shows up once the first message arrives)" % ident); sys.exit(0)
+t = d.get("lastReportAt")
+if not t:
+    print("            %s: on Airframes, nothing received yet" % ident); sys.exit(0)
+try:
+    s = t.replace("Z", "+00:00")
+    at = datetime.datetime.fromisoformat(s)
+    if at.tzinfo is None: at = at.replace(tzinfo=datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - at).total_seconds()
+except Exception:
+    print("            %s: last heard %s" % (ident, t)); sys.exit(0)
+def ago(x):
+    x = max(0, int(x))
+    if x < 120: return "%d s ago" % x
+    if x < 7200: return "%d min ago" % (x // 60)
+    if x < 172800: return "%d h ago" % (x // 3600)
+    return "%d days ago" % (x // 86400)
+note = "" if age < 3600 else "  <- nothing for a while; check the antenna and the log below"
+print("            %s: last heard %s%s" % (ident, ago(age), note))
+' "$id" || true
+  done
+  return 0
 }
 
 # ---------------------------------------------------------------------------

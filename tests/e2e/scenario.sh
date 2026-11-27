@@ -152,5 +152,34 @@ case "$1" in
     check "timer removed" '[ ! -e /etc/systemd/system/airframes-xng-update.timer ]'
     check "config kept" '[ -f $TOML ]'
     ;;
+  checksum)
+    out=$(XNG_SUMS=good run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2); echo "$out"
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "tarball checked" 'echo "$out" | grep -q "Checked xng-v0.23.1-.*(SHA-256)"'
+    check "native install" '[ "$(/usr/local/bin/xng --version)" = "xng 0.23.1" ]'
+    ;;
+  checksum-bad)
+    out=$(XNG_SUMS=bad run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2); echo "$out"
+    check "mismatch reported" 'echo "$out" | grep -q "doesn.t match the release.s SHA256SUMS"'
+    check "not installed" '[ ! -e /usr/local/bin/xng ]'
+    ;;
+  feed-check)
+    run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2 >/dev/null
+    id=$(sed -n 's/^station-id *= *"\(.*\)"/\1/p' $TOML)
+    echo "{\"$id-ACARS\": 30, \"$id-VDL2\": 18000}" > /tmp/fake/stations.json
+    out=$(run status); echo "$out"
+    check "acars heard" 'echo "$out" | grep -q "$id-ACARS: last heard [0-9]* s ago$"'
+    check "vdl2 quiet" 'echo "$out" | grep -q "$id-VDL2: last heard 5 h ago  <- nothing for a while"'
+    rm /tmp/fake/stations.json
+    out=$(run status); echo "$out"
+    check "not seen yet" 'echo "$out" | grep -q "$id-ACARS: not seen yet"'
+    ;;
+  preflight)
+    out=$(FAKE_DATE_OFFSET=900 run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2); echo "$out"
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "clock warning" 'echo "$out" | grep -q "clock is off by 15 minutes"'
+    out=$(run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2); echo "$out"
+    check "no warning when right" '! echo "$out" | grep -q "clock is off"'
+    ;;
   *) echo "unknown scenario $1"; exit 2 ;;
 esac
