@@ -44,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="3.1.0"
+VERSION="3.2.0"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
@@ -114,6 +114,7 @@ RTLSDR_ORDER_KNOWN=false # true when rtl_test gave librtlsdr's own order
 WANT_XNG=false           # set up the xng station (recommended)
 COMMAND=""               # status, update or uninstall
 PURGE=false              # uninstall --purge
+AUTO_UPDATE=""           # --auto-update yes/no; empty asks
 XNG_HTTP_PORT=8080
 XNG_METRICS_PORT=9090
 WANT_ADSB=false          # feed ADS-B to Airframes' partners (Airframes doesn't ingest it)
@@ -562,8 +563,10 @@ ui_choose() {
     echo >&2
     local choice
     while true; do
-      echo -ne "  ${BOLD}Select [1-${#options[@]}]: ${RESET}" >&2
+      echo -ne "  ${BOLD}Select [1-${#options[@]}, Enter = 1]: ${RESET}" >&2
       read -r choice || { echo >&2; err "No answer, stopping."; exit 1; }
+      # Enter takes the first option, like the highlighted item in gum
+      [ -z "$choice" ] && choice=1
       if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
         echo "${options[$((choice-1))]}"
         return 0
@@ -2375,6 +2378,7 @@ xng_summary() {
     echo -e "  On Airframes: ${CYAN}${AIRFRAMES_APP}/stations${RESET} (signed in as ${AF_USERNAME})"
   else
     echo -e "  On Airframes: your feed shows up as ${STATION_IDENT}-ACARS, -VDL2, ... once data arrives."
+    echo -e "  Claim it:   ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- sign-in${RESET}"
   fi
   echo -e "  Check it:   ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- status${RESET}"
 }
@@ -2674,6 +2678,9 @@ cmd_status() {
       echo "            xng ${latest} is out: run the installer with \"update\""
     fi
   fi
+  if [ -n "$where" ]; then
+    if auto_update_enabled; then echo "  Updates:  automatic (weekly)"; else echo "  Updates:  by hand (\"update\"; \"auto-update on\" automates it)"; fi
+  fi
   if [ -r "${XNG_CONFIG_DIR}/station.toml" ]; then
     ident=$(sed -n 's/^station-id *= *"\(.*\)"/\1/p' "${XNG_CONFIG_DIR}/station.toml" | head -1)
     echo "  Station:  ${ident:-?}"
@@ -2684,7 +2691,7 @@ cmd_status() {
     user=$(sudo cat "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null | json_field "d.get('username')" || true)
     echo "  Sign-in:  ${user:-signed in} (Airframes account)"
   else
-    echo "  Sign-in:  none (feeding unclaimed)"
+    echo "  Sign-in:  none (feeding unclaimed; run the installer with \"sign-in\" to claim it)"
   fi
 
   echo "  SDRs:"
@@ -2694,6 +2701,8 @@ cmd_status() {
   local busy
   busy=$(sdr_programs_running)
   [ -n "$busy" ] && echo "  Also running: ${busy}"
+  local adsb; adsb=$(adsb_status_lines)
+  if [ -n "$adsb" ]; then echo "  ADS-B:"; echo "$adsb"; fi
   lsmod 2>/dev/null | grep -q '^dvb_usb_rtl28xxu' && echo "  Warning:  the dvb_usb_rtl28xxu kernel driver is loaded (reboot to release RTL-SDRs)"
 
   if [ -n "$where" ]; then
@@ -2797,6 +2806,10 @@ cmd_uninstall() {
     info "Nothing removed."
     return 0
   fi
+  if [ -f "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" ]; then
+    disable_auto_update
+    substep "Turned off automatic updates"
+  fi
   if [ -f /etc/systemd/system/xng-station.service ]; then
     sudo systemctl disable --now xng-station >/dev/null 2>&1 || true
     sudo rm -f /etc/systemd/system/xng-station.service
@@ -2824,11 +2837,177 @@ cmd_uninstall() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# installer sign-in: put a station that was set up unclaimed on an account
+# ---------------------------------------------------------------------------
+# station.toml values the commands below need again
+toml_value() {
+  [ -r "${XNG_CONFIG_DIR}/station.toml" ] || return 0
+  sed -n "s/^$1 *= *\"\\(.*\\)\"/\\1/p" "${XNG_CONFIG_DIR}/station.toml" | head -1
+}
+
+xng_restart_station() {
+  case "$(xng_runs_where)" in
+    native) have_systemd && sudo systemctl restart xng-station ;;
+    docker) sudo docker restart xng-station >/dev/null ;;
+  esac
+  return 0
+}
+
+cmd_signin() {
+  if [ ! -r "${XNG_CONFIG_DIR}/station.toml" ]; then
+    err "No xng station here yet. Run the installer without \"sign-in\" to set one up (it asks to sign in)."
+    exit 1
+  fi
+  ensure_python3 || exit 1
+  # --station-id renames the station; otherwise keep the one it has
+  local saved_ident; saved_ident=$(toml_value station-id)
+  [ -n "$STATION_IDENT" ] || STATION_IDENT="$saved_ident"
+  local pos; pos=$(toml_value receiver-pos)
+  if [ -n "$pos" ]; then STATION_LAT="${pos%%,*}"; STATION_LON="${pos#*,}"; fi
+  info "Station ${BOLD}${STATION_IDENT}${RESET}"
+  SIGNIN_MODE=yes
+  if ! airframes_signin; then
+    err "Not signed in; nothing changed."
+    exit 1
+  fi
+  register_station
+  if [ "$STATION_IDENT" != "$saved_ident" ]; then
+    sudo sed -i "s/^station-id *= *.*/station-id = $(toml_str "$STATION_IDENT" | sed 's/[\/&]/\\&/g')/" "${XNG_CONFIG_DIR}/station.toml"
+    substep "Station ID is now ${STATION_IDENT}"
+  fi
+  # Airband audio feeds Airframes ATC only with the sign-in
+  if grep -q '^mode *= *"airband"' "${XNG_CONFIG_DIR}/station.toml" &&
+     ! grep -q '^\[outputs\.airband\.atc\]' "${XNG_CONFIG_DIR}/station.toml"; then
+    local tmp; tmp=$(mktemp)
+    {
+      cat "${XNG_CONFIG_DIR}/station.toml"
+      echo
+      echo "[outputs.airband.atc]"
+      echo "credentials = $(toml_str "${XNG_CONFIG_DIR}/atc.json")"
+      echo "station-name = $(toml_str "$STATION_IDENT")"
+      echo "location-precision-m = 500"
+    } > "$tmp"
+    sudo install -m 644 "$tmp" "${XNG_CONFIG_DIR}/station.toml"
+    rm -f "$tmp"
+    substep "Airband audio now feeds Airframes ATC"
+  elif ! grep -q '^mode *= *"airband"' "${XNG_CONFIG_DIR}/station.toml"; then
+    info "To add airband audio for Airframes ATC, run the installer again and give an SDR the airband job."
+  fi
+  [ "$(xng_runs_where)" = native ] && sudo chown xng: "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null
+  xng_restart_station
+  verify_xng_station
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Automatic updates: a weekly systemd timer running "installer -y update"
+# ---------------------------------------------------------------------------
+AUTO_UPDATE_UNIT="airframes-xng-update"
+
+auto_update_enabled() {
+  have_systemd && systemctl is-enabled --quiet "${AUTO_UPDATE_UNIT}.timer" 2>/dev/null
+}
+
+enable_auto_update() {
+  have_systemd || { warn "Automatic updates need systemd; run the installer with \"update\" now and then."; return 0; }
+  sudo tee "/etc/systemd/system/${AUTO_UPDATE_UNIT}.service" >/dev/null << EOF
+[Unit]
+Description=Update xng to the latest release (Airframes installer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=AIRFRAMES_NO_TTY=1
+Environment="XNG_CONFIG_DIR=${XNG_CONFIG_DIR//%/%%}"
+ExecStart=/bin/bash -c 'curl -fsSL https://install.airframes.sh/installer | bash -s -- -y --no-tui update'
+EOF
+  sudo tee "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" >/dev/null << EOF
+[Unit]
+Description=Weekly xng update check (Airframes installer)
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now "${AUTO_UPDATE_UNIT}.timer" >/dev/null 2>&1 || true
+  ok "xng updates itself weekly (turn it off with: installer auto-update off)"
+}
+
+disable_auto_update() {
+  if [ -f "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" ]; then
+    sudo systemctl disable --now "${AUTO_UPDATE_UNIT}.timer" >/dev/null 2>&1 || true
+    # An update already running would put xng back
+    sudo systemctl stop "${AUTO_UPDATE_UNIT}.service" >/dev/null 2>&1 || true
+    sudo rm -f "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" "/etc/systemd/system/${AUTO_UPDATE_UNIT}.service"
+    have_systemd && sudo systemctl daemon-reload
+  fi
+  return 0
+}
+
+# During setup: ask (default yes), or follow --auto-update / --no-auto-update
+setup_auto_update() {
+  have_systemd || return 0
+  case "$AUTO_UPDATE" in
+    yes) enable_auto_update ;;
+    no)  return 0 ;;
+    *)
+      auto_update_enabled && return 0
+      if [ "$AUTO_YES" != true ] && [ "$IS_TTY" = true ]; then
+        if ui_confirm "Keep xng up to date automatically (checks weekly)?" "yes"; then
+          enable_auto_update
+        else
+          info "Update by hand with: curl -sSL https://install.airframes.sh/installer | bash -s -- update"
+        fi
+      fi
+      ;;
+  esac
+  return 0
+}
+
+cmd_auto_update() {
+  case "$AUTO_UPDATE" in
+    yes) enable_auto_update ;;
+    no)  disable_auto_update; ok "Automatic updates are off" ;;
+    *)   if auto_update_enabled; then info "Automatic updates are on (weekly)"; else info "Automatic updates are off"; fi ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# ADS-B partner feeds, for the status report
+# ---------------------------------------------------------------------------
+adsb_status_lines() {
+  local u s c any=false
+  for u in readsb dump1090-fa dump1090-mutability piaware airplanes-feed airplanes-mlat; do
+    if have_systemd && systemctl list-unit-files "${u}.service" 2>/dev/null | grep -q "^${u}\.service"; then
+      s=$(systemctl is-active "$u" 2>/dev/null || true)
+      echo "            ${u}: ${s:-unknown}"; any=true
+    fi
+  done
+  if command -v docker >/dev/null 2>&1; then
+    for c in airframes-ultrafeeder airframes-planewatch ultrafeeder; do
+      s=$(sudo docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || true)
+      [ -n "$s" ] && { echo "            ${c} (Docker): ${s}"; any=true; }
+    done
+  fi
+  [ "$any" = true ] && [ -f /etc/default/airplanes ] &&
+    echo "            Check the Airplanes.Live feed at https://airplanes.live/myfeed"
+  return 0
+}
+
 run_command() {
   case "$COMMAND" in
     status)    cmd_status ;;
     update)    show_banner; cmd_update ;;
     uninstall) show_banner; cmd_uninstall ;;
+    signin)    show_banner; cmd_signin ;;
+    autoupdate) cmd_auto_update ;;
   esac
 }
 
@@ -3932,6 +4111,10 @@ What to set up:
   status      Check the station and print a report to paste when asking
               for help (no passwords or tokens in it)
   update      Update xng to the latest release, keeping its configuration
+  sign-in     Sign in to Airframes and put this station on your account
+              (for a station set up without signing in)
+  auto-update on|off
+              Update xng automatically every week (systemd timer)
   uninstall   Remove the xng station (--purge also removes /etc/xng
               and the sign-in)
   adsb        ADS-B (1090 MHz) for Airframes' partners Airplanes.Live and
@@ -3962,6 +4145,8 @@ xng options:
                           directory near you), or "nearest" (default)
   --xng-method METHOD     native or docker (default: native, else Docker)
   --xng-version VER       xng version (default: latest release)
+  --auto-update           Update xng weekly (asked when interactive)
+  --no-auto-update        Don't set up automatic updates
   --lat / --lon           Receiver position (also used for ADS-B)
 
 ADS-B options:
@@ -4061,6 +4246,12 @@ parse_args() {
       update|upgrade)   COMMAND=update; shift ;;
       uninstall|remove) COMMAND=uninstall; shift ;;
       --purge)          PURGE=true; shift ;;
+      signin|sign-in|login) COMMAND=signin; shift ;;
+      auto-update|autoupdate)
+        COMMAND=autoupdate; shift
+        case "${1:-}" in on|yes) AUTO_UPDATE=yes; shift ;; off|no) AUTO_UPDATE=no; shift ;; esac ;;
+      --auto-update)    AUTO_UPDATE=yes; shift ;;
+      --no-auto-update) AUTO_UPDATE=no; shift ;;
       --sign-in)        SIGNIN_MODE=yes; shift ;;
       --no-sign-in)     SIGNIN_MODE=no; shift ;;
       --modes)          XNG_MODES_ARG="$2"; WANT_XNG=true; shift 2 ;;
@@ -4442,6 +4633,8 @@ tui_flow() {
 
   [ ${#SELECTED_DECODERS[@]} -gt 0 ] && install_manager_script
 
+  [ "$WANT_XNG" = true ] && setup_auto_update
+
   [ "$WANT_XNG" = true ] && verify_xng_station
 
   [ "$WANT_XNG" = true ] && xng_summary
@@ -4601,6 +4794,8 @@ main() {
     setup_adsb
 
     [ ${#SELECTED_DECODERS[@]} -gt 0 ] && install_manager_script
+
+    [ "$WANT_XNG" = true ] && setup_auto_update
 
     [ "$WANT_XNG" = true ] && verify_xng_station
 

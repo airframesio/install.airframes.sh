@@ -2,10 +2,10 @@ name: Installer check
 
 on:
   pull_request:
-    paths: ['installer', '.github/workflows/installer-check.yml']
+    paths: ['installer', 'tests/**', '.github/workflows/installer-check.yml']
   push:
     branches: [main]
-    paths: ['installer', '.github/workflows/installer-check.yml']
+    paths: ['installer', 'tests/**', '.github/workflows/installer-check.yml']
 
 permissions:
   contents: read
@@ -38,3 +38,11 @@ jobs:
           grep -q "nothing to remove" uninstall.txt
           # Unknown arguments must fail
           if ./installer --no-such-flag >/dev/null 2>&1; then exit 1; fi
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: End-to-end scenarios (containers, stubbed API)
+        run: tests/e2e/run.sh
