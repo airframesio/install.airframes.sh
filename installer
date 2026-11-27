@@ -305,9 +305,9 @@ pkg_install() {
     apt)
       # A fresh or long-idle system has no or stale package lists: refresh
       # them and try again when the first attempt fails
-      if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"; then
+      if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"; then
         sudo apt-get update -qq || true
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
       fi
       ;;
     dnf)
@@ -2122,8 +2122,9 @@ xng_latest_version() {
 APT_UPDATED=false
 apt_update_once() {
   [ "$APT_UPDATED" = true ] && return 0
-  sudo apt-get update -qq >/dev/null 2>&1 || true
-  APT_UPDATED=true
+  # Only remember a refresh that worked, so a later step tries again
+  if sudo apt-get update -qq >/dev/null 2>&1; then APT_UPDATED=true; fi
+  return 0
 }
 
 # SoapySDR and its modules for the SDRs xng will open
@@ -2211,7 +2212,7 @@ install_xng_native() {
       if ! verify_release_file "$base" "xng-${ver}-${debarch}.deb" "${tmp}/xng.deb"; then
         substep "Trying the tarball instead"
       elif chmod 644 "${tmp}/xng.deb" && apt_update_once &&
-           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
+           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
         # The package's own binary, not the first xng on PATH (an older
         # tarball install in /usr/local/bin would win there)
         local deb_bin="" pkg_name
@@ -4855,7 +4856,12 @@ main() {
     exit 1
   fi
   detect_platform
-  ensure_curl
+  # Removing xng and turning auto-update off are local; everything else downloads
+  case "$COMMAND" in
+    uninstall) ;;
+    autoupdate) if [ "$AUTO_UPDATE" = yes ]; then ensure_curl; fi ;;
+    *) ensure_curl ;;
+  esac
   if [ -n "$COMMAND" ]; then
     run_command
     exit 0
