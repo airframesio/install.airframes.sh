@@ -438,5 +438,53 @@ Y
     out=$(run restore-decoders); echo "$out"
     check "nothing to restore" 'echo "$out" | grep -q "nothing to restore" && echo "$out" | grep -q "^EXIT=0"'
     ;;
+  report)
+    out=$(run -y xng --no-sign-in --report --modes 00000001=acars,00000002=vdl2); echo "$out"
+    R=/tmp/fakeapi/report.json; cat $R
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "report sent" '[ "$(wc -l < $R)" = 1 ]'
+    check "success" 'grep -q "\"outcome\":\"success\"" $R && grep -q "\"failed_step\":\"\"" $R'
+    check "versions" 'grep -q "\"installer_version\":\"3.7.0\"" $R && grep -q "\"xng_version\":\"0.23.1\"" $R'
+    check "system" 'grep -q "\"os\":\"linux\",\"distro\":\"debian\",\"arch\":\"amd64\"" $R'
+    check "sdrs and modes" 'grep -q "\"sdrs\":\[\"rtlsdr\",\"rtlsdr\"\],\"modes\":\[\"acars\",\"vdl2\"\]" $R'
+    id=$(sed -n 's/^station-id *= *"\(.*\)"/\1/p' $TOML)
+    check "no station id, serial or host" '! grep -q -e "$id" -e 00000001 -e "$(hostname)" $R'
+    check "thanks shown" 'echo "$out" | grep -q "Report sent"'
+    ;;
+  report-off)
+    out=$(run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2); echo "$out"
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "-y sends nothing" '[ ! -e /tmp/fakeapi/report.json ] && ! grep -q /installer/report $REQ'
+    out=$(run -y xng --no-sign-in --no-report --modes 00000001=acars); echo "$out"
+    check "--no-report sends nothing" '! grep -q /installer/report $REQ'
+    ;;
+  report-failed)
+    rm -f /tmp/fake/xng.tgz
+    out=$(run -y xng --no-sign-in --report --xng-method native --modes 00000001=acars,00000002=vdl2); echo "$out"
+    R=/tmp/fakeapi/report.json; cat $R
+    check "exit 1" 'echo "$out" | grep -q "^EXIT=1"'
+    check "failed at native install" 'grep -q "\"outcome\":\"failed\",\"failed_step\":\"xng-install-native\",\"exit_code\":1" $R'
+    ;;
+  report-not-running)
+    echo failed > /tmp/fake/svc.next; rm -f /tmp/fake/state.json
+    out=$(REPORT_STATUS=503 run -y xng --no-sign-in --report --modes 00000001=acars,00000002=vdl2); echo "$out"
+    R=/tmp/fakeapi/report.json; cat $R
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "not running" 'grep -q "\"outcome\":\"not_running\"" $R'
+    check "send failure is quiet" 'echo "$out" | grep -q "couldn.t be sent (HTTP 503)"'
+    ;;
+  report-ask)
+    # On a terminal (answer.py answers the prompts): install, no auto-update, then the report
+    tty_run() { AIRFRAMES_NO_TTY= python3 -I $T/answer.py 'Install the xng station=y' 'up to date automatically=n' "Send it\\?=$1" -- \
+      bash $INSTALLER xng --no-sign-in --station-id TEST-1 --lat 38.68 --lon -120.99 --modes 00000001=acars,00000002=vdl2; echo "EXIT=$?"; }
+    out=$(tty_run ''); echo "$out"
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "asks with a preview" 'echo "$out" | grep -q "send Airframes this anonymous report" && echo "$out" | grep -q "Modes:.*acars vdl2"'
+    check "default is no" 'echo "$out" | grep -q "Send it? \[y/N\]" && [ ! -e /tmp/fakeapi/report.json ]'
+    out=$(tty_run y); echo "$out"
+    check "yes sends it" '[ "$(wc -l < /tmp/fakeapi/report.json)" = 1 ] && ! grep -q TEST-1 /tmp/fakeapi/report.json'
+    out=$(AIRFRAMES_NO_TTY= python3 -I $T/answer.py 'Install the xng station=n' -- bash $INSTALLER xng --no-sign-in --station-id TEST-1 --lat 38.68 --lon -120.99 --modes 00000001=acars); echo "$out"
+    check "not asked after no to the install" 'echo "$out" | grep -q "Aborted" && ! echo "$out" | grep -q "anonymous report"'
+    ;;
   *) echo "unknown scenario $1"; exit 2 ;;
 esac
