@@ -44,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="3.5.0"
+VERSION="3.6.0"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
