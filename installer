@@ -881,7 +881,7 @@ detect_existing_setup() {
               fr24feed rbfeeder pfclient adsbexchange-feed mlat-client tar1090; do
     process_running "$name" && ADSB_SOFTWARE+=("$name")
   done
-  for name in acarsdec dumpvdl2 dumphfdl vdlm2dec acars_router; do
+  for name in acarsdec dumpvdl2 dumphfdl vdlm2dec AIS-catcher acars_router; do
     process_running "$name" && ACARS_SOFTWARE+=("$name")
   done
 
@@ -893,7 +893,7 @@ detect_existing_setup() {
       case "$line" in
         *ultrafeeder*|*readsb*|*piaware*|*dump978*|*fr24*|*tar1090*|*adsb*)
           ADSB_SOFTWARE+=("docker:${line%% *}") ;;
-        *acarshub*|*acarsdec*|*dumpvdl2*|*dumphfdl*|*vdlm2dec*|*acars_router*)
+        *acarshub*|*acarsdec*|*dumpvdl2*|*dumphfdl*|*vdlm2dec*|*acars_router*|*ais-catcher*|*aiscatcher*|*shipfeeder*)
           ACARS_SOFTWARE+=("docker:${line%% *}") ;;
       esac
     done < <(timeout 5 docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null || true)
@@ -1060,7 +1060,8 @@ show_existing_setup() {
   if [ ${#ACARS_SOFTWARE[@]} -gt 0 ]; then
     echo
     info "Found ACARS/VDL2/HFDL software already running: ${BOLD}$(join_by ', ' "${ACARS_SOFTWARE[@]}")${RESET}"
-    echo -e "  If it already decodes, you can feed Airframes from it without reinstalling:"
+    echo -e "  Setting up xng offers to take it over, keeping station names and SDRs"
+    echo -e "  (and switching back is one command). Or keep feeding Airframes from it:"
     echo -e "  ${DIM}https://docs.airframes.io/docs/feeding/how${RESET}"
   fi
   return 0
@@ -1476,7 +1477,8 @@ AIRBAND_MAX_SPAN_KHZ=2000
 # SDRs found for xng: "kind|serial|index|name" (index counts within a kind)
 declare -a XNG_SDRS=()
 # Job per SDR, same order as XNG_SDRS: acars, vdl2, hfdl, airband, ais, adsb,
-# uat, sonde, iridium, keep-adsb (left to the ADS-B decoder) or off
+# uat, sonde, iridium, keep-adsb (left to the ADS-B decoder), keep-old (left
+# to a decoder set up before, see offer_old_decoder_switch) or off
 declare -a XNG_JOBS=()
 # Airband channels picked from the directory: "mhz|label"
 declare -a AIRBAND_CHANNELS=()
@@ -1774,12 +1776,16 @@ choose_station_ident() {
     return 0
   fi
   host=$(hostname -s 2>/dev/null || echo station)
-  suggestion=$(normalize_station_ident "${AF_USERNAME:+${AF_USERNAME}-}${host}" 2>/dev/null ||
+  suggestion=$(normalize_station_ident "$MIG_STATION_SUGGESTION" 2>/dev/null ||
+               normalize_station_ident "${AF_USERNAME:+${AF_USERNAME}-}${host}" 2>/dev/null ||
                normalize_station_ident "$host" 2>/dev/null || echo "STATION")
   if [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ]; then
     echo
     info "Pick a station ID. It names your feed on Airframes; xng adds the mode,"
     info "so ACARS feeds as ${suggestion}-ACARS."
+    if [ "$MIGRATING" = true ]; then
+      info "SDRs xng takes over keep the names their decoders fed under."
+    fi
     while true; do
       id=$(ui_input "Station ID" "$suggestion")
       if id=$(normalize_station_ident "$id"); then break; fi
@@ -1912,6 +1918,7 @@ job_label() {
     sonde)     echo "Weather balloons (400-406 MHz), shown on the xng dashboard" ;;
     iridium)   echo "Iridium (1626 MHz, needs an L-band antenna), fed to Airframes" ;;
     keep-adsb) echo "Leave it to the ADS-B decoder already using it" ;;
+    keep-old)  echo "Leave it to the decoder set up before" ;;
     off)       echo "Don't use it" ;;
   esac
 }
@@ -1992,6 +1999,10 @@ tui_assign_jobs() {
     if sdr_used_by_adsb "$sdr"; then
       jobs+=("keep-adsb")
       label+=" (used by ${ADSB_SOFTWARE[0]})"
+    fi
+    if [ -n "${MIG_FROM[$i]:-}" ]; then
+      if [ "$MIGRATING" = true ]; then label+=" (was ${MIG_FROM[$i]})"
+      else jobs+=("keep-old"); label+=" (used by ${MIG_FROM[$i]})"; fi
     fi
     local j
     for j in $(sdr_jobs_for "$sdr"); do
@@ -2159,11 +2170,12 @@ render_station_toml() {
   local i sdr job c
   for i in "${!XNG_SDRS[@]}"; do
     sdr="${XNG_SDRS[$i]}"; job="${XNG_JOBS[$i]}"
-    case "$job" in off|keep-adsb|"") continue ;; esac
+    case "$job" in off|keep-adsb|keep-old|"") continue ;; esac
     echo
     echo "[[session]]"
     echo "sdr = $(toml_str "$(xng_sdr_selector "$sdr")")"
     echo "mode = \"${job}\""
+    render_migrated_settings "$i" "$job"
     [ -n "$pos" ] && echo "receiver-pos = \"${pos}\""
     if [ "$job" = "airband" ]; then
       for c in "${AIRBAND_CHANNELS[@]}"; do
@@ -2415,46 +2427,728 @@ EOF
   ok "xng is running in Docker (${compose_dir}/docker-compose.yml)"
 }
 
-# Decoders this installer set up before (airframes-acarsdec, ...) hold the
-# SDRs xng needs. Stop them; other ACARS software is only pointed out.
-check_old_decoders() {
-  local d unit
-  OLD_UNITS=()
-  for d in "${DECODER_LIST[@]}"; do
-    unit="airframes-${d}"
-    if have_systemd && systemctl is-enabled --quiet "$unit" 2>/dev/null; then OLD_UNITS+=("$unit")
-    elif have_systemd && systemctl is-active --quiet "$unit" 2>/dev/null; then OLD_UNITS+=("$unit"); fi
-    if command -v docker >/dev/null 2>&1 &&
-       timeout 5 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$unit"; then
-      OLD_UNITS+=("docker:${unit}")
-    fi
+# --- Switching old decoder setups to xng -------------------------------------
+#
+# Earlier setups run one decoder per SDR: acarsdec, dumpvdl2, dumphfdl,
+# vdlm2dec or AIS-catcher, as systemd services (this installer's
+# airframes-<decoder> units, wiedehopf's scripts, AIS-catcher's package),
+# Docker containers (sdr-enthusiasts images, AIS-catcher, shipfeeder) or the
+# docker-compose files the old installer wrote to ${CONFIG_DIR}/<decoder>.
+# They hold the SDRs xng needs. The installer offers to give each SDR the
+# same job in xng, with the same station name, gain and frequencies, and
+# stops the old decoders without removing them. What it stopped is written
+# to ${OLD_DECODERS_FILE}; `installer restore-decoders` stops xng and starts
+# them again.
+
+OLD_DECODERS_FILE="${CONFIG_DIR}/old-decoders.tsv"
+KEEP_OLD_DECODERS=false   # --keep-old-decoders: leave them running
+# Old decoders found, one per line, tab-separated:
+#   kind name program mode ident sdr-kind sdr-serial sdr-index gain channels state
+# kind: systemd, docker or compose (a compose file with no container).
+# state: running, enabled (starts at boot) or stopped.
+declare -a OLD_DECODERS=()
+declare -a OLD_UNITS=()        # what stop_old_decoders stops: "kind<TAB>name"
+# Per SDR (same index as XNG_SDRS), what the old decoder on it did
+declare -a MIG_FROM=() MIG_MODE=() MIG_IDENT=() MIG_GAIN=() MIG_CHANNELS=()
+MIG_STATION_SUGGESTION=""      # station ID the old decoders shared
+MIGRATING=false                # the person chose to switch them to xng
+
+# `docker`, or `sudo -n docker` when the user isn't in the docker group
+docker_ro() {
+  command -v docker >/dev/null 2>&1 || return 1
+  if timeout 10 docker "$@" 2>/dev/null; then return 0; fi
+  [ "$(id -u)" = 0 ] && return 1
+  timeout 10 sudo -n docker "$@" 2>/dev/null
+}
+
+# Field $2 (from 0) of a tab-separated line; tabs are whitespace to read, so
+# empty fields would collapse: split on \x1f instead.
+old_field() { local IFS=$'\x1f'; local -a f; read -ra f <<< "${1//$'\t'/$'\x1f'}"; echo "${f[$2]:-}"; }
+
+# Find the old decoders and read their settings. The reading is in Python
+# (shell words in ExecStart, EnvironmentFile variables, docker inspect JSON).
+collect_old_decoders() {
+  OLD_DECODERS=()
+  [ "$OS" = "linux" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local inspect states line
+  inspect=$(mktemp); states=$(mktemp)
+  local -a names=()
+  if command -v docker >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      [ -n "$line" ] && names+=("$line")
+    done < <(docker_ro ps -a --format '{{.Names}}' || true)
+    if [ ${#names[@]} -gt 0 ]; then docker_ro inspect "${names[@]}" > "$inspect" || true; fi
+  fi
+  # systemd unit states, for the units that look like decoders
+  local f unit
+  if have_systemd; then
+    for f in /etc/systemd/system/*.service /lib/systemd/system/*.service /usr/lib/systemd/system/*.service; do
+      [ -f "$f" ] || continue
+      grep -qiE '^ExecStart=.*(acarsdec|dumpvdl2|dumphfdl|vdlm2dec|ais-?catcher)' "$f" 2>/dev/null || continue
+      unit=$(basename "$f" .service)
+      printf '%s\t%s\t%s\n' "$unit" \
+        "$(systemctl is-enabled "$unit" 2>/dev/null | head -1 || true)" \
+        "$(systemctl is-active "$unit" 2>/dev/null | head -1 || true)" >> "$states"
+    done
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] && OLD_DECODERS+=("$line")
+  done < <(python3 - "$inspect" "$states" "$CONFIG_DIR" <<'PY' || true
+import glob, json, os, re, shlex, sys
+
+inspect_path, states_path, config_dir = sys.argv[1:4]
+PROGRAMS = {"acarsdec": "acars", "vdlm2dec": "vdl2", "dumpvdl2": "vdl2",
+            "dumphfdl": "hfdl", "ais-catcher": "ais"}
+NAMES = {"ais-catcher": "AIS-catcher"}
+
+def program_of(word):
+    b = os.path.basename(word).lower()
+    if b in ("ais-catcher", "aiscatcher"):
+        return "ais-catcher"
+    return b if b in PROGRAMS else None
+
+def program_in(text):
+    t = text.lower()
+    for p in ("acarsdec", "dumpvdl2", "dumphfdl", "vdlm2dec"):
+        if p in t:
+            return p
+    if re.search(r"ais-?catcher|shipfeeder", t):
+        return "ais-catcher"
+    return None
+
+def num(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+def soapy(s, out):
+    kv = dict(p.split("=", 1) for p in s.split(",") if "=" in p)
+    drv = kv.get("driver", "").lower()
+    if drv:
+        out["kind"] = drv
+    if kv.get("serial"):
+        out["serial"] = kv["serial"]
+
+def rtl_dev(v, out):
+    out["kind"] = "rtlsdr"
+    out["serial"] = v
+    if re.fullmatch(r"\d{1,2}", v):
+        out["index"] = str(int(v))
+
+def mhz_list(words, lo, hi):
+    """Frequencies (MHz, kHz or Hz) within lo..hi MHz, as MHz floats."""
+    out = []
+    for w in words:
+        v = num(w)
+        if v is None:
+            continue
+        for mhz in (v, v / 1e3, v / 1e6):
+            if lo <= mhz <= hi:
+                out.append(mhz)
+                break
+    return out
+
+def parse_args(prog, argv):
+    r = {"ident": "", "kind": "", "serial": "", "index": "", "gain": "", "freqs": []}
+    sdr = {}
+    i, n = 0, len(argv)
+    rest = []
+    def val():
+        return argv[i + 1] if i + 1 < n else ""
+    while i < n:
+        a = argv[i]
+        key, eq, inline = a.partition("=")
+        if a.startswith("--") and eq:
+            a, v, step = key, inline, 1
+        else:
+            v, step = val(), 2
+        if prog in ("acarsdec", "vdlm2dec"):
+            if a in ("-i", "--station-id", "--ident"): r["ident"] = v
+            elif a in ("-r", "--rtlsdr"): rtl_dev(v, sdr)
+            elif a in ("-g", "--gain"): r["gain"] = v
+            elif a in ("--soapysdr", "-d"): soapy(v, sdr)
+            elif a in ("-s", "--airspy"): sdr["kind"] = "airspy"; step = 1
+            elif a in ("-o", "-j", "-p", "-l", "-n", "-N", "-m", "-t", "-b", "-c", "-A", "--output", "-e"):
+                pass
+            else:
+                rest.append(a); step = 1
+        elif prog in ("dumpvdl2", "dumphfdl"):
+            if a == "--station-id": r["ident"] = v
+            elif a == "--rtlsdr": rtl_dev(v, sdr)
+            elif a == "--soapysdr": soapy(v, sdr)
+            elif a == "--airspy": sdr["kind"] = "airspy"
+            elif a == "--sdrplay": sdr["kind"] = "sdrplay"
+            elif a == "--gain": r["gain"] = v
+            elif a.startswith("--") and a not in ("--utc", "--milliseconds", "--raw-frames", "--decode-fragments", "--prettify-xml", "--prettify-json", "--statsd"):
+                pass  # option with a value
+            else:
+                rest.append(a); step = 1
+        else:  # AIS-catcher
+            if a.startswith("-d:"):
+                sdr["kind"] = "rtlsdr"; sdr["index"] = a[3:]; step = 1
+            elif a == "-d" and v and not v.startswith("-"):
+                rtl_dev(v, sdr)
+            elif a == "-gr":
+                # -gr TUNER 38.6 RTLAGC off ...
+                j = i + 1
+                while j + 1 < n and not argv[j].startswith("-"):
+                    if argv[j].upper() == "TUNER" and num(argv[j + 1]) is not None:
+                        r["gain"] = argv[j + 1]
+                    j += 2
+                step = j - i
+            elif a == "-H":
+                j = i + 2
+                while j + 1 < n and not argv[j].startswith("-"):
+                    if argv[j].upper() == "ID":
+                        r["ident"] = argv[j + 1]
+                    j += 2
+                step = j - i
+            else:
+                step = 1
+        i += step
+    if prog in ("acarsdec", "vdlm2dec", "dumpvdl2"):
+        r["freqs"] = mhz_list(rest, 118, 138)
+    elif prog == "dumphfdl":
+        r["freqs"] = mhz_list([w for w in rest if num(w) and num(w) >= 1000], 2, 30)
+    r.update(sdr)
+    return r
+
+def env_settings(prog, env, r):
+    for k in ("FEED_ID", "STATION_ID", "AIRFRAMES_STATION_ID"):
+        if env.get(k) and not r["ident"]:
+            r["ident"] = env[k]
+    for k in ("SERIAL", "RTLSDR_DEVICE_SERIAL", "DEVICE_SERIAL"):
+        if env.get(k):
+            r["kind"] = r["kind"] or "rtlsdr"; r["serial"] = env[k]
+    for k in ("SOAPYSDRDRIVER", "SOAPYSDR", "SOAPY_DEVICE"):
+        if env.get(k):
+            soapy(env[k], r)
+    for k in ("GAIN", "RTLSDR_DEVICE_GAIN"):
+        if env.get(k) and not r["gain"]:
+            r["gain"] = env[k]
+    if env.get("FREQUENCIES") and not r["freqs"]:
+        words = re.split(r"[;,\s]+", env["FREQUENCIES"])
+        r["freqs"] = mhz_list(words, 118, 138) if prog != "dumphfdl" else mhz_list(words, 2, 30)
+
+def channels(prog, freqs):
+    if not freqs or prog == "ais-catcher":
+        return ""
+    lo, hi = min(freqs), max(freqs)
+    if prog == "dumphfdl":
+        if hi - lo > 0.24:   # the old capture was 250 kHz wide
+            return ""
+        return ",".join("%dk" % round(f * 1000) for f in sorted(set(freqs)))
+    if hi - lo > 1.9:        # more than one RTL-SDR capture
+        return ""
+    return ",".join("%.3f" % f for f in sorted(set(freqs)))
+
+def clean(s):
+    return re.sub(r"[\t\r\n]", " ", str(s or "")).strip()
+
+def emit(kind, name, prog, r, state):
+    gain = r["gain"] if num(r["gain"]) is not None and 0 <= num(r["gain"]) <= 60 else ""
+    print("\t".join(clean(x) for x in (
+        kind, name, NAMES.get(prog, prog), PROGRAMS[prog], r["ident"], r["kind"],
+        r["serial"], r["index"], gain, channels(prog, r["freqs"]), state)) )
+
+def env_file(path, env):
+    try:
+        for line in open(path):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.replace("export ", "").strip()
+            try:
+                v = " ".join(shlex.split(v))
+            except ValueError:
+                v = v.strip().strip('"')
+            env[k] = v
+    except OSError:
+        pass
+
+def expand(words, env):
+    out = []
+    for w in words:
+        if re.fullmatch(r"\$\{?(\w+)\}?", w):
+            try:
+                out += shlex.split(env.get(re.sub(r"[${}]", "", w), ""))
+            except ValueError:
+                pass
+        else:
+            out.append(re.sub(r"\$\{?(\w+)\}?", lambda m: env.get(m.group(1), ""), w))
+    return out
+
+# systemd units
+states = {}
+for line in open(states_path):
+    p = line.rstrip("\n").split("\t")
+    if len(p) == 3:
+        states[p[0]] = p
+seen = set()
+for path in sorted(glob.glob("/etc/systemd/system/*.service")) + \
+            sorted(glob.glob("/lib/systemd/system/*.service")) + \
+            sorted(glob.glob("/usr/lib/systemd/system/*.service")):
+    unit = os.path.basename(path)[:-len(".service")]
+    if unit in seen or unit not in states or unit.startswith("xng"):
+        continue
+    seen.add(unit)
+    env, execs = {}, []
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        continue
+    for line in lines:
+        line = line.strip()
+        if line.startswith("EnvironmentFile="):
+            env_file(line.split("=", 1)[1].lstrip("-"), env)
+        elif line.startswith("Environment="):
+            try:
+                for kv in shlex.split(line.split("=", 1)[1]):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1); env[k] = v
+            except ValueError:
+                pass
+        elif line.startswith("ExecStart="):
+            execs.append(line.split("=", 1)[1].lstrip("-@+!:"))
+    for cmd in execs:
+        try:
+            words = expand(shlex.split(cmd), env)
+        except ValueError:
+            continue
+        if not words:
+            continue
+        prog = program_of(words[0])
+        argv = words[1:]
+        if not prog:
+            # A start script: use its line that runs the decoder
+            script = words[0] if os.path.isfile(words[0]) else ""
+            if words[0] in ("/bin/sh", "/bin/bash", "sh", "bash") and len(words) > 1:
+                script = words[-1] if os.path.isfile(words[-1]) else ""
+                if not script and "-c" in words:
+                    words = shlex.split(words[words.index("-c") + 1]); script = ""
+                    prog = program_of(words[0]) if words else None; argv = words[1:]
+            if script:
+                try:
+                    body = open(script, errors="replace").read()
+                except OSError:
+                    body = ""
+                for l in body.splitlines():
+                    l = l.strip()
+                    if l.startswith("#"):
+                        continue
+                    try:
+                        ws = expand(shlex.split(l), env)
+                    except ValueError:
+                        continue
+                    ws = [w for w in ws if w != "exec"]
+                    if ws and program_of(ws[0]):
+                        prog, argv = program_of(ws[0]), ws[1:]
+                        break
+            if not prog:
+                prog = program_in(cmd + " " + unit)
+                argv = []
+        if not prog:
+            continue
+        if prog == "ais-catcher":
+            # AIS-catcher's package keeps its options in /etc/AIS-catcher/config.cmd
+            cfg = "/etc/AIS-catcher/config.cmd"
+            if os.path.isfile(cfg):
+                try:
+                    for l in open(cfg):
+                        l = l.strip()
+                        if l and not l.startswith("#"):
+                            argv += shlex.split(l)
+                except (OSError, ValueError):
+                    pass
+        r = parse_args(prog, argv)
+        env_settings(prog, env, r)
+        _, enabled, active = states[unit]
+        state = "running" if active == "active" else ("enabled" if enabled == "enabled" else "stopped")
+        emit("systemd", unit, prog, r, state)
+        break
+
+# Docker containers
+containers = set()
+try:
+    data = json.load(open(inspect_path))
+except (OSError, ValueError):
+    data = []
+for c in data or []:
+    name = (c.get("Name") or "").lstrip("/")
+    cfg = c.get("Config") or {}
+    image = cfg.get("Image") or ""
+    if name.startswith("xng") or "acarshub" in image.lower():
+        continue
+    prog = program_in(image) or program_in(name)
+    if not prog:
+        continue
+    env = dict(e.split("=", 1) for e in (cfg.get("Env") or []) if "=" in e)
+    args = list(cfg.get("Entrypoint") or []) + list(cfg.get("Cmd") or [])
+    words = [w for w in args if program_of(w)]
+    argv = args[args.index(words[0]) + 1:] if words else args
+    r = parse_args(prog, argv)
+    env_settings(prog, env, r)
+    st = c.get("State") or {}
+    policy = ((c.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name") or "no"
+    state = "running" if st.get("Running") else ("enabled" if policy in ("always",) else "stopped")
+    emit("docker", name, prog, r, state)
+    containers.add(name)
+
+# docker-compose files from the old installer that never got a container
+for path in sorted(glob.glob(os.path.join(config_dir, "*", "docker-compose.yml"))):
+    d = os.path.basename(os.path.dirname(path))
+    if d == "xng" or d not in PROGRAMS or "airframes-" + d in containers:
+        continue
+    env = {}
+    try:
+        for l in open(path):
+            m = re.match(r'\s+([A-Z_]+):\s*"?(.*?)"?\s*$', l)
+            if m:
+                env[m.group(1)] = m.group(2)
+    except OSError:
+        continue
+    r = parse_args(d, [])
+    env_settings(d, env, r)
+    emit("compose", path, d, r, "stopped")
+PY
+)
+  rm -f "$inspect" "$states"
+  return 0
+}
+
+# Is this mode suffix one Airframes knows (as xng's auto-suffix)?
+known_suffix() {
+  case "$1" in ACARS|VDL2|HFDL|AIS|IMSL|IRDM|STDC|ADSB|UAT|SARSAT|DSC|NAVTEX|SONDE|ADSL|ATCS) return 0 ;; esac
+  return 1
+}
+
+# The station ID without its mode suffix: KE-KSEA-ACARS1 -> KE-KSEA
+ident_stem() {
+  local s="$1" last
+  [[ "$s" == *-* ]] || { echo "$s"; return 0; }
+  last="${s##*-}"
+  if known_suffix "$last" || known_suffix "$(echo "$last" | sed 's/[0-9]*$//')"; then
+    echo "${s%-*}"
+  else
+    echo "$s"
+  fi
+}
+
+# The ID xng feeds a mode under with auto-suffix (outputs/airframes.rs)
+xng_auto_ident() {
+  local base="$1" suffix last alpha
+  case "$2" in
+    acars) suffix=ACARS ;; vdl2) suffix=VDL2 ;; hfdl) suffix=HFDL ;; ais) suffix=AIS ;;
+    iridium) suffix=IRDM ;; adsb) suffix=ADSB ;; uat) suffix=UAT ;; sonde) suffix=SONDE ;;
+    *) echo "$base"; return 0 ;;
+  esac
+  if [[ "$base" == *-* ]]; then
+    last="${base##*-}"
+    alpha=$(echo "$last" | sed 's/[0-9]*$//')
+    known_suffix "$alpha" && base="${base%-*}"
+  fi
+  echo "${base}-${suffix}"
+}
+
+# The XNG_SDRS index of an old decoder's SDR, or nothing
+old_decoder_sdr() {
+  local kind serial idx i n=0 only=""
+  kind=$(old_field "$1" 5); serial=$(old_field "$1" 6); idx=$(old_field "$1" 7)
+  [ -n "$kind" ] || return 0
+  for i in "${!XNG_SDRS[@]}"; do
+    [ "$(sdr_field "${XNG_SDRS[$i]}" 0)" = "$kind" ] || continue
+    n=$((n + 1)); only="$i"
+    if [ -n "$serial" ] && [ "$(sdr_field "${XNG_SDRS[$i]}" 1)" = "$serial" ]; then echo "$i"; return 0; fi
   done
-  local others=() s
+  if [ -n "$idx" ]; then
+    for i in "${!XNG_SDRS[@]}"; do
+      [ "$(sdr_field "${XNG_SDRS[$i]}" 0)" = "$kind" ] || continue
+      [ "$(sdr_field "${XNG_SDRS[$i]}" 2)" = "$idx" ] && { echo "$i"; return 0; }
+    done
+  fi
+  # No serial or index given: the only SDR of that kind
+  if [ -z "$serial" ] && [ -z "$idx" ] && [ "$n" -eq 1 ]; then echo "$only"; fi
+  return 0
+}
+
+old_decoder_line() {
+  local r="$1" what ident chans
+  what="$(old_field "$r" 2)"
+  ident=$(old_field "$r" 4); chans=$(old_field "$r" 9)
+  case "$(old_field "$r" 0)" in
+    systemd) what+=" (systemd ${BOLD}$(old_field "$r" 1)${RESET})" ;;
+    docker)  what+=" (Docker ${BOLD}$(old_field "$r" 1)${RESET})" ;;
+    compose) what+=" (compose file ${BOLD}$(old_field "$r" 1)${RESET})" ;;
+  esac
+  case "$(old_field "$r" 10)" in
+    running) what+=", running" ;; enabled) what+=", starts at boot" ;; *) what+=", stopped" ;;
+  esac
+  local -a parts=()
+  [ -n "$ident" ] && parts+=("station ${ident}")
+  if [ -n "$(old_field "$r" 7)" ] && [ "$(old_field "$r" 6)" = "$(old_field "$r" 7)" ]; then
+    parts+=("RTL-SDR $(old_field "$r" 7)")
+  elif [ -n "$(old_field "$r" 6)" ]; then parts+=("SDR serial $(old_field "$r" 6)")
+  elif [ -n "$(old_field "$r" 7)" ]; then parts+=("SDR $(old_field "$r" 7)")
+  elif [ -n "$(old_field "$r" 5)" ]; then parts+=("$(old_field "$r" 5)"); fi
+  [ -n "$(old_field "$r" 8)" ] && parts+=("gain $(old_field "$r" 8)")
+  [ -n "$chans" ] && parts+=("${chans//,/ }")
+  echo -e "  ${CYAN}●${RESET} ${what}"
+  [ ${#parts[@]} -gt 0 ] && echo -e "      ${DIM}$(join_by ', ' "${parts[@]}")${RESET}"
+  return 0
+}
+
+# Before the station ID is chosen: find old decoders, ask whether xng
+# should take them over, and suggest the station ID they fed under.
+find_old_decoders() {
+  collect_old_decoders
+  [ ${#OLD_DECODERS[@]} -gt 0 ] || return 0
+  local r stem
+  echo
+  info "Found decoders set up before on this machine:"
+  for r in "${OLD_DECODERS[@]}"; do old_decoder_line "$r"; done
+  if [ "$KEEP_OLD_DECODERS" = true ]; then
+    MIGRATING=false
+    return 0
+  fi
+  echo -e "  xng can take them over: each SDR keeps its job, station name, gain and"
+  echo -e "  frequencies. The old decoders are stopped, not removed, and"
+  echo -e "  ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders${RESET}"
+  echo -e "  switches back."
+
+  if ui_confirm "Switch them to xng?" "yes"; then
+    MIGRATING=true
+  else
+    MIGRATING=false
+  fi
+
+  [ "$MIGRATING" = true ] || return 0
+  declare -A count=()
+  for r in "${OLD_DECODERS[@]}"; do
+    [ -n "$(old_field "$r" 4)" ] || continue
+    stem=$(normalize_station_ident "$(ident_stem "$(old_field "$r" 4)")" 2>/dev/null) || continue
+    count[$stem]=$(( ${count[$stem]:-0} + 1 ))
+  done
+  local best="" k
+  for k in "${!count[@]}"; do
+    if [ -z "$best" ] || [ "${count[$k]}" -gt "${count[$best]}" ]; then best="$k"; fi
+  done
+  MIG_STATION_SUGGESTION="$best"
+  return 0
+}
+
+# After the default jobs: give each SDR an old decoder used the same job,
+# station name, gain and frequencies in xng (or leave it to the old decoder).
+apply_old_decoders() {
+  OLD_UNITS=()
+  # Other ACARS software this can't take over (no unit or container)
+  local others=() s r covered
   for s in "${ACARS_SOFTWARE[@]}"; do
-    case "$s" in docker:airframes-*) ;; *) others+=("$s") ;; esac
+    covered=false
+    for r in "${OLD_DECODERS[@]}"; do
+      case "${s#docker:}" in "$(old_field "$r" 1)"|"$(old_field "$r" 2)") covered=true ;; esac
+      [ "$(old_field "$r" 2)" = AIS-catcher ] && [ "${s#docker:}" = AIS-catcher ] && covered=true
+    done
+    [ "$covered" = true ] || others+=("$s")
   done
   if [ ${#others[@]} -gt 0 ]; then
     warn "Also running: ${others[*]}. If it uses an SDR you give xng, stop it first."
   fi
-  [ ${#OLD_UNITS[@]} -gt 0 ] || return 0
-  if ui_confirm "Stop the decoders set up before (${OLD_UNITS[*]}) so xng can use their SDRs?" "yes"; then
-    :
-  else
-    OLD_UNITS=()
-    warn "Leaving them running. Give xng only the SDRs they don't use."
-  fi
-}
-declare -a OLD_UNITS=()
+  [ ${#OLD_DECODERS[@]} -gt 0 ] || return 0
 
-stop_old_decoders() {
-  local u
-  for u in "${OLD_UNITS[@]}"; do
-    case "$u" in
-      docker:*) sudo docker rm -f "${u#docker:}" >/dev/null 2>&1 || true ;;
-      *) sudo systemctl disable --now "$u" >/dev/null 2>&1 || true ;;
-    esac
-    substep "Stopped ${u#docker:}"
+  local i running
+  for r in "${OLD_DECODERS[@]}"; do
+    i=$(old_decoder_sdr "$r")
+    if [ "$MIGRATING" = true ]; then
+      [ "$(old_field "$r" 0)" = compose ] || OLD_UNITS+=("$(old_field "$r" 0)"$'\t'"$(old_field "$r" 1)")
+    fi
+    if [ -z "$i" ]; then
+      [ -n "$(old_field "$r" 5)" ] || [ "$MIGRATING" = false ] ||
+        warn "Can't tell which SDR $(old_field "$r" 1) uses; check the job xng gives each SDR."
+      [ -z "$(old_field "$r" 5)" ] || [ "$MIGRATING" = false ] ||
+        warn "The SDR $(old_field "$r" 1) used isn't plugged in; its job isn't carried over."
+      continue
+    fi
+    # Two old decoders on one SDR: the running one wins
+    if [ -n "${MIG_FROM[$i]:-}" ]; then
+      running=$(old_field "$r" 10)
+      [ "$running" = running ] || continue
+    fi
+    MIG_FROM[$i]="$(old_field "$r" 1)"
+    if [ "$MIGRATING" = true ]; then
+      MIG_MODE[$i]="$(old_field "$r" 3)"
+      MIG_IDENT[$i]="$(old_field "$r" 4)"
+      MIG_GAIN[$i]="$(old_field "$r" 8)"
+      MIG_CHANNELS[$i]="$(old_field "$r" 9)"
+      XNG_JOBS[$i]="${MIG_MODE[$i]}"
+    else
+      XNG_JOBS[$i]="keep-old"
+    fi
   done
+  if [ "$MIGRATING" = true ]; then
+    local -a took=()
+    for r in "${OLD_DECODERS[@]}"; do took+=("$(old_field "$r" 1)"); done
+    ok "xng takes over: $(join_by ', ' "${took[@]}")"
+  else
+    warn "Leaving them running. xng won't use their SDRs."
+  fi
+  return 0
+}
+
+# The IDs the sessions feed Airframes under, for the summary
+xng_feed_idents() {
+  local i job id out=()
+  for i in "${!XNG_SDRS[@]}"; do
+    job="${XNG_JOBS[$i]}"
+    case "$job" in acars|vdl2|hfdl|ais|iridium) ;; *) continue ;; esac
+    id=$(xng_auto_ident "$STATION_IDENT" "$job")
+    if [ "${MIG_MODE[$i]:-}" = "$job" ] && [ -n "${MIG_IDENT[$i]:-}" ]; then id="${MIG_IDENT[$i]}"; fi
+    out+=("$id")
+  done
+  join_by ', ' "${out[@]}"
+}
+
+# Settings carried over from an old decoder, for render_station_toml
+render_migrated_settings() {
+  local i="$1" job="$2" g c first=true
+  [ "${MIG_MODE[$i]:-}" = "$job" ] || return 0
+  g="${MIG_GAIN[$i]:-}"
+  if [ -n "$g" ]; then
+    [[ "$g" == *.* ]] || g="${g}.0"
+    echo "gain = ${g}"
+  fi
+  if [ -n "${MIG_CHANNELS[$i]:-}" ]; then
+    printf 'channels = ['
+    IFS=',' read -ra chans <<< "${MIG_CHANNELS[$i]}"
+    for c in "${chans[@]}"; do
+      [ "$first" = true ] || printf ', '
+      printf '"%s"' "$c"; first=false
+    done
+    printf ']\n'
+  fi
+  # Keep the station name the old decoder fed under when xng's would differ
+  local ident="${MIG_IDENT[$i]:-}"
+  if [ -n "$ident" ] && [ "$ident" != "$(xng_auto_ident "$STATION_IDENT" "$job")" ]; then
+    echo "airframes-station-id = $(toml_str "$ident")"
+  fi
+  return 0
+}
+
+# Stop the old decoders, without removing them, and write down how to
+# start them again.
+stop_old_decoders() {
+  [ ${#OLD_UNITS[@]} -gt 0 ] || return 0
+  local u kind name enabled active policy
+  sudo mkdir -p "$CONFIG_DIR"
+  if [ ! -f "$OLD_DECODERS_FILE" ]; then
+    printf '# Decoders the Airframes installer stopped when it switched this machine to xng.\n# Start them again with: curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders\n# kind\tname\twas-enabled\twas-active\trestart-policy\tstopped-at\n' |
+      sudo tee "$OLD_DECODERS_FILE" >/dev/null
+  fi
+  for u in "${OLD_UNITS[@]}"; do
+    kind="${u%%$'\t'*}"; name="${u#*$'\t'}"
+    case "$kind" in
+      systemd)
+        enabled=no; active=no
+        systemctl is-enabled --quiet "$name" 2>/dev/null && enabled=yes
+        systemctl is-active --quiet "$name" 2>/dev/null && active=yes
+        policy=""
+        sudo systemctl disable --now "$name" >/dev/null 2>&1 || true
+        ;;
+      docker)
+        enabled=""; policy=$(docker_ro inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$name" || echo no)
+        active=no
+        [ "$(docker_ro inspect -f '{{.State.Running}}' "$name" || true)" = true ] && active=yes
+        # So it doesn't come back when Docker or the machine restarts
+        sudo docker update --restart=no "$name" >/dev/null 2>&1 || true
+        sudo docker stop "$name" >/dev/null 2>&1 || true
+        ;;
+    esac
+    # Set up again after an earlier switch: keep the first record
+    if ! grep -q "^${kind}"$'\t'"${name}"$'\t' "$OLD_DECODERS_FILE" 2>/dev/null; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$kind" "$name" "${enabled:-}" "$active" "${policy:-}" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo tee -a "$OLD_DECODERS_FILE" >/dev/null
+    fi
+    substep "Stopped ${name} (not removed)"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# installer restore-decoders: stop xng and start the old decoders again
+# ---------------------------------------------------------------------------
+cmd_restore_decoders() {
+  local -a rows=()
+  local line
+  if [ -r "$OLD_DECODERS_FILE" ]; then
+    while IFS= read -r line; do
+      case "$line" in "#"*|"") continue ;; esac
+      rows+=("$line")
+    done < "$OLD_DECODERS_FILE"
+  fi
+  if [ ${#rows[@]} -eq 0 ]; then
+    ok "The installer hasn't stopped any decoders here; nothing to restore."
+    return 0
+  fi
+  info "This stops xng and starts the decoders it took over again:"
+  local r
+  for r in "${rows[@]}"; do
+    case "$(old_field "$r" 0)" in
+      docker) echo -e "  ${CYAN}●${RESET} $(old_field "$r" 1) (Docker container)" ;;
+      *)      echo -e "  ${CYAN}●${RESET} $(old_field "$r" 1) (systemd service)" ;;
+    esac
+  done
+  if [ "$AUTO_YES" != true ] && ! ui_confirm "Switch back?" "yes"; then
+    info "Nothing changed."
+    return 0
+  fi
+  # xng first, so it lets go of the SDRs
+  if [ -f "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" ]; then
+    disable_auto_update
+    substep "Turned off xng's automatic updates"
+  fi
+  if [ -f /etc/systemd/system/xng-station.service ]; then
+    sudo systemctl disable --now xng-station >/dev/null 2>&1 || true
+    substep "Stopped xng-station (still installed)"
+  fi
+  if command -v docker >/dev/null 2>&1 && sudo docker inspect xng-station >/dev/null 2>&1; then
+    sudo docker update --restart=no xng-station >/dev/null 2>&1 || true
+    sudo docker stop xng-station >/dev/null 2>&1 || true
+    substep "Stopped the xng-station container (still there)"
+  fi
+  local kind name enabled active policy failed=0
+  for r in "${rows[@]}"; do
+    kind=$(old_field "$r" 0); name=$(old_field "$r" 1)
+    enabled=$(old_field "$r" 2); active=$(old_field "$r" 3); policy=$(old_field "$r" 4)
+    case "$kind" in
+      systemd)
+        [ "$enabled" = yes ] && { sudo systemctl enable "$name" >/dev/null 2>&1 || true; }
+        if [ "$active" = yes ] || [ "$enabled" = yes ]; then
+          if sudo systemctl start "$name" >/dev/null 2>&1; then substep "Started ${name}"
+          else warn "Couldn't start ${name}; see: journalctl -u ${name}"; failed=1; fi
+        else
+          substep "${name} was stopped before; left stopped"
+        fi
+        ;;
+      docker)
+        sudo docker update --restart="${policy:-unless-stopped}" "$name" >/dev/null 2>&1 || true
+        if [ "$active" = no ] && [ "$policy" = no ]; then
+          substep "${name} was stopped before; left stopped"
+        elif sudo docker start "$name" >/dev/null 2>&1; then substep "Started ${name}"
+        else warn "Couldn't start ${name}; see: docker logs ${name}"; failed=1; fi
+        ;;
+    esac
+  done
+  sudo mv "$OLD_DECODERS_FILE" "${OLD_DECODERS_FILE%.tsv}.restored-$(date -u +%Y%m%d%H%M%S).tsv"
+  if [ "$failed" = 0 ]; then
+    ok "Your old decoders are back. xng is stopped but still installed."
+  else
+    warn "Some decoders didn't start (see above). xng is stopped but still installed."
+  fi
+  info "Switch to xng again: curl -sSL https://install.airframes.sh/installer | bash -s -- xng"
+  info "Or remove xng:       curl -sSL https://install.airframes.sh/installer | bash -s -- uninstall"
+  return 0
 }
 
 setup_xng_station() {
@@ -2513,17 +3207,27 @@ xng_summary() {
     ok "Your Airframes station ${BOLD}${STATION_IDENT}${RESET} is set up:"
   fi
   for i in "${!XNG_SDRS[@]}"; do
-    case "${XNG_JOBS[$i]}" in off) continue ;; esac
+    case "${XNG_JOBS[$i]}" in off|keep-old) continue ;; esac
     echo -e "  ${GREEN}●${RESET} $(sdr_field "${XNG_SDRS[$i]}" 3) $(sdr_field "${XNG_SDRS[$i]}" 1): $(job_label "${XNG_JOBS[$i]}")"
   done
   echo -e "  Dashboard:  ${CYAN}http://${host:-localhost}:${XNG_HTTP_PORT}${RESET}"
   if [ -n "$STATION_REGISTERED" ]; then
     echo -e "  On Airframes: ${CYAN}$(station_page_url "$STATION_REGISTERED")${RESET} (signed in as ${AF_USERNAME})"
   else
-    echo -e "  On Airframes: your feed shows up as ${STATION_IDENT}-ACARS, -VDL2, ... once data arrives."
+    if [ ${#OLD_UNITS[@]} -gt 0 ] || [ "$MIGRATING" = true ]; then
+      echo -e "  On Airframes: your feeds keep their names: $(xng_feed_idents)"
+    else
+      echo -e "  On Airframes: your feed shows up as ${STATION_IDENT}-ACARS, -VDL2, ... once data arrives."
+    fi
     echo -e "  Claim it:   ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- sign-in${RESET}"
   fi
   echo -e "  Check it:   ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- status${RESET}"
+  if [ ${#OLD_UNITS[@]} -gt 0 ]; then
+    local u names=()
+    for u in "${OLD_UNITS[@]}"; do names+=("${u#*$'\t'}"); done
+    echo -e "  Stopped, not removed: $(join_by ', ' "${names[@]}")"
+    echo -e "  Switch back: ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders${RESET}"
+  fi
 }
 
 # How far the Airframes API's clock (its Date header) is ahead of this one,
@@ -2574,13 +3278,14 @@ plan_xng_station() {
   preflight_checks
   signin_step
   detect_station_location
+  find_old_decoders
   choose_station_ident
   detect_xng_sdrs
   if [ ${#XNG_SDRS[@]} -eq 0 ]; then
     warn "No SDR found on USB. xng is set up anyway; plug one in and run this again to choose its job."
   fi
-  check_old_decoders
   default_jobs
+  apply_old_decoders
   apply_modes_arg
   if [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ] && [ -z "$XNG_MODES_ARG" ] && [ ${#XNG_SDRS[@]} -gt 0 ]; then
     tui_assign_jobs
@@ -2613,9 +3318,21 @@ xng_plan_lines() {
   if [ ${#XNG_SDRS[@]} -eq 0 ]; then
     echo -e "  ${BOLD}SDRs:${RESET}        none plugged in yet"
   fi
+  local from ident
   for i in "${!XNG_SDRS[@]}"; do
-    echo -e "  ${BOLD}SDR ${i}:${RESET}       $(sdr_field "${XNG_SDRS[$i]}" 3) $(sdr_field "${XNG_SDRS[$i]}" 1): $(job_label "${XNG_JOBS[$i]}")"
+    from=""
+    if [ -n "${MIG_FROM[$i]:-}" ] && [ "${MIG_MODE[$i]:-}" = "${XNG_JOBS[$i]}" ]; then
+      ident="${MIG_IDENT[$i]:-}"
+      [ -n "$ident" ] || ident=$(xng_auto_ident "$STATION_IDENT" "${XNG_JOBS[$i]}")
+      from="  ${DIM}(was ${MIG_FROM[$i]}, feeds as ${ident})${RESET}"
+    fi
+    echo -e "  ${BOLD}SDR ${i}:${RESET}       $(sdr_field "${XNG_SDRS[$i]}" 3) $(sdr_field "${XNG_SDRS[$i]}" 1): $(job_label "${XNG_JOBS[$i]}")${from}"
   done
+  if [ ${#OLD_UNITS[@]} -gt 0 ]; then
+    local u names=()
+    for u in "${OLD_UNITS[@]}"; do names+=("${u#*$'\t'}"); done
+    echo -e "  ${BOLD}Stops:${RESET}       $(join_by ', ' "${names[@]}") (not removed)"
+  fi
   if [ ${#AIRBAND_CHANNELS[@]} -gt 0 ]; then
     local c chan_list=""
     for c in "${AIRBAND_CHANNELS[@]}"; do chan_list+="${c%%|*} "; done
@@ -3025,6 +3742,10 @@ cmd_uninstall() {
     info "The station stays on your Airframes account; remove it there if you don't want it: ${AIRFRAMES_APP}/stations"
   fi
   ok "xng is removed."
+  if [ -s "$OLD_DECODERS_FILE" ]; then
+    info "The decoders xng took over are still stopped. Start them again with:"
+    info "  curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders"
+  fi
   return 0
 }
 
@@ -3197,9 +3918,16 @@ airframes_feed_lines() {
   [ -r "${XNG_CONFIG_DIR}/station.toml" ] || return 0
   local suffix=true
   grep -q '^auto-suffix *= *true' "${XNG_CONFIG_DIR}/station.toml" || suffix=false
-  for m in $(sed -n 's/^mode *= *"\(.*\)"/\1/p' "${XNG_CONFIG_DIR}/station.toml" | sort -u); do
+  local row own
+  # One "mode|airframes-station-id" row per session; the ID is set when the
+  # session keeps the name an old decoder fed under
+  for row in $(awk -F'"' '/^\[\[session\]\]/ { if (m != "") print m "|" o; m = ""; o = "" }
+                          /^mode *=/ { m = $2 } /^airframes-station-id *=/ { o = $2 }
+                          END { if (m != "") print m "|" o }' "${XNG_CONFIG_DIR}/station.toml" | sort -u); do
+    m="${row%%|*}"; own="${row#*|}"
     sfx=$(feed_suffix "$m"); [ -n "$sfx" ] || continue
-    if [ "$suffix" = true ]; then id=$(feed_ident "$base" "$sfx"); else id="$base"; fi
+    if [ -n "$own" ]; then id="$own"
+    elif [ "$suffix" = true ]; then id=$(feed_ident "$base" "$sfx"); else id="$base"; fi
     out=$(curl -sS -m 10 -w '\n%{http_code}' "${AIRFRAMES_API}/stations/ident/${id}" 2>/dev/null || true)
     code="${out##*$'\n'}"; body="${out%$'\n'*}"
     case "$code" in
@@ -3574,6 +4302,7 @@ run_command() {
     update)    show_banner; cmd_update ;;
     uninstall) show_banner; cmd_uninstall ;;
     signin)    show_banner; cmd_signin ;;
+    restoredecoders) show_banner; cmd_restore_decoders ;;
     autoupdate) cmd_auto_update ;;
     fix)       show_banner; cmd_fix || exit 1 ;;
   esac
@@ -4694,6 +5423,9 @@ What to set up:
               Update xng automatically every week (systemd timer)
   uninstall   Remove the xng station (--purge also removes /etc/xng
               and the sign-in)
+  restore-decoders
+              Stop xng and start the decoders it took over again
+              (acarsdec, dumpvdl2, dumphfdl, vdlm2dec, AIS-catcher)
   adsb        ADS-B (1090 MHz) for Airframes' partners Airplanes.Live and
               Plane Watch (Airframes doesn't ingest ADS-B itself). Uses the
               ADS-B decoder already running, or installs readsb.
@@ -4724,6 +5456,9 @@ xng options:
   --xng-version VER       xng version (default: latest release)
   --auto-update           Update xng weekly (asked when interactive)
   --no-auto-update        Don't set up automatic updates
+  --keep-old-decoders     Leave decoders set up before running (by default
+                          xng takes over their SDRs, station names, gain and
+                          frequencies, and stops them without removing them)
   --lat / --lon           Receiver position (also used for ADS-B)
 
 ADS-B options:
@@ -4740,6 +5475,7 @@ Examples:
   curl -sSL https://install.airframes.sh/installer | bash -s -- status
   curl -sSL https://install.airframes.sh/installer | bash -s -- update
   curl -sSL https://install.airframes.sh/installer | bash -s -- fix
+  curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders
   curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
   curl -sSL https://install.airframes.sh/installer | bash -s -- -y acarsdec --station-id MY-STATION
   curl -sSL https://install.airframes.sh/installer | bash -s -- --token abc123
@@ -4826,6 +5562,9 @@ parse_args() {
       --purge)          PURGE=true; shift ;;
       signin|sign-in|login) COMMAND=signin; shift ;;
       fix|repair)       COMMAND=fix; shift ;;
+      restore-decoders|switch-back) COMMAND=restoredecoders; shift ;;
+      migrate)          WANT_XNG=true; shift ;;
+      --keep-old-decoders) KEEP_OLD_DECODERS=true; WANT_XNG=true; shift ;;
       auto-update|autoupdate)
         COMMAND=autoupdate; shift
         case "${1:-}" in on|yes) AUTO_UPDATE=yes; shift ;; off|no) AUTO_UPDATE=no; shift ;; esac ;;
