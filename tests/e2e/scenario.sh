@@ -228,7 +228,7 @@ case "$1" in
     check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
     check "report sent" '[ "$(wc -l < $R)" = 1 ]'
     check "success" 'grep -q "\"outcome\":\"success\"" $R && grep -q "\"failed_step\":\"\"" $R'
-    check "versions" 'grep -q "\"installer_version\":\"3.5.0\"" $R && grep -q "\"xng_version\":\"0.23.1\"" $R'
+    check "versions" 'grep -q "\"installer_version\":\"3.7.0\"" $R && grep -q "\"xng_version\":\"0.23.1\"" $R'
     check "system" 'grep -q "\"os\":\"linux\",\"distro\":\"debian\",\"arch\":\"amd64\"" $R'
     check "sdrs and modes" 'grep -q "\"sdrs\":\[\"rtlsdr\",\"rtlsdr\"\],\"modes\":\[\"acars\",\"vdl2\"\]" $R'
     id=$(sed -n 's/^station-id *= *"\(.*\)"/\1/p' $TOML)
