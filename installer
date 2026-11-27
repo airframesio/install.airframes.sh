@@ -2103,6 +2103,12 @@ xng_latest_version() {
   local tag
   tag=$(curl -fsSL -m 15 https://api.github.com/repos/airframesio/xng/releases/latest 2>/dev/null |
         json_field "d['tag_name']") || tag=""
+  # The API allows 60 calls an hour per address (shared ones run out); the
+  # release page redirects to the latest tag without that limit
+  if [ -z "$tag" ]; then
+    tag=$(curl -fsSIL -m 15 -o /dev/null -w '%{url_effective}' https://github.com/airframesio/xng/releases/latest 2>/dev/null || true)
+    case "$tag" in */releases/tag/*) tag="${tag##*/}" ;; *) tag="" ;; esac
+  fi
   tag="${tag#v}"
   echo "${tag:-$XNG_VERSION_FALLBACK}"
 }

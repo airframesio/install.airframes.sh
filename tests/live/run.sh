@@ -23,7 +23,8 @@ done
 export AIRFRAMES_SYSFS_USB=/tmp/usb AIRFRAMES_NO_TTY=1
 ARGS=(-y xng --no-sign-in --no-auto-update --lat 38.68 --lon -120.99 --modes "00000001=acars,00000002=vdl2")
 
-latest=$(curl -fsSL https://api.github.com/repos/airframesio/xng/releases/latest | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -1)
+latest=$(curl -fsSIL -o /dev/null -w '%{url_effective}' https://github.com/airframesio/xng/releases/latest)
+latest="${latest##*/}"; latest="${latest#v}"
 echo "Latest xng release: ${latest:-unknown}  ($(uname -m), $(. /etc/os-release; echo "$PRETTY_NAME"))"
 
 if [ "$SRC" = online ]; then
