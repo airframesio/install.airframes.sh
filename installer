@@ -44,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="3.6.0"
+VERSION="3.5.0"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
@@ -178,6 +178,7 @@ pkg_translate() {
         docker)          echo "docker.io" ;;
         docker-compose)  echo "docker-compose" ;;
         qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     dnf)
@@ -203,6 +204,7 @@ pkg_translate() {
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
         qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     pacman)
@@ -228,6 +230,7 @@ pkg_translate() {
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
         qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     apk)
@@ -253,6 +256,7 @@ pkg_translate() {
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
         qrencode)        echo "libqrencode-tools" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     brew)
@@ -278,6 +282,7 @@ pkg_translate() {
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
         qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
   esac
@@ -303,7 +308,12 @@ pkg_install() {
 
   case "$PKG" in
     apt)
-      sudo apt-get install -y -qq "${pkgs[@]}"
+      # A fresh or long-idle system has no or stale package lists: refresh
+      # them and try again when the first attempt fails
+      if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"; then
+        sudo apt-get update -qq || true
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
+      fi
       ;;
     dnf)
       sudo dnf install -y -q "${pkgs[@]}"
@@ -1457,7 +1467,7 @@ AIRFRAMES_API="${AIRFRAMES_API:-https://api.airframes.io}"
 AIRFRAMES_APP="${AIRFRAMES_APP:-https://app.airframes.io}"
 XNG_CONFIG_DIR="${XNG_CONFIG_DIR:-/etc/xng}"
 XNG_IMAGE_REPO="ghcr.io/airframesio/xng"
-XNG_VERSION_FALLBACK="0.23.1"
+XNG_VERSION_FALLBACK="0.24.0"
 FEEDER_CLIENT_ID="airframes-feeder"
 FEEDER_SCOPE="atc:feed"
 # One radio hears airband channels within 2 MHz of each other (xng captures
@@ -2185,14 +2195,29 @@ xng_latest_version() {
   local tag
   tag=$(curl -fsSL -m 15 https://api.github.com/repos/airframesio/xng/releases/latest 2>/dev/null |
         json_field "d['tag_name']") || tag=""
+  # The API allows 60 calls an hour per address (shared ones run out); the
+  # release page redirects to the latest tag without that limit
+  if [ -z "$tag" ]; then
+    tag=$(curl -fsSIL -m 15 -o /dev/null -w '%{url_effective}' https://github.com/airframesio/xng/releases/latest 2>/dev/null || true)
+    case "$tag" in */releases/tag/*) tag="${tag##*/}" ;; *) tag="" ;; esac
+  fi
   tag="${tag#v}"
   echo "${tag:-$XNG_VERSION_FALLBACK}"
+}
+
+# Refresh apt's package lists once per run (a fresh system has none)
+APT_UPDATED=false
+apt_update_once() {
+  [ "$APT_UPDATED" = true ] && return 0
+  # Only remember a refresh that worked, so a later step tries again
+  if sudo apt-get update -qq >/dev/null 2>&1; then APT_UPDATED=true; fi
+  return 0
 }
 
 # SoapySDR and its modules for the SDRs xng will open
 install_xng_runtime() {
   [ "$PKG" = "apt" ] || return 0
-  sudo apt-get update -qq >/dev/null 2>&1 || true
+  apt_update_once
   local -a pkgs=() m p
   for p in libsoapysdr0.8 libairspy0 libairspyhf1; do
     apt-cache show "$p" >/dev/null 2>&1 && pkgs+=("$p")
@@ -2273,7 +2298,8 @@ install_xng_native() {
     if curl -fsSL "${base}/xng-${ver}-${debarch}.deb" -o "${tmp}/xng.deb" 2>/dev/null; then
       if ! verify_release_file "$base" "xng-${ver}-${debarch}.deb" "${tmp}/xng.deb"; then
         substep "Trying the tarball instead"
-      elif chmod 644 "${tmp}/xng.deb" && sudo apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
+      elif chmod 644 "${tmp}/xng.deb" && apt_update_once &&
+           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
         # The package's own binary, not the first xng on PATH (an older
         # tarball install in /usr/local/bin would win there)
         local deb_bin="" pkg_name
@@ -4492,15 +4518,20 @@ ensure_docker() {
   if ! command -v docker >/dev/null 2>&1; then
     step "Installing Docker"
     if [ "$OS" = "linux" ]; then
-      curl -fsSL https://get.docker.com | sudo sh
-      sudo usermod -aG docker "$USER" 2>/dev/null || true
+      if ! curl -fsSL https://get.docker.com | sudo sh; then
+        err "Docker couldn't be installed (get.docker.com). Install it by hand and run this again."
+        return 1
+      fi
+      # $USER is unset under systemd (the weekly update) and in containers
+      local me; me="${USER:-$(id -un 2>/dev/null || true)}"
+      [ -n "$me" ] && [ "$me" != root ] && sudo usermod -aG docker "$me" 2>/dev/null || true
     elif [ "$OS" = "macos" ]; then
       err "Please install Docker Desktop from https://docker.com/products/docker-desktop"
       return 1
     fi
   fi
 
-  if ! docker info >/dev/null 2>&1; then
+  if ! docker info >/dev/null 2>&1 && ! sudo docker info >/dev/null 2>&1; then
     err "Docker is not running. Please start Docker and try again."
     return 1
   fi
@@ -5451,6 +5482,20 @@ tui_confirm_install() {
 }
 
 # Is systemd running here (not just installed, as in many containers)?
+# Everything is downloaded with curl. The one-liner has it, but "wget -O- | bash"
+# or a copied script may not.
+ensure_curl() {
+  command -v curl >/dev/null 2>&1 && return 0
+  if [ "${PKG:-}" = apt ]; then
+    info "Installing curl"
+    sudo apt-get update -qq >/dev/null 2>&1 || true
+    sudo apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || true
+  fi
+  command -v curl >/dev/null 2>&1 && return 0
+  err "The installer needs curl. Install it (for example: sudo apt-get install curl) and run this again."
+  exit 1
+}
+
 have_systemd() {
   [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
@@ -5626,6 +5671,12 @@ main() {
     exit 1
   fi
   detect_platform
+  # Removing xng and turning auto-update off are local; everything else downloads
+  case "$COMMAND" in
+    uninstall) ;;
+    autoupdate) if [ "$AUTO_UPDATE" = yes ]; then ensure_curl; fi ;;
+    *) ensure_curl ;;
+  esac
   if [ -n "$COMMAND" ]; then
     run_command
     exit 0
