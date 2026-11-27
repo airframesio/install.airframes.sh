@@ -40,7 +40,7 @@ check "download checked against SHA256SUMS" 'echo "$out" | grep -q "Checked xng.
 bin=$(command -v xng || true)
 [ -n "$bin" ] || bin=$(ls /usr/bin/xng /usr/local/bin/xng 2>/dev/null | head -1)
 check "xng installed natively" '[ -n "$bin" ] && [ -x "$bin" ]'
-ver=$("$bin" --version 2>&1 | head -1)
+ver=$("$bin" --version 2>/dev/null | head -1)
 echo "xng --version: $ver"
 check "latest release installed" '[ -n "$latest" ] && echo "$ver" | grep -q "$latest"'
 st=$(timeout 600 "$bin" selftest 2>&1); src=$?
@@ -57,6 +57,7 @@ for _ in $(seq 1 30); do
   state=$(curl -s -m 3 http://127.0.0.1:8080/api/state || true)
   [ -n "$state" ] && break
   pgrep -f "xng station" >/dev/null || break
+  grep -q "^Error:" /tmp/xng.log 2>/dev/null && break
   sleep 2
 done
 echo "--- xng log"; tail -20 /tmp/xng.log
