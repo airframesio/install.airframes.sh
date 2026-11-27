@@ -298,7 +298,12 @@ pkg_install() {
 
   case "$PKG" in
     apt)
-      sudo apt-get install -y -qq "${pkgs[@]}"
+      # A fresh or long-idle system has no or stale package lists: refresh
+      # them and try again when the first attempt fails
+      if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"; then
+        sudo apt-get update -qq || true
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
+      fi
       ;;
     dnf)
       sudo dnf install -y -q "${pkgs[@]}"
@@ -2102,10 +2107,18 @@ xng_latest_version() {
   echo "${tag:-$XNG_VERSION_FALLBACK}"
 }
 
+# Refresh apt's package lists once per run (a fresh system has none)
+APT_UPDATED=false
+apt_update_once() {
+  [ "$APT_UPDATED" = true ] && return 0
+  sudo apt-get update -qq >/dev/null 2>&1 || true
+  APT_UPDATED=true
+}
+
 # SoapySDR and its modules for the SDRs xng will open
 install_xng_runtime() {
   [ "$PKG" = "apt" ] || return 0
-  sudo apt-get update -qq >/dev/null 2>&1 || true
+  apt_update_once
   local -a pkgs=() m p
   for p in libsoapysdr0.8 libairspy0 libairspyhf1; do
     apt-cache show "$p" >/dev/null 2>&1 && pkgs+=("$p")
@@ -2186,7 +2199,8 @@ install_xng_native() {
     if curl -fsSL "${base}/xng-${ver}-${debarch}.deb" -o "${tmp}/xng.deb" 2>/dev/null; then
       if ! verify_release_file "$base" "xng-${ver}-${debarch}.deb" "${tmp}/xng.deb"; then
         substep "Trying the tarball instead"
-      elif chmod 644 "${tmp}/xng.deb" && sudo apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
+      elif chmod 644 "${tmp}/xng.deb" && apt_update_once &&
+           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
         # The package's own binary, not the first xng on PATH (an older
         # tarball install in /usr/local/bin would win there)
         local deb_bin="" pkg_name
