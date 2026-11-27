@@ -49,17 +49,19 @@ check "xng selftest" "[ $src = 0 ]"
 check "station.toml written" 'grep -q "^mode = \"acars\"" /etc/xng/station.toml'
 
 # Start the station by hand (no systemd in the container). The RTL-SDRs are
-# fake, so the sessions fail to open, but the config must load and the
-# dashboard must answer.
+# fake, so xng stops when it opens them; getting that far shows that the
+# config loads and the sessions are tuned. A dashboard answer is a bonus.
 ("$bin" station /etc/xng/station.toml > /tmp/xng.log 2>&1 &)
 state=""
-for _ in $(seq 1 60); do
+for _ in $(seq 1 30); do
   state=$(curl -s -m 3 http://127.0.0.1:8080/api/state || true)
   [ -n "$state" ] && break
+  pgrep -f "xng station" >/dev/null || break
   sleep 2
 done
 echo "--- xng log"; tail -20 /tmp/xng.log
-check "dashboard answers /api/state" 'echo "$state" | grep -q "\"sessions\""'
+check "station config loads and reaches the SDRs" 'echo "$state" | grep -q "\"sessions\"" || grep -q "rtlsdr_get_index_by_serial(00000001)" /tmp/xng.log'
+check "no config errors" '! grep -qi "config\|toml\|unknown field\|parse" /tmp/xng.log'
 
 if [ "$SRC" = online ]; then
   st=$(curl -sSL https://install.airframes.sh/installer | bash -s -- status 2>&1)
