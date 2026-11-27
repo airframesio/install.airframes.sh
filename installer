@@ -44,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="3.4.0"
+VERSION="3.5.0"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
@@ -177,6 +177,8 @@ pkg_translate() {
         zlib-dev)        echo "zlib1g-dev" ;;
         docker)          echo "docker.io" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     dnf)
@@ -201,6 +203,8 @@ pkg_translate() {
         zlib-dev)        echo "zlib-devel" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     pacman)
@@ -225,6 +229,8 @@ pkg_translate() {
         zlib-dev)        echo "zlib" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     apk)
@@ -249,6 +255,8 @@ pkg_translate() {
         zlib-dev)        echo "zlib-dev" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "libqrencode-tools" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     brew)
@@ -273,6 +281,8 @@ pkg_translate() {
         zlib-dev)        echo "" ;; # system provided
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
   esac
@@ -298,7 +308,12 @@ pkg_install() {
 
   case "$PKG" in
     apt)
-      sudo apt-get install -y -qq "${pkgs[@]}"
+      # A fresh or long-idle system has no or stale package lists: refresh
+      # them and try again when the first attempt fails
+      if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"; then
+        sudo apt-get update -qq || true
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
+      fi
       ;;
     dnf)
       sudo dnf install -y -q "${pkgs[@]}"
@@ -1453,7 +1468,7 @@ AIRFRAMES_API="${AIRFRAMES_API:-https://api.airframes.io}"
 AIRFRAMES_APP="${AIRFRAMES_APP:-https://app.airframes.io}"
 XNG_CONFIG_DIR="${XNG_CONFIG_DIR:-/etc/xng}"
 XNG_IMAGE_REPO="ghcr.io/airframesio/xng"
-XNG_VERSION_FALLBACK="0.23.1"
+XNG_VERSION_FALLBACK="0.24.0"
 FEEDER_CLIENT_ID="airframes-feeder"
 FEEDER_SCOPE="atc:feed"
 # One radio hears airband channels within 2 MHz of each other (xng captures
@@ -1534,6 +1549,64 @@ saved_signin_user() {
     json_field "d['username'] if d.get('refresh_token') else None" || true
 }
 
+# --- QR codes in the terminal ----------------------------------------------
+# The sign-in link as a QR code, so a phone can open it with the code filled
+# in. qrencode is optional: the installer tries to install it once, and shows
+# only the link when it's missing, when the terminal is too narrow, or when
+# AIRFRAMES_NO_QR=1.
+
+# Terminal width in columns (AIRFRAMES_COLUMNS overrides, for tests)
+term_columns() {
+  local cols=""
+  if [ -n "${AIRFRAMES_COLUMNS:-}" ]; then echo "$AIRFRAMES_COLUMNS"; return 0; fi
+  cols=$( { stty size </dev/tty; } 2>/dev/null | awk '{print $2}' || true)
+  [ -n "$cols" ] && [ "$cols" -gt 0 ] 2>/dev/null || cols=$(tput cols 2>/dev/null || true)
+  [ -n "$cols" ] && [ "$cols" -gt 0 ] 2>/dev/null || cols="${COLUMNS:-80}"
+  echo "$cols"
+}
+
+# Does the terminal take UTF-8? (half-block QR codes need it)
+term_utf8() {
+  local cs
+  cs=$(locale charmap 2>/dev/null || true)
+  case "${cs:-${LC_ALL:-${LC_CTYPE:-${LANG:-}}}}" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*) return 0 ;;
+  esac
+  return 1
+}
+
+QR_INSTALL_TRIED=false
+ensure_qrencode() {
+  command -v qrencode >/dev/null 2>&1 && return 0
+  [ "$QR_INSTALL_TRIED" = true ] && return 1
+  QR_INSTALL_TRIED=true
+  [ -n "${PKG:-}" ] || return 1
+  substep "Installing qrencode (for a QR code you can scan)"
+  pkg_install qrencode >/dev/null 2>&1 || true
+  command -v qrencode >/dev/null 2>&1
+}
+
+# show_qr <url>: put the QR code (indented by 4) in QR_TEXT, or return 1
+# with the reason in QR_SKIPPED (off, missing, narrow). Not for $(...).
+QR_TEXT=""
+QR_SKIPPED=""
+show_qr() {
+  local url="$1" modules width cols type indent="    "
+  QR_TEXT=""; QR_SKIPPED=""
+  if [ -n "${AIRFRAMES_NO_QR:-}" ]; then QR_SKIPPED=off; return 1; fi
+  if ! ensure_qrencode; then QR_SKIPPED=missing; return 1; fi
+  # ASCII output draws each module as "##", so its width / 2 is the size
+  modules=$(qrencode -t ASCII -m 2 "$url" 2>/dev/null | awk '{ if (length($0) > w) w = length($0) } END { print int(w / 2) }' || true)
+  if [ -z "$modules" ] || ! [ "$modules" -gt 0 ] 2>/dev/null; then QR_SKIPPED=missing; return 1; fi
+  # Half blocks fit two rows in a line; without UTF-8, two spaces per module
+  if term_utf8; then type=ANSIUTF8; width=$modules; else type=ANSI; width=$((modules * 2)); fi
+  cols=$(term_columns)
+  if [ $((width + ${#indent})) -gt "$cols" ]; then QR_SKIPPED=narrow; return 1; fi
+  QR_TEXT=$(qrencode -t "$type" -m 2 "$url" 2>/dev/null | sed "s/^/${indent}/" || true)
+  if [ -z "$QR_TEXT" ]; then QR_SKIPPED=missing; return 1; fi
+  return 0
+}
+
 # Device-flow sign-in. Shows the code and link, waits for approval, then
 # saves the refresh token where xng reads it and keeps the access token for
 # registering the station. Returns 1 when skipped or it fails.
@@ -1559,10 +1632,16 @@ airframes_signin() {
   echo -e "    1. Open ${CYAN}${uri}${RESET} on any phone or computer"
   echo -e "    2. Enter the code  ${BOLD}${code}${RESET}"
   echo
-  if command -v qrencode >/dev/null 2>&1; then
-    echo -e "  ${DIM}Or scan this:${RESET}"
-    qrencode -t ANSIUTF8 -m 2 "$uri_full" 2>/dev/null | sed 's/^/    /'
+  # The link with the code in it, as a QR code for a phone and as text
+  if show_qr "$uri_full"; then
+    echo -e "  ${DIM}Or scan this with your phone's camera (the code is filled in):${RESET}"
+    echo "$QR_TEXT"
   fi
+  if [ "$uri_full" != "$uri" ]; then
+    echo -e "  ${DIM}Or open this link, the code is filled in:${RESET} ${CYAN}${uri_full}${RESET}"
+  fi
+  [ "$QR_SKIPPED" = narrow ] && echo -e "  ${DIM}(Make the window wider to see a QR code.)${RESET}"
+  echo
   echo -e "  ${DIM}Waiting for you to approve it (Ctrl-C to stop)...${RESET}"
 
   local deadline=$(( $(date +%s) + expires )) err_code
@@ -1716,6 +1795,11 @@ choose_station_ident() {
   STATION_IDENT="$id"
 }
 
+# The station's page on the Airframes website
+station_page_url() {
+  echo "${AIRFRAMES_APP}/stations/$1"
+}
+
 # Register the station on the signed-in account (needs the access token from
 # this run's sign-in). Asks for another ID when the ident is someone else's.
 register_station() {
@@ -1735,6 +1819,7 @@ register_station() {
         elif [ "$(json_field "d.get('claimed')" <<< "$resp")" = "True" ]; then status="claimed for your account"
         else status="already on your account"; fi
         ok "Station ${BOLD}${STATION_IDENT}${RESET} ${status}"
+        substep "Its page: $(station_page_url "$STATION_IDENT")"
         STATION_REGISTERED="$STATION_IDENT"
         return 0
         ;;
@@ -2100,14 +2185,29 @@ xng_latest_version() {
   local tag
   tag=$(curl -fsSL -m 15 https://api.github.com/repos/airframesio/xng/releases/latest 2>/dev/null |
         json_field "d['tag_name']") || tag=""
+  # The API allows 60 calls an hour per address (shared ones run out); the
+  # release page redirects to the latest tag without that limit
+  if [ -z "$tag" ]; then
+    tag=$(curl -fsSIL -m 15 -o /dev/null -w '%{url_effective}' https://github.com/airframesio/xng/releases/latest 2>/dev/null || true)
+    case "$tag" in */releases/tag/*) tag="${tag##*/}" ;; *) tag="" ;; esac
+  fi
   tag="${tag#v}"
   echo "${tag:-$XNG_VERSION_FALLBACK}"
+}
+
+# Refresh apt's package lists once per run (a fresh system has none)
+APT_UPDATED=false
+apt_update_once() {
+  [ "$APT_UPDATED" = true ] && return 0
+  # Only remember a refresh that worked, so a later step tries again
+  if sudo apt-get update -qq >/dev/null 2>&1; then APT_UPDATED=true; fi
+  return 0
 }
 
 # SoapySDR and its modules for the SDRs xng will open
 install_xng_runtime() {
   [ "$PKG" = "apt" ] || return 0
-  sudo apt-get update -qq >/dev/null 2>&1 || true
+  apt_update_once
   local -a pkgs=() m p
   for p in libsoapysdr0.8 libairspy0 libairspyhf1; do
     apt-cache show "$p" >/dev/null 2>&1 && pkgs+=("$p")
@@ -2188,7 +2288,8 @@ install_xng_native() {
     if curl -fsSL "${base}/xng-${ver}-${debarch}.deb" -o "${tmp}/xng.deb" 2>/dev/null; then
       if ! verify_release_file "$base" "xng-${ver}-${debarch}.deb" "${tmp}/xng.deb"; then
         substep "Trying the tarball instead"
-      elif chmod 644 "${tmp}/xng.deb" && sudo apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
+      elif chmod 644 "${tmp}/xng.deb" && apt_update_once &&
+           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
         # The package's own binary, not the first xng on PATH (an older
         # tarball install in /usr/local/bin would win there)
         local deb_bin="" pkg_name
@@ -2419,7 +2520,7 @@ xng_summary() {
   done
   echo -e "  Dashboard:  ${CYAN}http://${host:-localhost}:${XNG_HTTP_PORT}${RESET}"
   if [ -n "$STATION_REGISTERED" ]; then
-    echo -e "  On Airframes: ${CYAN}${AIRFRAMES_APP}/stations${RESET} (signed in as ${AF_USERNAME})"
+    echo -e "  On Airframes: ${CYAN}$(station_page_url "$STATION_REGISTERED")${RESET} (signed in as ${AF_USERNAME})"
   else
     echo -e "  On Airframes: your feed shows up as ${STATION_IDENT}-ACARS, -VDL2, ... once data arrives."
     echo -e "  Claim it:   ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- sign-in${RESET}"
@@ -2775,6 +2876,7 @@ cmd_status() {
   if sudo test -r "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null; then
     user=$(sudo cat "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null | json_field "d.get('username')" || true)
     echo "  Sign-in:  ${user:-signed in} (Airframes account)"
+    [ -n "$ident" ] && echo "  Page:     $(station_page_url "$ident")"
   else
     echo "  Sign-in:  none (feeding unclaimed; run the installer with \"sign-in\" to claim it)"
   fi
@@ -3828,15 +3930,20 @@ ensure_docker() {
   if ! command -v docker >/dev/null 2>&1; then
     step "Installing Docker"
     if [ "$OS" = "linux" ]; then
-      curl -fsSL https://get.docker.com | sudo sh
-      sudo usermod -aG docker "$USER" 2>/dev/null || true
+      if ! curl -fsSL https://get.docker.com | sudo sh; then
+        err "Docker couldn't be installed (get.docker.com). Install it by hand and run this again."
+        return 1
+      fi
+      # $USER is unset under systemd (the weekly update) and in containers
+      local me; me="${USER:-$(id -un 2>/dev/null || true)}"
+      [ -n "$me" ] && [ "$me" != root ] && sudo usermod -aG docker "$me" 2>/dev/null || true
     elif [ "$OS" = "macos" ]; then
       err "Please install Docker Desktop from https://docker.com/products/docker-desktop"
       return 1
     fi
   fi
 
-  if ! docker info >/dev/null 2>&1; then
+  if ! docker info >/dev/null 2>&1 && ! sudo docker info >/dev/null 2>&1; then
     err "Docker is not running. Please start Docker and try again."
     return 1
   fi
@@ -4788,6 +4895,20 @@ tui_confirm_install() {
 }
 
 # Is systemd running here (not just installed, as in many containers)?
+# Everything is downloaded with curl. The one-liner has it, but "wget -O- | bash"
+# or a copied script may not.
+ensure_curl() {
+  command -v curl >/dev/null 2>&1 && return 0
+  if [ "${PKG:-}" = apt ]; then
+    info "Installing curl"
+    sudo apt-get update -qq >/dev/null 2>&1 || true
+    sudo apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || true
+  fi
+  command -v curl >/dev/null 2>&1 && return 0
+  err "The installer needs curl. Install it (for example: sudo apt-get install curl) and run this again."
+  exit 1
+}
+
 have_systemd() {
   [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
@@ -4967,6 +5088,12 @@ main() {
     exit 1
   fi
   detect_platform
+  # Removing xng and turning auto-update off are local; everything else downloads
+  case "$COMMAND" in
+    uninstall) ;;
+    autoupdate) if [ "$AUTO_UPDATE" = yes ]; then ensure_curl; fi ;;
+    *) ensure_curl ;;
+  esac
   if [ -n "$COMMAND" ]; then
     run_command
     exit 0

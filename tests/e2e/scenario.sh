@@ -38,6 +38,18 @@ esac
 S
 printf '#!/bin/sh\ncat /tmp/fake/journal 2>/dev/null\n' > /usr/local/bin/journalctl
 printf '#!/bin/sh\necho "Bus 001 Device 004: ID 0bda:2838 Realtek RTL2838"\n' > /usr/local/bin/lsusb
+# qrencode stand-in (only installed by the qr scenarios): a 33-module code,
+# "##" per module in ASCII, one cell per module and a marker otherwise
+cat > /tmp/fake/qrencode <<'S'
+#!/bin/sh
+echo "$*" >> /tmp/fake/qrencode.log
+for a in "$@"; do t="$a"; done
+case " $* " in
+  *" ASCII "*) i=0; while [ $i -lt 33 ]; do printf '%066d\n' 0 | tr 0 '#'; i=$((i+1)); done ;;
+  *) echo "QRCODE-FOR $t"; printf '%033d\n' 0 | tr 0 '#' ;;
+esac
+S
+chmod +x /tmp/fake/qrencode
 chmod +x /usr/local/bin/*
 echo active > /tmp/fake/svc.next
 printf 'INFO xng station started\n' > /tmp/fake/journal
@@ -83,6 +95,35 @@ case "$1" in
     check "station registered" 'grep -q "POST https://api.airframes.io/feeder/station .*Bearer acc-xyz" $REQ'
     check "airband atc output" 'grep -q "^\[outputs.airband.atc\]" $TOML'
     check "airband channels" 'grep -q "^\[\[session.airband.channel\]\]" $TOML'
+    id=$(sed -n 's/^station-id *= *"\(.*\)"/\1/p' $TOML)
+    check "station page linked" 'echo "$out" | grep -q "Its page: https://app.airframes.io/stations/$id$"'
+    check "summary links page" 'echo "$out" | grep -q "On Airframes: .*https://app.airframes.io/stations/$id"'
+    check "full link shown" 'echo "$out" | grep -q "https://app.airframes.io/device?user_code=WDJB-MJHT"'
+    check "tried to install qrencode" 'echo "$out" | grep -q "Installing qrencode"'
+    check "no QR without qrencode" '! echo "$out" | grep -q "scan this"'
+    out=$(run status); echo "$out"
+    check "status links page" 'echo "$out" | grep -q "Page:     https://app.airframes.io/stations/$id$"'
+    ;;
+  qr)
+    cp /tmp/fake/qrencode /usr/local/bin/qrencode
+    run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2 >/dev/null
+    out=$(AIRFRAMES_COLUMNS=100 LC_ALL=C.UTF-8 run sign-in); echo "$out"
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "QR of the full link" 'echo "$out" | grep -q "^    QRCODE-FOR https://app.airframes.io/device?user_code=WDJB-MJHT"'
+    check "half blocks with UTF-8" 'grep -q -- "-t ANSIUTF8" /tmp/fake/qrencode.log'
+    check "link shown too" 'echo "$out" | grep -q "Or open this link"'
+    check "no install attempt" '! echo "$out" | grep -q "Installing qrencode"'
+    : > /tmp/fake/qrencode.log
+    # 33 modules: 37 columns with half blocks, 70 without UTF-8
+    out=$(AIRFRAMES_COLUMNS=60 LC_ALL=C LANG= run sign-in); echo "$out"
+    check "narrow without UTF-8: link only" '! echo "$out" | grep -q QRCODE-FOR && echo "$out" | grep -q "user_code=WDJB-MJHT"'
+    check "wider hint" 'echo "$out" | grep -q "Make the window wider"'
+    out=$(AIRFRAMES_COLUMNS=36 LC_ALL=C.UTF-8 run sign-in); echo "$out"
+    check "too narrow: link only" '! echo "$out" | grep -q QRCODE-FOR && echo "$out" | grep -q "Make the window wider"'
+    out=$(AIRFRAMES_COLUMNS=80 LC_ALL=C LANG= run sign-in); echo "$out"
+    check "plain ANSI without UTF-8" 'echo "$out" | grep -q QRCODE-FOR && grep -q -- "-t ANSI " /tmp/fake/qrencode.log'
+    out=$(AIRFRAMES_NO_QR=1 AIRFRAMES_COLUMNS=100 run sign-in); echo "$out"
+    check "AIRFRAMES_NO_QR" '! echo "$out" | grep -q QRCODE-FOR && ! echo "$out" | grep -q "Make the window wider"'
     ;;
   sign-in-later)
     run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2 >/dev/null
@@ -187,7 +228,7 @@ case "$1" in
     check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
     check "report sent" '[ "$(wc -l < $R)" = 1 ]'
     check "success" 'grep -q "\"outcome\":\"success\"" $R && grep -q "\"failed_step\":\"\"" $R'
-    check "versions" 'grep -q "\"installer_version\":\"3.4.0\"" $R && grep -q "\"xng_version\":\"0.23.1\"" $R'
+    check "versions" 'grep -q "\"installer_version\":\"3.5.0\"" $R && grep -q "\"xng_version\":\"0.23.1\"" $R'
     check "system" 'grep -q "\"os\":\"linux\",\"distro\":\"debian\",\"arch\":\"amd64\"" $R'
     check "sdrs and modes" 'grep -q "\"sdrs\":\[\"rtlsdr\",\"rtlsdr\"\],\"modes\":\[\"acars\",\"vdl2\"\]" $R'
     id=$(sed -n 's/^station-id *= *"\(.*\)"/\1/p' $TOML)
