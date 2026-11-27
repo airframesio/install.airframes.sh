@@ -2262,7 +2262,10 @@ services:
 volumes:
   xng-cache:
 EOF
-  (cd "$compose_dir" && sudo docker compose pull -q && sudo docker compose up -d)
+  if ! (cd "$compose_dir" && sudo docker compose pull -q && sudo docker compose up -d); then
+    err "Couldn't start the xng container (${compose_dir}/docker-compose.yml)"
+    return 1
+  fi
   ok "xng is running in Docker (${compose_dir}/docker-compose.yml)"
 }
 
@@ -2322,8 +2325,14 @@ setup_xng_station() {
     sudo docker stop xng-station >/dev/null 2>&1 || true
   fi
   # PiAware's SkyAware and others use 8080; take the next free port
-  XNG_HTTP_PORT=$(free_port 8080)
-  XNG_METRICS_PORT=$(free_port 9090)
+  if ! XNG_HTTP_PORT=$(free_port 8080); then
+    XNG_HTTP_PORT=8080
+    warn "Ports 8080-8089 are all taken; xng decodes anyway, but its dashboard won't start"
+  fi
+  if ! XNG_METRICS_PORT=$(free_port 9090); then
+    XNG_METRICS_PORT=9090
+    warn "Ports 9090-9099 are all taken; xng's metrics won't start"
+  fi
   [ "$XNG_HTTP_PORT" = 8080 ] || substep "Port 8080 is taken; the xng dashboard uses ${XNG_HTTP_PORT}"
   sudo mkdir -p "$XNG_CONFIG_DIR"
   local tmp
@@ -2445,7 +2454,7 @@ free_port() {
   for n in 0 1 2 3 4 5 6 7 8 9; do
     if ! port_in_use "$((p + n))"; then echo "$((p + n))"; return 0; fi
   done
-  echo "$p"
+  return 1
 }
 
 # Where the station runs: native (systemd unit), docker or nothing
@@ -2697,7 +2706,7 @@ cmd_status() {
     fi
     echo "  Recent log:"
     # Hide anything that looks like a credential before it's pasted anywhere
-    xng_recent_log 15 | sed -E 's/((refresh_|access_)?token|bearer|password|secret)([" :=]+)[^ ",]+/\1\3[hidden]/Ig; s/^/    /'
+    xng_recent_log 15 | sed -E 's/((refresh_|access_)?token|bearer|password|secret)("?[ :=]+)"[^"]*"/\1\3"[hidden]"/Ig; s/((refresh_|access_)?token|bearer|password|secret)([" :=]+)([^ ",=:[][^ ",]*)/\1\3[hidden]/Ig; s/^/    /'
     local log; log=$(xng_recent_log 200)
     if xng_log_hints "$log" >/dev/null 2>&1; then
       echo
@@ -2727,24 +2736,44 @@ cmd_update() {
     return 0
   fi
   step "Updating xng ${cur:-?} to ${ver}"
-  if [ "$where" = native ]; then
+  local from; from=$(xng_runs_where)
+  # Stop the current station first: both would want the same SDRs
+  if [ "$from" = native ]; then
     have_systemd && sudo systemctl stop xng-station 2>/dev/null || true
+  else
+    sudo docker stop xng-station >/dev/null 2>&1 || true
+  fi
+  local done_as=""
+  if [ "$where" = native ]; then
     if install_xng_native "$ver"; then
       install_xng_service_native
+      done_as=native
     else
-      warn "xng ${ver} has no build that runs here; switching to the Docker image."
-      sudo systemctl disable --now xng-station >/dev/null 2>&1 || true
-      sudo rm -f /etc/systemd/system/xng-station.service
-      have_systemd && sudo systemctl daemon-reload
-      install_xng_docker "$ver" || exit 1
+      warn "xng ${ver} has no build that runs here; trying the Docker image."
     fi
-  else
-    if [ -f /etc/systemd/system/xng-station.service ]; then
-      sudo systemctl disable --now xng-station >/dev/null 2>&1 || true
-      sudo rm -f /etc/systemd/system/xng-station.service
-      have_systemd && sudo systemctl daemon-reload
+  fi
+  if [ -z "$done_as" ] && install_xng_docker "$ver"; then
+    done_as=docker
+  fi
+  if [ -z "$done_as" ]; then
+    err "The update failed; starting the xng you had again."
+    if [ "$from" = native ]; then
+      sudo rm -rf "${CONFIG_DIR}/xng"
+      have_systemd && sudo systemctl start xng-station 2>/dev/null || true
+    else
+      sudo docker start xng-station >/dev/null 2>&1 || true
     fi
-    install_xng_docker "$ver" || exit 1
+    exit 1
+  fi
+  # Remove the old deployment only once the new one runs
+  if [ "$done_as" = docker ] && [ -f /etc/systemd/system/xng-station.service ]; then
+    sudo systemctl disable xng-station >/dev/null 2>&1 || true
+    sudo rm -f /etc/systemd/system/xng-station.service
+    have_systemd && sudo systemctl daemon-reload
+  fi
+  if [ "$done_as" = native ] && [ -f "${CONFIG_DIR}/xng/docker-compose.yml" ]; then
+    (cd "${CONFIG_DIR}/xng" && sudo docker compose down >/dev/null 2>&1) || sudo docker rm -f xng-station >/dev/null 2>&1 || true
+    sudo rm -f "${CONFIG_DIR}/xng/docker-compose.yml"
   fi
   verify_xng_station
 }
