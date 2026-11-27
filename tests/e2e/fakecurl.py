@@ -78,6 +78,10 @@ if url and url.startswith(api):
         if body["ident"] in os.environ.get("TAKEN", "").split(","):
             reply(409, {"error": "station_ident_taken"})
         reply(201, {"created": True, "claimed": False, "station": {"ident": body["ident"]}})
+    if path == "/installer/report":
+        json.loads(data)
+        open(state + "/report.json", "a").write(data + "\n")
+        reply(int(os.environ.get("REPORT_STATUS", "202")), {"ok": True})
     if path.startswith("/stations/ident/"):
         # /tmp/fake/stations.json: {"IDENT-ACARS": seconds since last report, ...}
         known = json.load(open("/tmp/fake/stations.json")) if os.path.exists("/tmp/fake/stations.json") else {}

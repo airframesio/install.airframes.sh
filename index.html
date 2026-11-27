@@ -73,6 +73,8 @@
             <button class="copy-btn" data-copy="curl -sSL https://install.airframes.sh/installer | bash -s -- status">Copy</button>
           </div>
 
+          <p class="install-step">At the end, the installer asks whether to send Airframes an anonymous report (installer version, system, SDR types, modes, and the step that failed if one did). The answer defaults to no; <code>--no-report</code> skips the question. <a href="https://docs.airframes.io/docs/feeding/how">What's in it</a>.</p>
+
           <div class="install-callout">
             <strong>ADS-B?</strong> Airframes doesn't ingest ADS-B itself, but the installer can feed it to our partners <a href="https://airplanes.live">Airplanes.Live</a> and <a href="https://plane.watch">Plane Watch</a>: pick ADS-B in the menu (xng can decode it too), or run <code class="nowrap">| bash -s -- adsb</code>. On a PiAware or other ADS-B box it feeds them from the decoder you already run. To feed Airframes ACARS, VDL2, HFDL or airband voice as well, add a second SDR.
           </div>

@@ -44,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="3.3.0"
+VERSION="3.4.0"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
@@ -1060,6 +1060,7 @@ check_existing_setup() {
 # decoders, leaving ADS-B dongles alone. Asks when it can't tell; an
 # unattended run stops instead of guessing (--device overrides).
 check_sdr_for_decoders() {
+  report_step sdr-check
   [ ${#SELECTED_DECODERS[@]} -gt 0 ] || return 0
   if [ "${SELECTED_SDR:-rtlsdr}" != "rtlsdr" ]; then
     [ -n "$SDR_DEVICE" ] || SDR_DEVICE="0"
@@ -1117,7 +1118,7 @@ check_sdr_for_decoders() {
     if [ "$interactive" = true ]; then
       echo
       if ! ui_confirm "Install anyway (you can plug in another SDR later)?" "yes"; then
-        info "Stopped. Nothing was installed."
+        REPORT_ARMED=false; info "Stopped. Nothing was installed."
         exit 0
       fi
     else
@@ -1403,6 +1404,7 @@ EOF
 
 setup_adsb() {
   [ "$WANT_ADSB" = true ] || return 0
+  report_step adsb
   echo
   step "ADS-B for Airframes' partners (Airplanes.Live, Plane Watch)"
 
@@ -2389,13 +2391,16 @@ setup_xng_station() {
 
   local method="${XNG_METHOD}"
   if [ -z "$method" ] || [ "$method" = "native" ]; then
+    report_step xng-install-native
     if install_xng_native "$ver"; then
+      report_step xng-service
       install_xng_service_native
       return 0
     fi
     [ "$method" = "native" ] && { err "xng ${ver} has no build that runs here; try --xng-method docker."; return 1; }
     info "Using the xng Docker image instead (it runs on every Linux, 32-bit Pi included)."
   fi
+  report_step xng-install-docker
   install_xng_docker "$ver"
 }
 
@@ -2457,15 +2462,21 @@ preflight_checks() {
 
 # Whole xng flow, after the menu: sign in, station, hardware, jobs.
 plan_xng_station() {
+  report_step xng-prepare
   ensure_python3 || exit 1
+  report_step preflight
   preflight_checks
+  report_step sign-in
   signin_step
+  report_step station-id
   detect_station_location
   choose_station_ident
+  report_step sdr-detect
   detect_xng_sdrs
   if [ ${#XNG_SDRS[@]} -eq 0 ]; then
     warn "No SDR found on USB. xng is set up anyway; plug one in and run this again to choose its job."
   fi
+  report_step plan
   check_old_decoders
   default_jobs
   apply_modes_arg
@@ -2659,6 +2670,7 @@ xng_log_hints() {
 
 # After setup: wait for the station to come up and show what it's doing
 verify_xng_station() {
+  report_step verify
   local where state="" i json=""
   where=$(xng_runs_where)
   [ -n "$where" ] || return 0
@@ -3031,6 +3043,7 @@ disable_auto_update() {
 # During setup: ask (default yes), or follow --auto-update / --no-auto-update
 setup_auto_update() {
   have_systemd || return 0
+  report_step auto-update
   case "$AUTO_UPDATE" in
     yes) enable_auto_update ;;
     no)  return 0 ;;
@@ -3383,6 +3396,134 @@ api_report_status() {
     -H "Content-Type: application/json" \
     -d "{\"token\":\"${TOKEN}\",\"status\":\"${status}\",\"message\":\"${message}\",\"percent\":${percent}}" \
     >/dev/null 2>&1 &
+}
+
+# ---------------------------------------------------------------------------
+# Opt-in install report. At the end of an install (or when it fails), the
+# installer shows a small anonymous report and asks whether to send it
+# (default no). It holds the installer version, OS, distribution, CPU
+# architecture, SDR types, modes, install method, how long it took and
+# whether it worked or the step it failed at. Nothing that identifies the
+# person or station: no station ID, sign-in, hostname, serials, position or
+# IP (the API doesn't store the IP). -y doesn't send unless --report is
+# given; --no-report never asks.
+# ---------------------------------------------------------------------------
+REPORT_MODE=""            # --report yes, --no-report no, empty asks
+REPORT_ARMED=false        # true once an install starts; a "no" at a prompt unsets it
+REPORT_STEP="start"       # last step reached, named from a fixed list
+REPORT_STARTED=$(date +%s)
+
+report_step() { REPORT_STEP="$1"; }
+
+# Only letters, digits and . _ + - (every field is one of our own words)
+report_word() { printf '%s' "$1" | tr -cd 'A-Za-z0-9._+-' | cut -c1-40; }
+
+# JSON array from words: report_array a b c -> ["a","b","c"]
+report_array() {
+  local out="" w
+  for w in "$@"; do
+    w=$(report_word "$w")
+    [ -n "$w" ] && out+="${out:+,}\"${w}\""
+  done
+  echo "[${out}]"
+}
+
+report_payload() {
+  local outcome="$1" rc="$2" i job
+  local -a setup=() sdrs=() modes=()
+  [ "$WANT_XNG" = true ] && setup+=(xng)
+  setup+=("${SELECTED_DECODERS[@]}")
+  [ "$WANT_ADSB" = true ] && setup+=(adsb)
+  if [ "$WANT_XNG" = true ]; then
+    for i in "${!XNG_SDRS[@]}"; do
+      job="${XNG_JOBS[$i]:-off}"
+      sdrs+=("$(sdr_field "${XNG_SDRS[$i]}" 0)")
+      [ "$job" = off ] || modes+=("$job")
+    done
+  elif [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    sdrs+=("$SELECTED_SDR")
+    modes+=("${SELECTED_DECODERS[@]}")
+  fi
+  [ "$WANT_ADSB" = true ] && modes+=(adsb-partners)
+  local method="" xver=""
+  if [ "$WANT_XNG" = true ]; then
+    method=$(xng_runs_where)
+    xver=$(xng_installed_version 2>/dev/null || true)
+  elif [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    method="$SELECTED_METHOD"
+  fi
+  local step=""
+  [ "$outcome" = success ] || step="$REPORT_STEP"
+  local signed_in=false
+  [ -n "$STATION_REGISTERED" ] && signed_in=true
+  printf '{"installer_version":"%s","os":"%s","distro":"%s","arch":"%s","wsl":%s,"setup":%s,"sdrs":%s,"modes":%s,"method":"%s","xng_version":"%s","signed_in":%s,"outcome":"%s","failed_step":"%s","exit_code":%d,"duration_seconds":%d}\n' \
+    "$(report_word "$VERSION")" "$(report_word "$OS")" "$(report_word "$DISTRO")" "$(report_word "$ARCH")" \
+    "$IS_WSL" "$(report_array "${setup[@]}")" "$(report_array "${sdrs[@]}")" "$(report_array "${modes[@]}")" \
+    "$(report_word "$method")" "$(report_word "$xver")" "$signed_in" "$outcome" "$(report_word "$step")" \
+    "$rc" "$(( $(date +%s) - REPORT_STARTED ))"
+}
+
+# Readable lines for the person to check before they answer
+report_preview() {
+  local outcome="$1" i job
+  local -a sdrs=() modes=()
+  local what="${OS}/${DISTRO}/${ARCH}"
+  if [ "$WANT_XNG" = true ]; then
+    for i in "${!XNG_SDRS[@]}"; do
+      sdrs+=("$(sdr_field "${XNG_SDRS[$i]}" 0)")
+      job="${XNG_JOBS[$i]:-off}"; [ "$job" = off ] || modes+=("$job")
+    done
+  elif [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    sdrs+=("$SELECTED_SDR"); modes+=("${SELECTED_DECODERS[@]}")
+  fi
+  [ "$WANT_ADSB" = true ] && modes+=(adsb-partners)
+  echo -e "  ${DIM}Installer:${RESET} ${VERSION}   ${DIM}System:${RESET} ${what}"
+  echo -e "  ${DIM}SDRs:${RESET}      ${sdrs[*]:-none}"
+  echo -e "  ${DIM}Modes:${RESET}     ${modes[*]:-none}"
+  case "$outcome" in
+    success)     echo -e "  ${DIM}Result:${RESET}    worked" ;;
+    not_running) echo -e "  ${DIM}Result:${RESET}    installed, but xng isn't running" ;;
+    *)           echo -e "  ${DIM}Result:${RESET}    failed at: ${REPORT_STEP}" ;;
+  esac
+}
+
+send_install_report() {
+  local body="$1" code
+  code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -X POST "${AIRFRAMES_API}/installer/report" \
+    -H 'Content-Type: application/json' -H "User-Agent: airframes-installer/${VERSION}" \
+    --data "$body" 2>/dev/null) || code=000
+  case "$code" in
+    2*) ok "Report sent. Thank you!" ;;
+    *)  substep "The report couldn't be sent (HTTP ${code}); that's fine, nothing else depends on it." ;;
+  esac
+}
+
+# Runs on exit (trap in main). Asks only once the install was confirmed, and
+# never after Ctrl-C.
+installer_exit() {
+  local rc="$1" outcome=success
+  [ "$REPORT_ARMED" = true ] || return 0
+  REPORT_ARMED=false
+  set +e
+  [ "$rc" -ge 128 ] && return 0
+  if [ "$rc" -ne 0 ]; then outcome=failed
+  elif [ "${XNG_HEALTH:-}" = failed ]; then outcome=not_running
+  fi
+  case "$REPORT_MODE" in
+    no) return 0 ;;
+    yes) ;;
+    *)
+      [ "$AUTO_YES" = true ] && return 0
+      [ "$IS_TTY" = true ] || return 0
+      echo
+      info "Help improve the installer: send Airframes this anonymous report?"
+      report_preview "$outcome"
+      echo -e "  ${DIM}No station ID, sign-in, hostname, serial numbers or location. Details: https://docs.airframes.io/docs/feeding/how${RESET}"
+      ui_confirm "Send it?" "no" || return 0
+      ;;
+  esac
+  send_install_report "$(report_payload "$outcome" "$rc")"
+  return 0
 }
 
 # ===========================================================================
@@ -4171,6 +4312,7 @@ EOF
 }
 
 install_manager_script() {
+  report_step manager
   step "Installing airframes manager"
 
   local install_dir="/usr/local/bin"
@@ -4294,6 +4436,13 @@ xng options:
   --no-auto-update        Don't set up automatic updates
   --lat / --lon           Receiver position (also used for ADS-B)
 
+Install report:
+  --report                Send the anonymous install report without asking
+                          (also with -y). It holds the installer version, OS,
+                          architecture, SDR types, modes and the step that
+                          failed, nothing that identifies you or the station
+  --no-report             Don't ask about the report
+
 ADS-B options:
   --lat DEG / --lon DEG   Antenna position, decimal degrees
   --alt ALT               Antenna altitude, e.g. 120m or 394ft
@@ -4399,6 +4548,8 @@ parse_args() {
       --no-auto-update) AUTO_UPDATE=no; shift ;;
       --sign-in)        SIGNIN_MODE=yes; shift ;;
       --no-sign-in)     SIGNIN_MODE=no; shift ;;
+      --report)         REPORT_MODE=yes; shift ;;
+      --no-report)      REPORT_MODE=no; shift ;;
       --modes)          XNG_MODES_ARG="$2"; WANT_XNG=true; shift 2 ;;
       --airband)        XNG_AIRBAND_ARG="$2"; WANT_XNG=true; shift 2 ;;
       --xng-method)
@@ -4471,7 +4622,7 @@ tui_select_decoders() {
 
     local selections
     selections=$(gum_multichoice "Select what to install" "${labels[@]}") || {
-      info "Nothing selected"
+      REPORT_ARMED=false; info "Nothing selected"
       exit 0
     }
 
@@ -4630,6 +4781,7 @@ tui_confirm_install() {
   echo
 
   if ! ui_confirm "Proceed with installation?"; then
+    REPORT_ARMED=false
     info "Aborted."
     exit 0
   fi
@@ -4733,6 +4885,7 @@ tui_flow() {
 
   # What to set up
   tui_select_setup
+  REPORT_ARMED=true
 
   [ "$WANT_XNG" = true ] && plan_xng_station
 
@@ -4761,6 +4914,7 @@ tui_flow() {
   fi
 
   for decoder in "${SELECTED_DECODERS[@]}"; do
+    report_step "decoder-${SELECTED_METHOD}"
     case "$SELECTED_METHOD" in
       source)  install_from_source "$decoder" ;;
       docker)  install_with_docker "$decoder" ;;
@@ -4768,6 +4922,7 @@ tui_flow() {
       package) install_from_package "$decoder" ;;
     esac
 
+    report_step service
     save_config "$decoder"
     tui_post_install "$decoder"
   done
@@ -4803,6 +4958,7 @@ closing_message() {
 
 main() {
   if [ -t 0 ]; then IS_TTY=true; else IS_TTY=false; fi
+  trap 'installer_exit $?' EXIT
 
   parse_args "$@"
   if [ "$WANT_XNG" = true ] && [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
@@ -4837,6 +4993,7 @@ main() {
     echo
 
     api_fetch_config || exit 1
+    REPORT_ARMED=true
 
     if [ -z "$SELECTED_REGION" ]; then
       SELECTED_REGION=$(detect_region_from_timezone)
@@ -4848,6 +5005,7 @@ main() {
     mkdir -p "$BUILD_DIR"
 
     for decoder in "${SELECTED_DECODERS[@]}"; do
+      report_step "decoder-${SELECTED_METHOD}"
       case "$SELECTED_METHOD" in
         source)  install_from_source "$decoder" ;;
         docker)  install_with_docker "$decoder" ;;
@@ -4855,6 +5013,7 @@ main() {
         package) install_from_package "$decoder" ;;
       esac
 
+      report_step service
       save_config "$decoder"
 
       api_report_status "configuring" "Configuring ${decoder}" 80
@@ -4893,6 +5052,7 @@ main() {
       SELECTED_REGION=$(detect_region_from_timezone)
     fi
 
+    REPORT_ARMED=true
     check_existing_setup
     [ "$WANT_XNG" = true ] && plan_xng_station
     [ ${#SELECTED_DECODERS[@]} -gt 0 ] && check_sdr_for_decoders
@@ -4912,6 +5072,7 @@ main() {
       [ "$WANT_XNG" = true ] && what=("the xng station ${STATION_IDENT}" "${what[@]}")
       [ "$WANT_ADSB" = true ] && what+=("ADS-B feeds for Airplanes.Live${PLANEWATCH_KEY:+ and Plane Watch}")
       if ! ui_confirm "Install $(join_by ', ' "${what[@]}")?"; then
+        REPORT_ARMED=false
         info "Aborted."
         exit 0
       fi
@@ -4923,6 +5084,7 @@ main() {
     fi
 
     for decoder in "${SELECTED_DECODERS[@]}"; do
+      report_step "decoder-${SELECTED_METHOD}"
       case "$SELECTED_METHOD" in
         source)  install_from_source "$decoder" ;;
         docker)  install_with_docker "$decoder" ;;
@@ -4930,6 +5092,7 @@ main() {
         package) install_from_package "$decoder" ;;
       esac
 
+      report_step service
       save_config "$decoder"
       cli_post_install "$decoder"
     done
@@ -4952,6 +5115,8 @@ main() {
   # TUI mode: no args, interactive
   if [ "$IS_TTY" = true ]; then
     tui_flow
+    # Exit here, inside main: the exit trap asks about the report on the terminal
+    exit 0
   else
     # No terminal to ask on (cron, CI, ssh without -t, docker without -t)
     # and no decoder named. Say exactly what to run instead.
