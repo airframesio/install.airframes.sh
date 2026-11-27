@@ -44,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="3.3.0"
+VERSION="3.4.0"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
@@ -177,6 +177,7 @@ pkg_translate() {
         zlib-dev)        echo "zlib1g-dev" ;;
         docker)          echo "docker.io" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
       esac
       ;;
     dnf)
@@ -201,6 +202,7 @@ pkg_translate() {
         zlib-dev)        echo "zlib-devel" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
       esac
       ;;
     pacman)
@@ -225,6 +227,7 @@ pkg_translate() {
         zlib-dev)        echo "zlib" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
       esac
       ;;
     apk)
@@ -249,6 +252,7 @@ pkg_translate() {
         zlib-dev)        echo "zlib-dev" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "libqrencode-tools" ;;
       esac
       ;;
     brew)
@@ -273,6 +277,7 @@ pkg_translate() {
         zlib-dev)        echo "" ;; # system provided
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
       esac
       ;;
   esac
@@ -1532,6 +1537,64 @@ saved_signin_user() {
     json_field "d['username'] if d.get('refresh_token') else None" || true
 }
 
+# --- QR codes in the terminal ----------------------------------------------
+# The sign-in link as a QR code, so a phone can open it with the code filled
+# in. qrencode is optional: the installer tries to install it once, and shows
+# only the link when it's missing, when the terminal is too narrow, or when
+# AIRFRAMES_NO_QR=1.
+
+# Terminal width in columns (AIRFRAMES_COLUMNS overrides, for tests)
+term_columns() {
+  local cols=""
+  if [ -n "${AIRFRAMES_COLUMNS:-}" ]; then echo "$AIRFRAMES_COLUMNS"; return 0; fi
+  cols=$( { stty size </dev/tty; } 2>/dev/null | awk '{print $2}' || true)
+  [ -n "$cols" ] && [ "$cols" -gt 0 ] 2>/dev/null || cols=$(tput cols 2>/dev/null || true)
+  [ -n "$cols" ] && [ "$cols" -gt 0 ] 2>/dev/null || cols="${COLUMNS:-80}"
+  echo "$cols"
+}
+
+# Does the terminal take UTF-8? (half-block QR codes need it)
+term_utf8() {
+  local cs
+  cs=$(locale charmap 2>/dev/null || true)
+  case "${cs:-${LC_ALL:-${LC_CTYPE:-${LANG:-}}}}" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*) return 0 ;;
+  esac
+  return 1
+}
+
+QR_INSTALL_TRIED=false
+ensure_qrencode() {
+  command -v qrencode >/dev/null 2>&1 && return 0
+  [ "$QR_INSTALL_TRIED" = true ] && return 1
+  QR_INSTALL_TRIED=true
+  [ -n "${PKG:-}" ] || return 1
+  substep "Installing qrencode (for a QR code you can scan)"
+  pkg_install qrencode >/dev/null 2>&1 || true
+  command -v qrencode >/dev/null 2>&1
+}
+
+# show_qr <url>: put the QR code (indented by 4) in QR_TEXT, or return 1
+# with the reason in QR_SKIPPED (off, missing, narrow). Not for $(...).
+QR_TEXT=""
+QR_SKIPPED=""
+show_qr() {
+  local url="$1" modules width cols type indent="    "
+  QR_TEXT=""; QR_SKIPPED=""
+  if [ -n "${AIRFRAMES_NO_QR:-}" ]; then QR_SKIPPED=off; return 1; fi
+  if ! ensure_qrencode; then QR_SKIPPED=missing; return 1; fi
+  # ASCII output draws each module as "##", so its width / 2 is the size
+  modules=$(qrencode -t ASCII -m 2 "$url" 2>/dev/null | awk '{ if (length($0) > w) w = length($0) } END { print int(w / 2) }' || true)
+  if [ -z "$modules" ] || ! [ "$modules" -gt 0 ] 2>/dev/null; then QR_SKIPPED=missing; return 1; fi
+  # Half blocks fit two rows in a line; without UTF-8, two spaces per module
+  if term_utf8; then type=ANSIUTF8; width=$modules; else type=ANSI; width=$((modules * 2)); fi
+  cols=$(term_columns)
+  if [ $((width + ${#indent})) -gt "$cols" ]; then QR_SKIPPED=narrow; return 1; fi
+  QR_TEXT=$(qrencode -t "$type" -m 2 "$url" 2>/dev/null | sed "s/^/${indent}/" || true)
+  if [ -z "$QR_TEXT" ]; then QR_SKIPPED=missing; return 1; fi
+  return 0
+}
+
 # Device-flow sign-in. Shows the code and link, waits for approval, then
 # saves the refresh token where xng reads it and keeps the access token for
 # registering the station. Returns 1 when skipped or it fails.
@@ -1557,10 +1620,16 @@ airframes_signin() {
   echo -e "    1. Open ${CYAN}${uri}${RESET} on any phone or computer"
   echo -e "    2. Enter the code  ${BOLD}${code}${RESET}"
   echo
-  if command -v qrencode >/dev/null 2>&1; then
-    echo -e "  ${DIM}Or scan this:${RESET}"
-    qrencode -t ANSIUTF8 -m 2 "$uri_full" 2>/dev/null | sed 's/^/    /'
+  # The link with the code in it, as a QR code for a phone and as text
+  if show_qr "$uri_full"; then
+    echo -e "  ${DIM}Or scan this with your phone's camera (the code is filled in):${RESET}"
+    echo "$QR_TEXT"
   fi
+  if [ "$uri_full" != "$uri" ]; then
+    echo -e "  ${DIM}Or open this link, the code is filled in:${RESET} ${CYAN}${uri_full}${RESET}"
+  fi
+  [ "$QR_SKIPPED" = narrow ] && echo -e "  ${DIM}(Make the window wider to see a QR code.)${RESET}"
+  echo
   echo -e "  ${DIM}Waiting for you to approve it (Ctrl-C to stop)...${RESET}"
 
   local deadline=$(( $(date +%s) + expires )) err_code
@@ -1714,6 +1783,11 @@ choose_station_ident() {
   STATION_IDENT="$id"
 }
 
+# The station's page on the Airframes website
+station_page_url() {
+  echo "${AIRFRAMES_APP}/stations/$1"
+}
+
 # Register the station on the signed-in account (needs the access token from
 # this run's sign-in). Asks for another ID when the ident is someone else's.
 register_station() {
@@ -1733,6 +1807,7 @@ register_station() {
         elif [ "$(json_field "d.get('claimed')" <<< "$resp")" = "True" ]; then status="claimed for your account"
         else status="already on your account"; fi
         ok "Station ${BOLD}${STATION_IDENT}${RESET} ${status}"
+        substep "Its page: $(station_page_url "$STATION_IDENT")"
         STATION_REGISTERED="$STATION_IDENT"
         return 0
         ;;
@@ -2414,7 +2489,7 @@ xng_summary() {
   done
   echo -e "  Dashboard:  ${CYAN}http://${host:-localhost}:${XNG_HTTP_PORT}${RESET}"
   if [ -n "$STATION_REGISTERED" ]; then
-    echo -e "  On Airframes: ${CYAN}${AIRFRAMES_APP}/stations${RESET} (signed in as ${AF_USERNAME})"
+    echo -e "  On Airframes: ${CYAN}$(station_page_url "$STATION_REGISTERED")${RESET} (signed in as ${AF_USERNAME})"
   else
     echo -e "  On Airframes: your feed shows up as ${STATION_IDENT}-ACARS, -VDL2, ... once data arrives."
     echo -e "  Claim it:   ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- sign-in${RESET}"
@@ -2763,6 +2838,7 @@ cmd_status() {
   if sudo test -r "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null; then
     user=$(sudo cat "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null | json_field "d.get('username')" || true)
     echo "  Sign-in:  ${user:-signed in} (Airframes account)"
+    [ -n "$ident" ] && echo "  Page:     $(station_page_url "$ident")"
   else
     echo "  Sign-in:  none (feeding unclaimed; run the installer with \"sign-in\" to claim it)"
   fi
