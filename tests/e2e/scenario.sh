@@ -42,11 +42,22 @@ case "$1" in
     done; true ;;
   start|restart) [ "$2" = xng-station ] && cp /tmp/fake/svc.next /tmp/fake/svc 2>/dev/null; touch "/tmp/fake/active-$2"; true ;;
   stop) rm -f "/tmp/fake/active-$2"; [ "$2" = xng-station ] && echo inactive > /tmp/fake/svc; true ;;
+  is-failed) [ -f "/tmp/fake/failed-$u" ] ;;
+  reset-failed) rm -f "/tmp/fake/failed-$2" ;;
   list-unit-files) exit 1 ;;
   *) true ;;
 esac
 S
 printf '#!/bin/sh\ncat /tmp/fake/journal 2>/dev/null\n' > /usr/local/bin/journalctl
+# timedatectl: NTP on unless /tmp/fake/ntp-off exists
+cat > /usr/local/bin/timedatectl <<'S'
+#!/bin/sh
+echo "timedatectl $*" >> /tmp/fake/timedatectl.log
+case "$1" in
+  show) [ -f /tmp/fake/ntp-off ] && echo no || echo yes ;;
+  set-ntp) [ "$2" = true ] && rm -f /tmp/fake/ntp-off ;;
+esac
+S
 printf '#!/bin/sh\necho "Bus 001 Device 004: ID 0bda:2838 Realtek RTL2838"\n' > /usr/local/bin/lsusb
 # qrencode stand-in (only installed by the qr scenarios): a 33-module code,
 # "##" per module in ASCII, one cell per module and a marker otherwise
@@ -248,6 +259,91 @@ case "$1" in
     check "clock warning" 'echo "$out" | grep -q "clock is off by 15 minutes"'
     out=$(run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2); echo "$out"
     check "no warning when right" '! echo "$out" | grep -q "clock is off"'
+    ;;
+  fix-healthy)
+    run -y xng --no-sign-in --auto-update --modes 00000001=acars,00000002=vdl2 >/dev/null
+    out=$(run fix); echo "$out"
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "nothing to fix" 'echo "$out" | grep -q "Nothing to fix"'
+    check "no restart" '! echo "$out" | grep -q "Restart xng"'
+    ;;
+  fix-service)
+    run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2 >/dev/null
+    echo failed > /tmp/fake/svc; : > /tmp/fake/systemctl.log
+    printf 'LIBUSB_ERROR_BUSY\n' > /tmp/fake/journal
+    out=$(run -y fix); echo "$out"
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "problem explained" 'echo "$out" | grep -q "xng isn.t running (failed)"'
+    check "reset-failed" 'grep -q "reset-failed xng-station" /tmp/fake/systemctl.log'
+    check "restarted" 'grep -q "restart xng-station" /tmp/fake/systemctl.log'
+    check "running again" 'echo "$out" | grep -q "xng is running"'
+    check "summary" 'echo "$out" | grep -q "Fixed 1 of 1 problem."'
+    ;;
+  fix-ask)
+    # No -y and no terminal: list the fixes, change nothing, exit 1
+    run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2 >/dev/null
+    echo failed > /tmp/fake/svc; rm -f /etc/udev/rules.d/60-airframes-sdr.rules; : > /tmp/fake/systemctl.log
+    out=$(run fix); echo "$out"
+    check "exit 1" 'echo "$out" | grep -q "^EXIT=1"'
+    check "says how to apply" 'echo "$out" | grep -q "Run with -y to apply"'
+    check "rule not written" '[ ! -e /etc/udev/rules.d/60-airframes-sdr.rules ]'
+    check "not restarted" '! grep -q "restart xng-station" /tmp/fake/systemctl.log'
+    check "two left" 'echo "$out" | grep -q "2 of 2 problems left"'
+    ;;
+  fix-drivers)
+    run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2 >/dev/null
+    rm -f /etc/udev/rules.d/60-airframes-sdr.rules /etc/modprobe.d/airframes-rtlsdr.conf; : > /tmp/fake/systemctl.log
+    out=$(run -y fix); echo "$out"
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "udev rule back" 'grep -q 0bda /etc/udev/rules.d/60-airframes-sdr.rules'
+    check "dvb blocked" 'grep -q "blacklist dvb_usb_rtl28xxu" /etc/modprobe.d/airframes-rtlsdr.conf'
+    check "xng restarted" 'grep -q "restart xng-station" /tmp/fake/systemctl.log'
+    ;;
+  fix-serial)
+    run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2 >/dev/null
+    echo 00001090 > /tmp/usb/1-1.2/serial
+    out=$(run -y fix); echo "$out"
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "explained" 'echo "$out" | grep -q "serial 00000002, which isn.t plugged in"'
+    check "new serial" 'grep -q "serial=00001090" $TOML && ! grep -q "serial=00000002" $TOML'
+    check "other job kept" 'grep -q "serial=00000001" $TOML'
+    check "backup kept" 'grep -q "serial=00000002" $TOML.bak'
+    # Two SDRs could take the job: don't guess
+    run -y xng --no-sign-in --modes 00000001=acars,00001090=vdl2 >/dev/null
+    echo 00000007 > /tmp/usb/1-1.2/serial
+    d=/tmp/usb/1-1.3; mkdir -p $d; echo 0bda > $d/idVendor; echo 2838 > $d/idProduct; echo 00000008 > $d/serial
+    out=$(run -y fix); echo "$out"
+    check "ambiguous: exit 1" 'echo "$out" | grep -q "^EXIT=1"'
+    check "ambiguous: asks to rerun" 'echo "$out" | grep -q "pick which SDR does what"'
+    check "ambiguous: unchanged" 'grep -q "serial=00001090" $TOML'
+    ;;
+  fix-clock)
+    run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2 >/dev/null
+    touch /tmp/fake/ntp-off
+    out=$(run -y fix); echo "$out"
+    check "ntp off found" 'echo "$out" | grep -q "Network time sync is off"'
+    check "ntp turned on" 'grep -q "set-ntp true" /tmp/fake/timedatectl.log && [ ! -e /tmp/fake/ntp-off ]'
+    : > /tmp/fake/timedatectl.log
+    out=$(FAKE_DATE_OFFSET=900 run -y fix); echo "$out"
+    check "skew found" 'echo "$out" | grep -q "clock is off by 15 minutes"'
+    check "time sync on" 'grep -q "set-ntp true" /tmp/fake/timedatectl.log'
+    ;;
+  fix-auto-update)
+    run -y xng --no-sign-in --auto-update --modes 00000001=acars,00000002=vdl2 >/dev/null
+    rm -f /tmp/fake/enabled-airframes-xng-update.timer /etc/systemd/system/airframes-xng-update.service
+    out=$(run -y fix); echo "$out"
+    check "explained" 'echo "$out" | grep -q "weekly xng update is broken: one of its two systemd units is missing"'
+    check "service back" 'grep -q "install.airframes.sh/installer" /etc/systemd/system/airframes-xng-update.service'
+    check "timer enabled" '[ -f /tmp/fake/enabled-airframes-xng-update.timer ]'
+    touch /tmp/fake/failed-airframes-xng-update.service
+    out=$(run -y fix); echo "$out"
+    check "failed run found" 'echo "$out" | grep -q "its last run failed"'
+    check "failed state cleared" '[ ! -e /tmp/fake/failed-airframes-xng-update.service ]'
+    ;;
+  fix-none)
+    out=$(run fix); echo "$out"
+    check "exit 1" 'echo "$out" | grep -q "^EXIT=1"'
+    check "no station" 'echo "$out" | grep -q "No xng station here yet"'
     ;;
   migrate-systemd)
     # The old installer's units: acarsdec on RTL-SDR 1 (by index), dumpvdl2 by serial

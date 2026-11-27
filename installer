@@ -44,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="3.5.0"
+VERSION="3.6.0"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 BUILD_DIR="/tmp/airframes-build"
@@ -2345,6 +2345,21 @@ install_xng_native() {
   ok "Installed $("$XNG_BIN" --version 2>/dev/null | head -1)"
 }
 
+# RTL-SDR, Airspy and HackRF access for the plugdev group (xng runs as xng:plugdev)
+SDR_UDEV_RULE=/etc/udev/rules.d/60-airframes-sdr.rules
+install_sdr_udev_rule() {
+  sudo mkdir -p "$(dirname "$SDR_UDEV_RULE")"
+  sudo tee "$SDR_UDEV_RULE" >/dev/null << 'EOF'
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="plugdev", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", GROUP="plugdev", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="60a1", GROUP="plugdev", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="03eb", ATTRS{idProduct}=="800c", GROUP="plugdev", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="6089", GROUP="plugdev", MODE="0664"
+EOF
+  sudo udevadm control --reload-rules 2>/dev/null || true
+  sudo udevadm trigger 2>/dev/null || true
+}
+
 install_xng_service_native() {
   if ! id xng >/dev/null 2>&1; then
     sudo useradd --system --no-create-home --shell /usr/sbin/nologin xng 2>/dev/null || true
@@ -2373,19 +2388,7 @@ PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
-  # RTL-SDR access for the plugdev group
-  if [ ! -f /etc/udev/rules.d/60-airframes-sdr.rules ]; then
-    sudo mkdir -p /etc/udev/rules.d
-    sudo tee /etc/udev/rules.d/60-airframes-sdr.rules >/dev/null << 'EOF'
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="plugdev", MODE="0664"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", GROUP="plugdev", MODE="0664"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="60a1", GROUP="plugdev", MODE="0664"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="03eb", ATTRS{idProduct}=="800c", GROUP="plugdev", MODE="0664"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="6089", GROUP="plugdev", MODE="0664"
-EOF
-    sudo udevadm control --reload-rules 2>/dev/null || true
-    sudo udevadm trigger 2>/dev/null || true
-  fi
+  [ -f "$SDR_UDEV_RULE" ] || install_sdr_udev_rule
   if have_systemd; then
     sudo systemctl daemon-reload
     sudo systemctl enable xng-station >/dev/null 2>&1
@@ -3227,11 +3230,25 @@ xng_summary() {
   fi
 }
 
+# How far the Airframes API's clock (its Date header) is ahead of this one,
+# in seconds (negative: behind). Empty when the header can't be read; fails
+# when the API doesn't answer.
+api_clock_offset() {
+  local hdr remote
+  hdr=$(curl -sS -I -m 15 "${AIRFRAMES_API}/" 2>/dev/null | tr -d '\r' || true)
+  [ -n "$hdr" ] || return 1
+  remote=$(printf '%s\n' "$hdr" | sed -n 's/^[Dd]ate: *//p' | head -1)
+  [ -n "$remote" ] || return 0
+  remote=$(date -u -d "$remote" +%s 2>/dev/null || true)
+  [ -n "$remote" ] || return 0
+  echo $(( remote - $(date -u +%s) ))
+}
+
 # ---------------------------------------------------------------------------
 # Before installing: disk space, network, clock. Warnings only.
 # ---------------------------------------------------------------------------
 preflight_checks() {
-  local free code hdr remote now skew
+  local free code skew
   free=$(df -Pk / 2>/dev/null | awk 'NR == 2 {print int($4 / 1024)}' || true)
   if [ -n "$free" ] && [ "$free" -lt 300 ]; then
     warn "Only ${free} MB free on /. xng needs about 100 MB, plus room for logs; free some space if the install fails."
@@ -3240,17 +3257,12 @@ preflight_checks() {
   case "$code" in
     ""|000) warn "Can't reach GitHub, where xng is downloaded from. Check this machine's internet connection and DNS." ;;
   esac
-  hdr=$(curl -sS -I -m 15 "${AIRFRAMES_API}/" 2>/dev/null | tr -d '\r' || true)
-  if [ -z "$hdr" ]; then
+  if ! skew=$(api_clock_offset); then
     warn "Can't reach ${AIRFRAMES_API}. Signing in and feeding need it."
     return 0
   fi
-  remote=$(printf '%s\n' "$hdr" | sed -n 's/^[Dd]ate: *//p' | head -1)
-  [ -n "$remote" ] || return 0
-  remote=$(date -u -d "$remote" +%s 2>/dev/null || true)
-  [ -n "$remote" ] || return 0
-  now=$(date -u +%s)
-  skew=$(( now > remote ? now - remote : remote - now ))
+  [ -n "$skew" ] || return 0
+  skew=${skew#-}
   if [ "$skew" -gt 300 ]; then
     warn "This machine's clock is off by $(( skew / 60 )) minutes. Sign-in and downloads can fail, and message times will be wrong."
     if command -v timedatectl >/dev/null 2>&1; then
@@ -3976,6 +3988,314 @@ adsb_status_lines() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# installer fix: find the common problems and repair them, one at a time
+# ---------------------------------------------------------------------------
+# Each problem is explained with what the fix does, then asked about (-y
+# applies them all). Without a terminal and without -y nothing is changed:
+# the run only lists what it would do.
+FIX_FOUND=0          # problems found
+FIX_DONE=0           # problems fixed
+FIX_LEFT=0           # problems skipped or not fixable here
+FIX_RESTART=false    # station.toml or drivers changed: xng must restart
+
+# fix_problem <what is wrong> <what the fix does> <question>; 0 = go ahead
+fix_problem() {
+  FIX_FOUND=$((FIX_FOUND + 1))
+  echo
+  warn "$1"
+  echo -e "  ${BOLD}Fix:${RESET} $2"
+  if [ "$AUTO_YES" = true ]; then return 0; fi
+  if [ "$IS_TTY" != true ]; then
+    substep "Not changed: there's no terminal to ask on. Run with -y to apply the fixes."
+    FIX_LEFT=$((FIX_LEFT + 1))
+    return 1
+  fi
+  if ui_confirm "$3" "yes"; then return 0; fi
+  substep "Skipped"
+  FIX_LEFT=$((FIX_LEFT + 1))
+  return 1
+}
+
+fix_done()   { FIX_DONE=$((FIX_DONE + 1)); ok "$*"; }
+fix_failed() { FIX_LEFT=$((FIX_LEFT + 1)); err "$*"; }
+fix_fine()   { echo -e "  ${GREEN}ok${RESET}  $*"; }
+
+# A problem the installer can't repair by itself: say what to do instead
+fix_manual() {
+  FIX_FOUND=$((FIX_FOUND + 1)); FIX_LEFT=$((FIX_LEFT + 1))
+  echo
+  warn "$1"
+  echo -e "  ${BOLD}To fix it:${RESET} $2"
+}
+
+# Clock: time sync on, and not minutes away from the Airframes API's clock
+fix_clock() {
+  local ntp="" offset="" skew=""
+  if command -v timedatectl >/dev/null 2>&1; then
+    ntp=$(timedatectl show -p NTP --value 2>/dev/null || true)
+  fi
+  offset=$(api_clock_offset 2>/dev/null || true)
+  [ -n "$offset" ] && skew=${offset#-}
+  if [ -n "$skew" ] && [ "$skew" -gt 300 ]; then
+    if fix_problem "This machine's clock is off by $(( skew / 60 )) minutes. Sign-in and downloads can fail, and message times are wrong." \
+        "set the clock from the Airframes API's time and turn on network time sync (timedatectl set-ntp true) so it stays right." \
+        "Set the clock and turn on time sync?"; then
+      if sudo date -u -s "@$(( $(date -u +%s) + offset ))" >/dev/null 2>&1; then
+        command -v timedatectl >/dev/null 2>&1 && sudo timedatectl set-ntp true 2>/dev/null
+        fix_done "Clock set to $(date -u '+%Y-%m-%d %H:%M UTC')"
+        FIX_RESTART=true
+      elif command -v timedatectl >/dev/null 2>&1 && sudo timedatectl set-ntp true 2>/dev/null; then
+        fix_done "Turned on time sync; the clock catches up within a few minutes"
+      else
+        fix_failed "Couldn't set the clock. Install a time sync service (sudo apt-get install systemd-timesyncd) and check that UDP port 123 is open."
+      fi
+    fi
+  elif [ "$ntp" = no ]; then
+    if fix_problem "Network time sync is off, so the clock will drift (a Pi has no clock battery and starts wrong after a power cut)." \
+        "turn it on with timedatectl set-ntp true." \
+        "Turn on time sync?"; then
+      if sudo timedatectl set-ntp true 2>/dev/null; then fix_done "Turned on time sync"
+      else fix_failed "Couldn't turn on time sync. Install systemd-timesyncd (sudo apt-get install systemd-timesyncd)."; fi
+    fi
+  elif [ -n "$skew" ]; then
+    fix_fine "Clock is right${ntp:+ (time sync on)}"
+  else
+    fix_fine "Clock not checked (${AIRFRAMES_API} didn't answer)"
+  fi
+}
+
+# The DVB-T TV driver must stay off the RTL-SDRs
+fix_dvb_driver() {
+  [ "$OS" = linux ] || return 0
+  local loaded=false
+  lsmod 2>/dev/null | grep -q '^dvb_usb_rtl28xxu' && loaded=true
+  if [ ! -f /etc/modprobe.d/airframes-rtlsdr.conf ]; then
+    if fix_problem "The TV tuner (DVB-T) kernel driver isn't blocked. It grabs RTL-SDRs at boot, so xng can't open them." \
+        "block it in /etc/modprobe.d/airframes-rtlsdr.conf and unload it now." \
+        "Block the TV tuner driver?"; then
+      blacklist_dvb
+      if lsmod 2>/dev/null | grep -q '^dvb_usb_rtl28xxu'; then
+        fix_done "Blocked the TV tuner driver. It's still loaded: reboot once (sudo reboot)."
+      else
+        fix_done "Blocked the TV tuner driver"
+      fi
+      FIX_RESTART=true
+    fi
+  elif [ "$loaded" = true ]; then
+    if fix_problem "The TV tuner (DVB-T) kernel driver is blocked but still loaded, so it holds the RTL-SDRs." \
+        "unload it (modprobe -r dvb_usb_rtl28xxu)." \
+        "Unload the TV tuner driver?"; then
+      sudo modprobe -r dvb_usb_rtl28xxu 2>/dev/null || true
+      if lsmod 2>/dev/null | grep -q '^dvb_usb_rtl28xxu'; then
+        fix_failed "It's in use and won't unload. Reboot once (sudo reboot)."
+      else
+        fix_done "Unloaded the TV tuner driver"; FIX_RESTART=true
+      fi
+    fi
+  else
+    fix_fine "TV tuner driver blocked"
+  fi
+}
+
+# Native installs run xng as xng:plugdev; the udev rule lets it open the SDRs
+fix_udev_rule() {
+  [ "$OS" = linux ] && [ "$(xng_runs_where)" = native ] || return 0
+  if [ -f "$SDR_UDEV_RULE" ]; then
+    fix_fine "SDR permissions (udev rule) in place"
+    return 0
+  fi
+  if fix_problem "The udev rule that lets xng open the SDRs is missing, so xng gets \"permission denied\"." \
+      "write ${SDR_UDEV_RULE} and reload udev." \
+      "Add the udev rule?"; then
+    install_sdr_udev_rule
+    sudo usermod -aG plugdev xng 2>/dev/null || true
+    fix_done "Added ${SDR_UDEV_RULE}. If xng still can't open an SDR, unplug it and plug it back in."
+    FIX_RESTART=true
+  fi
+}
+
+# station.toml names SDRs by serial. When an SDR is swapped (or its serial
+# rewritten with rtl_eeprom), xng can't find it: point that job at the SDR
+# that is plugged in instead, when there's exactly one candidate.
+sdr_kind_label() {
+  case "$1" in
+    rtlsdr) echo RTL-SDR ;; airspy) echo Airspy ;; airspyhf) echo "Airspy HF+" ;;
+    hackrf) echo HackRF ;; sdrplay) echo SDRplay ;; *) echo "$1" ;;
+  esac
+}
+
+fix_sdr_serials() {
+  local toml="${XNG_CONFIG_DIR}/station.toml"
+  [ -r "$toml" ] || return 0
+  detect_rtlsdr_serials
+  detect_xng_sdrs
+  local -a wanted=() missing=()
+  local sel kind serial s
+  while IFS= read -r sel; do
+    [[ "$sel" =~ driver=([a-z]+),serial=([^,\"]+) ]] || continue
+    wanted+=("${BASH_REMATCH[1]}|${BASH_REMATCH[2]}")
+  done < <(sed -n 's/^sdr *= *"\(.*\)"/\1/p' "$toml")
+  [ ${#wanted[@]} -gt 0 ] || { fix_fine "station.toml names no SDRs by serial"; return 0; }
+  for s in "${wanted[@]}"; do
+    printf '%s\n' "${XNG_SDRS[@]}" | grep "^${s}|" >/dev/null || missing+=("$s")
+  done
+  if [ ${#missing[@]} -eq 0 ]; then
+    fix_fine "Every SDR in station.toml is plugged in"
+    return 0
+  fi
+  local m new k cands
+  local label
+  for m in "${missing[@]}"; do
+    kind="${m%%|*}"; serial="${m#*|}"; label=$(sdr_kind_label "$kind")
+    # Plugged-in SDRs of that kind that no job uses yet
+    cands=()
+    for k in "${XNG_SDRS[@]}"; do
+      [ "$(sdr_field "$k" 0)" = "$kind" ] || continue
+      s="${kind}|$(sdr_field "$k" 1)"
+      printf '%s\n' "${wanted[@]}" | grep -xF "$s" >/dev/null || cands+=("$(sdr_field "$k" 1)")
+    done
+    local nmiss
+    nmiss=$(printf '%s\n' "${missing[@]}" | grep -c "^${kind}|")
+    new="${cands[0]:-}"
+    if [ ${#cands[@]} -eq 1 ] && [ "$nmiss" -eq 1 ] && [ "$new" != unknown ] &&
+       [[ "$serial" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$new" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      if fix_problem "station.toml has a job for the ${label} with serial ${serial}, which isn't plugged in. The ${label} with serial ${new} is plugged in and has no job." \
+          "give serial ${new} that job in ${toml} (the old file is kept as station.toml.bak)." \
+          "Use the SDR with serial ${new}?"; then
+        sudo cp "$toml" "${toml}.bak"
+        sudo sed -i "s/^sdr *= *\"driver=${kind},serial=${serial//./\\.}\"/sdr = \"driver=${kind},serial=${new}\"/" "$toml"
+        fix_done "The job for ${serial} now uses ${new}"
+        FIX_RESTART=true
+      fi
+    elif [ ${#cands[@]} -eq 0 ]; then
+      fix_manual "station.toml has a job for the ${label} with serial ${serial}, which isn't plugged in." \
+        "plug it in, or run the installer again to give the SDRs here their jobs: curl -sSL https://install.airframes.sh/installer | bash"
+    else
+      fix_manual "station.toml has a job for the ${label} with serial ${serial}, which isn't plugged in, and more than one other ${label} could take it (${cands[*]})." \
+        "run the installer again and pick which SDR does what: curl -sSL https://install.airframes.sh/installer | bash"
+    fi
+  done
+}
+
+# The weekly update timer: both units there, the timer enabled, the last
+# run not failed
+fix_auto_update() {
+  have_systemd || return 0
+  local d=/etc/systemd/system timer="${AUTO_UPDATE_UNIT}.timer" svc="${AUTO_UPDATE_UNIT}.service" why=""
+  if [ ! -f "$d/$timer" ] && [ ! -f "$d/$svc" ]; then
+    fix_fine "Automatic updates off (turn on with: auto-update on)"
+    return 0
+  fi
+  if [ ! -f "$d/$timer" ] || [ ! -f "$d/$svc" ]; then why="one of its two systemd units is missing"
+  elif ! systemctl is-enabled --quiet "$timer" 2>/dev/null; then why="its timer isn't enabled, so it never runs"
+  elif systemctl is-failed --quiet "$svc" 2>/dev/null; then why="its last run failed"
+  elif ! grep -q 'install.airframes.sh/installer' "$d/$svc"; then why="its service doesn't run the installer"
+  fi
+  if [ -z "$why" ]; then
+    fix_fine "Automatic updates on (weekly)"
+    return 0
+  fi
+  if [ "$why" = "its last run failed" ]; then
+    local log; log=$(sudo journalctl -u "$svc" -n 6 --no-pager -o cat 2>/dev/null || true)
+    [ -n "$log" ] && { echo "  Last run:"; echo "$log" | sed 's/^/    /'; }
+  fi
+  if fix_problem "The weekly xng update is broken: ${why}." \
+      "write its timer and service again and enable them (run \"update\" to see an update error right away)." \
+      "Set up the weekly update again?"; then
+    sudo systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+    enable_auto_update >/dev/null
+    if systemctl is-enabled --quiet "$timer" 2>/dev/null; then fix_done "The weekly update is set up again"
+    else fix_failed "Couldn't enable ${timer}; see: systemctl status ${timer}"; fi
+  fi
+}
+
+# The station itself: installed as a service or container that is enabled
+# and running. Runs last, so it also restarts xng for the fixes above.
+fix_service() {
+  local where state
+  where=$(xng_runs_where)
+  state=$(xng_service_state)
+  if [ "$where" = native ] && ! have_systemd; then
+    fix_fine "xng service not checked (systemd isn't running here)"
+    return 0
+  fi
+  if [ "$where" = docker ] && [ "$state" = missing ]; then state=stopped; fi
+  case "$state" in
+    active|restarting)
+      local enabled=true
+      [ "$where" = native ] && ! systemctl is-enabled --quiet xng-station 2>/dev/null && enabled=false
+      if [ "$enabled" = false ]; then
+        if fix_problem "xng is running, but the xng-station service isn't enabled, so it won't start after a reboot." \
+            "enable it (systemctl enable xng-station)." "Enable the service?"; then
+          sudo systemctl enable xng-station >/dev/null 2>&1 || true
+          fix_done "xng starts at boot again"
+        fi
+      fi
+      if [ "$FIX_RESTART" = true ]; then
+        if fix_problem "xng needs a restart to use the fixes above." "restart it." "Restart xng?"; then
+          xng_restart_station
+          FIX_DONE=$((FIX_DONE + 1))
+          FIX_CHECK=true
+        fi
+      elif [ "$state" = restarting ]; then
+        fix_manual "xng keeps restarting." "see the log hints below, or run the installer with \"status\" and paste the report in the Airframes Discord."
+        FIX_CHECK=true
+      else
+        fix_fine "xng is running ($where)"
+      fi
+      ;;
+    *)
+      if fix_problem "xng isn't running (${state})." \
+          "start it again$([ "$where" = native ] && echo " (systemctl reset-failed, enable and restart xng-station)" || echo " (docker compose up -d)")." \
+          "Start xng?"; then
+        if [ "$where" = native ]; then
+          sudo systemctl reset-failed xng-station >/dev/null 2>&1 || true
+          sudo systemctl enable xng-station >/dev/null 2>&1 || true
+          sudo systemctl restart xng-station 2>/dev/null || true
+        else
+          (cd "${CONFIG_DIR}/xng" && sudo docker compose up -d >/dev/null 2>&1) ||
+            sudo docker start xng-station >/dev/null 2>&1 || true
+        fi
+        FIX_DONE=$((FIX_DONE + 1))
+        FIX_CHECK=true
+      fi
+      ;;
+  esac
+}
+FIX_CHECK=false      # xng was (re)started: check that it came up
+
+cmd_fix() {
+  local where
+  where=$(xng_runs_where)
+  if [ -z "$where" ]; then
+    err "No xng station here yet. Run the installer without \"fix\" to set one up."
+    return 1
+  fi
+  step "Looking for problems"
+  fix_clock
+  fix_dvb_driver
+  fix_udev_rule
+  fix_sdr_serials
+  fix_auto_update
+  fix_service
+  if [ "$FIX_CHECK" = true ]; then
+    verify_xng_station
+    if [ "$XNG_HEALTH" = failed ]; then FIX_LEFT=$((FIX_LEFT + 1)); FIX_DONE=$((FIX_DONE > 0 ? FIX_DONE - 1 : 0)); fi
+  fi
+  echo
+  if [ "$FIX_FOUND" -eq 0 ]; then
+    ok "Nothing to fix."
+  elif [ "$FIX_LEFT" -eq 0 ]; then
+    ok "Fixed ${FIX_DONE} of ${FIX_FOUND} problem$([ "$FIX_FOUND" -eq 1 ] || echo s)."
+  else
+    warn "${FIX_LEFT} of ${FIX_FOUND} problem$([ "$FIX_FOUND" -eq 1 ] || echo s) left. For help, run the installer with \"status\" and paste the report in the Airframes Discord:"
+    echo -e "    ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- status${RESET}"
+    return 1
+  fi
+  return 0
+}
+
 run_command() {
   case "$COMMAND" in
     status)    cmd_status ;;
@@ -3984,6 +4304,7 @@ run_command() {
     signin)    show_banner; cmd_signin ;;
     restoredecoders) show_banner; cmd_restore_decoders ;;
     autoupdate) cmd_auto_update ;;
+    fix)       show_banner; cmd_fix || exit 1 ;;
   esac
 }
 
@@ -5092,6 +5413,10 @@ What to set up:
   status      Check the station and print a report to paste when asking
               for help (no passwords or tokens in it)
   update      Update xng to the latest release, keeping its configuration
+  fix         Find and repair common problems: xng stopped or failed, SDR
+              permissions, the TV tuner driver, the clock, an SDR whose
+              serial changed, the weekly update. Asks before each fix (-y
+              applies them all)
   sign-in     Sign in to Airframes and put this station on your account
               (for a station set up without signing in)
   auto-update on|off
@@ -5149,6 +5474,7 @@ Examples:
   curl -sSL https://install.airframes.sh/installer | bash -s -- -y xng --no-sign-in --modes "0=acars,1=vdl2"
   curl -sSL https://install.airframes.sh/installer | bash -s -- status
   curl -sSL https://install.airframes.sh/installer | bash -s -- update
+  curl -sSL https://install.airframes.sh/installer | bash -s -- fix
   curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders
   curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
   curl -sSL https://install.airframes.sh/installer | bash -s -- -y acarsdec --station-id MY-STATION
@@ -5235,6 +5561,7 @@ parse_args() {
       uninstall|remove) COMMAND=uninstall; shift ;;
       --purge)          PURGE=true; shift ;;
       signin|sign-in|login) COMMAND=signin; shift ;;
+      fix|repair)       COMMAND=fix; shift ;;
       restore-decoders|switch-back) COMMAND=restoredecoders; shift ;;
       migrate)          WANT_XNG=true; shift ;;
       --keep-old-decoders) KEEP_OLD_DECODERS=true; WANT_XNG=true; shift ;;

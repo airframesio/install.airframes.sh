@@ -36,6 +36,9 @@ jobs:
           grep -q "xng:      not installed" status.txt
           bash -s -- -y uninstall < installer > uninstall.txt
           grep -q "nothing to remove" uninstall.txt
+          # fix with no station: explains and fails
+          if bash -s -- -y fix < installer > fix.txt 2>&1; then exit 1; fi
+          grep -q "No xng station here yet" fix.txt
           # Unknown arguments must fail
           if ./installer --no-such-flag >/dev/null 2>&1; then exit 1; fi
 
