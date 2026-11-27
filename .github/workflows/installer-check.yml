@@ -1,0 +1,40 @@
+name: Installer check
+
+on:
+  pull_request:
+    paths: ['installer', '.github/workflows/installer-check.yml']
+  push:
+    branches: [main]
+    paths: ['installer', '.github/workflows/installer-check.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax
+        run: bash -n installer
+
+      - name: ShellCheck (errors)
+        run: shellcheck -S error installer
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./installer --version > version.txt
+          grep -q "Airframes Installer v" version.txt
+          ./installer --help > help.txt
+          grep -q "status" help.txt
+          # Piped like the one-liner, on a machine without a station
+          bash -s -- status < installer > status.txt
+          cat status.txt
+          grep -q "xng:      not installed" status.txt
+          bash -s -- -y uninstall < installer > uninstall.txt
+          grep -q "nothing to remove" uninstall.txt
+          # Unknown arguments must fail
+          if ./installer --no-such-flag >/dev/null 2>&1; then exit 1; fi
