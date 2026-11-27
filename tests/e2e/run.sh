@@ -6,7 +6,7 @@
 set -u
 cd "$(dirname "$0")/../.."
 IMAGE="${E2E_IMAGE:-python:3.11-slim-bookworm}"
-ALL="unattended signin qr sign-in-later port-taken failed status update update-fails auto-update uninstall checksum checksum-bad feed-check preflight report report-off report-failed report-not-running report-ask"
+ALL="unattended signin qr sign-in-later port-taken failed status update update-fails auto-update uninstall checksum checksum-bad feed-check preflight fix-healthy fix-service fix-ask fix-drivers fix-serial fix-clock fix-auto-update fix-none migrate-systemd migrate-docker migrate-compose keep-old report report-off report-failed report-not-running report-ask"
 fail=0
 for s in ${*:-$ALL}; do
   out=$(timeout 300 docker run --rm -v "$PWD:/t:ro" "$IMAGE" bash /t/tests/e2e/scenario.sh "$s" 2>&1)
