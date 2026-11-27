@@ -96,6 +96,8 @@ case "$1" in
     out=$(run sign-in); echo "$out"
     check "airband atc added" 'grep -q "^\[outputs.airband.atc\]" $TOML'
     check "xng restarted" 'grep -q "restart xng-station" /tmp/fake/systemctl.log'
+    out=$(run -y sign-in --station-id NEW-STATION); echo "$out"
+    check "renamed with --station-id" 'grep -q "^station-id = \"NEW-STATION\"" $TOML'
     ;;
   port-taken)
     python3 -m http.server 8080 >/dev/null 2>&1 & sleep 1
@@ -138,6 +140,7 @@ case "$1" in
     out=$(run -y xng --no-sign-in --auto-update --modes 00000001=acars,00000002=vdl2); echo "$out"
     check "timer written" 'grep -q "OnCalendar=weekly" /etc/systemd/system/airframes-xng-update.timer'
     check "timer enabled" '[ -f /tmp/fake/enabled-airframes-xng-update.timer ]'
+    check "config dir kept" 'grep -q "^Environment=\"XNG_CONFIG_DIR=/etc/xng\"" /etc/systemd/system/airframes-xng-update.service'
     out=$(run auto-update off); echo "$out"
     check "timer removed" '[ ! -e /etc/systemd/system/airframes-xng-update.timer ]'
     ;;

@@ -10,8 +10,9 @@ ALL="unattended signin sign-in-later port-taken failed status update update-fail
 fail=0
 for s in ${*:-$ALL}; do
   out=$(timeout 300 docker run --rm -v "$PWD:/t:ro" "$IMAGE" bash /t/tests/e2e/scenario.sh "$s" 2>&1)
-  if echo "$out" | grep -q '^ASSERT FAIL' || ! echo "$out" | grep -q '^ASSERT ok'; then
-    echo "FAIL $s"; echo "$out" | sed 's/^/    /'; fail=1
+  rc=$?
+  if [ "$rc" -ne 0 ] || echo "$out" | grep -q '^ASSERT FAIL' || ! echo "$out" | grep -q '^ASSERT ok'; then
+    echo "FAIL $s (exit $rc)"; echo "$out" | sed 's/^/    /'; fail=1
   else
     echo "ok   $s ($(echo "$out" | grep -c '^ASSERT ok') checks)"
   fi

@@ -2860,7 +2860,9 @@ cmd_signin() {
     exit 1
   fi
   ensure_python3 || exit 1
-  STATION_IDENT=$(toml_value station-id)
+  # --station-id renames the station; otherwise keep the one it has
+  local saved_ident; saved_ident=$(toml_value station-id)
+  [ -n "$STATION_IDENT" ] || STATION_IDENT="$saved_ident"
   local pos; pos=$(toml_value receiver-pos)
   if [ -n "$pos" ]; then STATION_LAT="${pos%%,*}"; STATION_LON="${pos#*,}"; fi
   info "Station ${BOLD}${STATION_IDENT}${RESET}"
@@ -2869,9 +2871,8 @@ cmd_signin() {
     err "Not signed in; nothing changed."
     exit 1
   fi
-  local before="$STATION_IDENT"
   register_station
-  if [ "$STATION_IDENT" != "$before" ]; then
+  if [ "$STATION_IDENT" != "$saved_ident" ]; then
     sudo sed -i "s/^station-id *= *.*/station-id = $(toml_str "$STATION_IDENT" | sed 's/[\/&]/\\&/g')/" "${XNG_CONFIG_DIR}/station.toml"
     substep "Station ID is now ${STATION_IDENT}"
   fi
@@ -2919,6 +2920,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 Environment=AIRFRAMES_NO_TTY=1
+Environment="XNG_CONFIG_DIR=${XNG_CONFIG_DIR//%/%%}"
 ExecStart=/bin/bash -c 'curl -fsSL https://install.airframes.sh/installer | bash -s -- -y --no-tui update'
 EOF
   sudo tee "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" >/dev/null << EOF
@@ -2941,6 +2943,8 @@ EOF
 disable_auto_update() {
   if [ -f "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" ]; then
     sudo systemctl disable --now "${AUTO_UPDATE_UNIT}.timer" >/dev/null 2>&1 || true
+    # An update already running would put xng back
+    sudo systemctl stop "${AUTO_UPDATE_UNIT}.service" >/dev/null 2>&1 || true
     sudo rm -f "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" "/etc/systemd/system/${AUTO_UPDATE_UNIT}.service"
     have_systemd && sudo systemctl daemon-reload
   fi
