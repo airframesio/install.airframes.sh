@@ -16,22 +16,32 @@ done
 # Stubs: packages, docker, systemd, logs, USB listing
 printf '#!/bin/sh\necho "[stub] apt-get $*" >&2\n' > /usr/local/bin/apt-get
 printf '#!/bin/sh\nexit 1\n' > /usr/local/bin/apt-cache
-cat > /usr/local/bin/docker <<'S'
-#!/bin/sh
-case "$1" in ps) exit 0;; inspect) exit 1;; esac
-[ -n "${DOCKER_FAILS:-}" ] && case "$*" in *compose*pull*|*compose*up*) exit 1;; esac
-echo "[stub] docker $*" >&2
-S
+install -m 755 "$T/fakedocker.py" /usr/local/bin/docker
+mkdir -p /tmp/fake/docker
 cat > /usr/local/bin/systemctl <<'S'
 #!/bin/sh
 echo "$*" >> /tmp/fake/systemctl.log
+q=false; [ "$2" = "--quiet" ] && q=true
+[ "$q" = true ] && u="$3" || u="$2"
 case "$1" in
-  is-active) [ "$2" = "--quiet" ] && u="$3" || u="$2"
-    case "$u" in xng-station) st=$(cat /tmp/fake/svc 2>/dev/null || echo inactive); [ "$2" = "--quiet" ] || echo "$st"; [ "$st" = active ];; *) exit 1;; esac ;;
-  is-enabled) [ "$2" = "--quiet" ] && u="$3" || u="$2"; [ -f "/tmp/fake/enabled-$u" ] ;;
-  enable) for u in "$@"; do touch "/tmp/fake/enabled-$u"; done ;;
-  disable) for u in "$@"; do rm -f "/tmp/fake/enabled-$u"; done ;;
-  restart|start) [ "$2" = xng-station ] && cp /tmp/fake/svc.next /tmp/fake/svc 2>/dev/null ;;
+  is-active)
+    case "$u" in
+      xng-station) st=$(cat /tmp/fake/svc 2>/dev/null || echo inactive) ;;
+      *) [ -f "/tmp/fake/active-$u" ] && st=active || st=inactive ;;
+    esac
+    [ "$q" = true ] || echo "$st"; [ "$st" = active ] ;;
+  is-enabled)
+    [ -f "/tmp/fake/enabled-$u" ] && st=enabled || st=disabled
+    [ "$q" = true ] || echo "$st"; [ "$st" = enabled ] ;;
+  enable|disable)
+    act="$1"; now=false; shift
+    for u in "$@"; do
+      case "$u" in --now) now=true; continue ;; -*) continue ;; esac
+      if [ "$act" = enable ]; then touch "/tmp/fake/enabled-$u"; [ "$now" = true ] && touch "/tmp/fake/active-$u"
+      else rm -f "/tmp/fake/enabled-$u"; [ "$now" = true ] && rm -f "/tmp/fake/active-$u"; fi
+    done; true ;;
+  start|restart) [ "$2" = xng-station ] && cp /tmp/fake/svc.next /tmp/fake/svc 2>/dev/null; touch "/tmp/fake/active-$2"; true ;;
+  stop) rm -f "/tmp/fake/active-$2"; [ "$2" = xng-station ] && echo inactive > /tmp/fake/svc; true ;;
   list-unit-files) exit 1 ;;
   *) true ;;
 esac
@@ -55,6 +65,23 @@ fake_release() {
 }
 fake_release 0.23.1
 export XNG_LATEST=v0.23.1
+
+
+# Decoders set up the old way: systemd units like the old installer's, and
+# containers like sdr-enthusiasts' and AIS-catcher's
+old_unit() {  # old_unit <name> <ExecStart> [enabled|stopped]
+  mkdir -p /etc/systemd/system
+  printf '[Unit]\nDescription=Airframes decoder\n\n[Service]\nExecStart=%s\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n' "$2" > "/etc/systemd/system/$1.service"
+  [ "${3:-enabled}" = enabled ] && touch "/tmp/fake/enabled-$1" "/tmp/fake/active-$1"
+  return 0
+}
+old_container() {  # old_container <name> <image> <restart> <env json> <cmd json>
+  cat > "/tmp/fake/docker/$1.json" <<J
+{"Name": "/$1", "Config": {"Image": "$2", "Env": $4, "Cmd": $5, "Entrypoint": null},
+ "State": {"Running": true}, "HostConfig": {"RestartPolicy": {"Name": "$3"}}}
+J
+}
+OLDF=/opt/airframes/config/old-decoders.tsv
 
 I='bash -s --'
 run() { echo "\$ installer $*"; bash -s -- "$@" < "$INSTALLER" 2>&1; echo "EXIT=$?"; }
@@ -180,6 +207,99 @@ case "$1" in
     check "clock warning" 'echo "$out" | grep -q "clock is off by 15 minutes"'
     out=$(run -y xng --no-sign-in --modes 00000001=acars,00000002=vdl2); echo "$out"
     check "no warning when right" '! echo "$out" | grep -q "clock is off"'
+    ;;
+  migrate-systemd)
+    # The old installer's units: acarsdec on RTL-SDR 1 (by index), dumpvdl2 by serial
+    old_unit airframes-acarsdec "acarsdec -v -o 4 -g 42 -i KE-KSEA-ACARS1 -j feed.airframes.io:5550 -r 1 131.550 131.725 130.025"
+    old_unit airframes-dumpvdl2 "dumpvdl2 --rtlsdr 00000001 --station-id KE-KSEA-VDL2 --output decoded:json:udp:address=feed.airframes.io,port=5552 136650000 136975000"
+    out=$(run -y xng --no-sign-in); echo "$out"; cat $TOML
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "found both" 'echo "$out" | grep -q "acarsdec (systemd airframes-acarsdec), running" && echo "$out" | grep -q "dumpvdl2 (systemd airframes-dumpvdl2), running"'
+    check "station ID kept" 'grep -q "^station-id = \"KE-KSEA\"" $TOML'
+    sess() { awk -v s="serial=$1" '/^\[\[session\]\]/{p=0} index($0,s){p=1} p' $TOML; }
+    check "acars on its SDR" 'sess 00000002 | grep -q "mode = \"acars\""'
+    check "acars gain" 'sess 00000002 | grep -q "^gain = 42.0"'
+    check "acars channels" 'sess 00000002 | grep -q "^channels = \[\"130.025\", \"131.550\", \"131.725\"\]"'
+    check "acars name kept" 'sess 00000002 | grep -q "^airframes-station-id = \"KE-KSEA-ACARS1\""'
+    check "vdl2 on its SDR" 'sess 00000001 | grep -q "mode = \"vdl2\""'
+    check "vdl2 channels" 'sess 00000001 | grep -q "^channels = \[\"136.650\", \"136.975\"\]"'
+    check "vdl2 needs no override" '! sess 00000001 | grep -q airframes-station-id'
+    check "units stopped" '[ ! -e /tmp/fake/enabled-airframes-acarsdec ] && [ ! -e /tmp/fake/active-airframes-dumpvdl2 ]'
+    check "units kept" '[ -f /etc/systemd/system/airframes-acarsdec.service ] && [ -f /etc/systemd/system/airframes-dumpvdl2.service ]'
+    check "recorded" 'grep -q "^systemd	airframes-acarsdec	yes	yes" $OLDF && grep -q "^systemd	airframes-dumpvdl2	yes	yes" $OLDF'
+    check "way back shown" 'echo "$out" | grep -q "Switch back: .*restore-decoders"'
+    check "names in summary" 'echo "$out" | grep -q "keep their names: KE-KSEA-VDL2, KE-KSEA-ACARS1"'
+    echo '{"KE-KSEA-ACARS1": 30}' > /tmp/fake/stations.json
+    out=$(run status); echo "$out"
+    check "status checks the kept name" 'echo "$out" | grep -q "KE-KSEA-ACARS1: last heard [0-9]* s ago$" && echo "$out" | grep -q "KE-KSEA-VDL2: not seen yet"'
+    out=$(run -y restore-decoders); echo "$out"
+    check "restore exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "xng stopped" 'grep -q "disable --now xng-station" /tmp/fake/systemctl.log'
+    check "units back" '[ -e /tmp/fake/enabled-airframes-acarsdec ] && [ -e /tmp/fake/active-airframes-acarsdec ] && [ -e /tmp/fake/active-airframes-dumpvdl2 ]'
+    check "xng kept" '[ -x /usr/local/bin/xng ] && [ -f $TOML ]'
+    check "record archived" '[ ! -e $OLDF ] && ls /opt/airframes/config/old-decoders.restored-*.tsv >/dev/null'
+    ;;
+  migrate-docker)
+    old_container airframes-dumpvdl2 ghcr.io/sdr-enthusiasts/docker-dumpvdl2:latest unless-stopped \
+      '["FEED_ID=XX-TEST-VDL2", "SERIAL=00000002", "FREQUENCIES=136650000;136975000", "GAIN=40"]' null
+    old_container ais-catcher ghcr.io/jvde-github/ais-catcher:edge always '[]' \
+      '["-d", "00000001", "-gr", "TUNER", "38.6", "-H", "https://ais.airframes.io/intake", "ID", "XX-TEST-AIS", "INTERVAL", "10"]'
+    out=$(run -y xng --no-sign-in); echo "$out"; cat $TOML
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "station ID kept" 'grep -q "^station-id = \"XX-TEST\"" $TOML'
+    sess() { awk -v s="serial=$1" '/^\[\[session\]\]/{p=0} index($0,s){p=1} p' $TOML; }
+    check "vdl2 on its SDR" 'sess 00000002 | grep -q "mode = \"vdl2\"" && sess 00000002 | grep -q "^gain = 40.0"'
+    check "ais on its SDR" 'sess 00000001 | grep -q "mode = \"ais\"" && sess 00000001 | grep -q "^gain = 38.6"'
+    check "no overrides" '! grep -q airframes-station-id $TOML'
+    check "containers stopped" 'grep -q "^stop airframes-dumpvdl2" /tmp/fake/docker.log && grep -q "^stop ais-catcher" /tmp/fake/docker.log'
+    check "no restart at boot" 'grep -q "^update --restart=no ais-catcher" /tmp/fake/docker.log'
+    check "containers kept" '! grep -q "^rm" /tmp/fake/docker.log && [ -f /tmp/fake/docker/ais-catcher.json ]'
+    check "recorded" 'grep -q "^docker	ais-catcher		yes	always" $OLDF'
+    out=$(run -y restore-decoders); echo "$out"
+    check "policy back" 'grep -q "^update --restart=always ais-catcher" /tmp/fake/docker.log && grep -q "^update --restart=unless-stopped airframes-dumpvdl2" /tmp/fake/docker.log'
+    check "started" 'grep -q "^start ais-catcher" /tmp/fake/docker.log && grep -q "^start airframes-dumpvdl2" /tmp/fake/docker.log'
+    ;;
+  migrate-compose)
+    # A compose file from the old installer that was never started, plus a
+    # wrapper-script unit (EnvironmentFile) for dumpvdl2
+    mkdir -p /opt/airframes/config/acarsdec /etc/default /usr/local/share/dumpvdl2
+    cat > /opt/airframes/config/acarsdec/docker-compose.yml <<'Y'
+version: '3.8'
+services:
+  acarsdec:
+    image: ghcr.io/sdr-enthusiasts/docker-acarsdec:latest
+    container_name: airframes-acarsdec
+    restart: unless-stopped
+    environment:
+      FEED_ID: "ZZ-HOME-ACARS"
+      FREQUENCIES: "130.025 130.450 131.125 131.550"
+      OUTPUT_SERVER: "feed.airframes.io"
+      SERIAL: "00000001"
+Y
+    printf 'SERIAL=00000002\nOPTIONS="--station-id ZZ-HOME-VDL2 --gain 39.6"\n' > /etc/default/dumpvdl2
+    printf '#!/bin/sh\n# start dumpvdl2\nexec /usr/local/bin/dumpvdl2 --rtlsdr $SERIAL $OPTIONS 136725000 136975000\n' > /usr/local/share/dumpvdl2/start.sh
+    chmod +x /usr/local/share/dumpvdl2/start.sh
+    old_unit dumpvdl2 "/usr/local/share/dumpvdl2/start.sh"
+    sed -i 's/^\[Service\]/[Service]\nEnvironmentFile=\/etc\/default\/dumpvdl2/' /etc/systemd/system/dumpvdl2.service
+    out=$(run -y xng --no-sign-in); echo "$out"; cat $TOML
+    sess() { awk -v s="serial=$1" '/^\[\[session\]\]/{p=0} index($0,s){p=1} p' $TOML; }
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "compose found" 'echo "$out" | grep -q "compose file .*acarsdec/docker-compose.yml"'
+    check "acars from compose" 'sess 00000001 | grep -q "mode = \"acars\"" && sess 00000001 | grep -q "\"130.450\""'
+    check "vdl2 from script" 'sess 00000002 | grep -q "mode = \"vdl2\"" && sess 00000002 | grep -q "^gain = 39.6" && sess 00000002 | grep -q "\"136.725\""'
+    check "station ID kept" 'grep -q "^station-id = \"ZZ-HOME\"" $TOML'
+    check "only the unit recorded" '[ "$(grep -vc "^#" $OLDF)" = 1 ] && grep -q "^systemd	dumpvdl2	" $OLDF'
+    check "compose file kept" '[ -f /opt/airframes/config/acarsdec/docker-compose.yml ]'
+    ;;
+  keep-old)
+    old_unit airframes-acarsdec "acarsdec -v -o 4 -g 42 -i KE-KSEA-ACARS1 -j feed.airframes.io:5550 -r 00000001 131.550 131.725"
+    out=$(run -y xng --no-sign-in --keep-old-decoders); echo "$out"; cat $TOML
+    check "exit 0" 'echo "$out" | grep -q "^EXIT=0"'
+    check "left running" '[ -e /tmp/fake/active-airframes-acarsdec ] && [ -e /tmp/fake/enabled-airframes-acarsdec ]'
+    check "its SDR left alone" '! grep -q "serial=00000001" $TOML && grep -q "serial=00000002" $TOML'
+    check "nothing recorded" '[ ! -e $OLDF ]'
+    out=$(run restore-decoders); echo "$out"
+    check "nothing to restore" 'echo "$out" | grep -q "nothing to restore" && echo "$out" | grep -q "^EXIT=0"'
     ;;
   *) echo "unknown scenario $1"; exit 2 ;;
 esac
