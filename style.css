@@ -174,7 +174,7 @@ header {
 
 .install-section {
   margin: 4rem auto;
-  max-width: 700px;
+  max-width: 760px;
 }
 
 .install-section h3 {
@@ -193,6 +193,7 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 1rem;
   backdrop-filter: blur(5px);
 }
 
@@ -201,6 +202,8 @@ header {
   font-size: 1rem;
   color: var(--accent-primary);
   letter-spacing: 0.02em;
+  overflow-wrap: break-word;
+  text-align: left;
 }
 
 .copy-btn {
@@ -221,6 +224,52 @@ header {
 
 .copy-btn:active {
   transform: scale(0.95);
+}
+
+.install-step {
+  color: var(--text-secondary);
+  margin: 1.5rem 0 0.75rem;
+  line-height: 1.5;
+}
+
+.install-step code,
+.install-note code {
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  color: var(--accent-primary);
+  font-size: 0.9em;
+}
+
+.install-callout {
+  border-left: 3px solid var(--accent-secondary);
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 0 8px 8px 0;
+  padding: 1rem 1.25rem;
+  margin: 1.5rem 0;
+  color: var(--text-secondary);
+  line-height: 1.5;
+  text-align: left;
+}
+
+.install-callout code {
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  color: var(--accent-primary);
+  font-size: 0.9em;
+}
+
+.install-callout a {
+  color: var(--accent-primary);
+}
+
+.install-callout strong {
+  color: var(--text-primary, #fff);
+}
+
+.install-note a {
+  color: var(--accent-primary);
+}
+
+.nowrap {
+  white-space: nowrap;
 }
 
 .install-note {

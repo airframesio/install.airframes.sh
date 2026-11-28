@@ -6,6 +6,8 @@
 # One-command setup for aviation decoders and Airframes feeding.
 #
 # Usage:
+#   curl -sSL https://install.airframes.sh/installer | bash
+#   curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
 #   bash <(curl -sSL https://install.airframes.sh/installer)
 #   bash <(curl -sSL https://install.airframes.sh/installer) acarsdec
 #   bash <(curl -sSL https://install.airframes.sh/installer) --token <TOKEN>
@@ -42,7 +44,7 @@ fi
 # Section 2: Constants & version
 # ===========================================================================
 
-VERSION="2.1.1"
+VERSION="3.7.1"
 API_BASE="https://app.airframes.io/api/v1"
 AIRFRAMES_FEED_HOST="feed.airframes.io"
 # Private per-run build directory. A fixed path under /tmp let any other local
@@ -62,13 +64,12 @@ GITHUB_RELEASES="https://github.com/airframesio/install.airframes.sh/releases"
 # Section 3: Color & output utilities
 # ===========================================================================
 
-if [ -t 1 ] && [ -t 0 ]; then
-  IS_TTY=true
-else
-  IS_TTY=false
-fi
+# IS_TTY says whether there is someone to answer prompts. main() sets it,
+# after the entry point has pointed stdin at the terminal (see the end of the
+# file). Colors only need stdout to be a terminal.
+IS_TTY=false
 
-if [ "$IS_TTY" = true ]; then
+if [ -t 1 ]; then
   BOLD="\033[1m"
   DIM="\033[2m"
   ITALIC="\033[3m"
@@ -111,15 +112,46 @@ SELECTED_DECODERS=()
 SELECTED_METHOD="binary" # binary, source, docker, package
 SELECTED_REGION=""
 SELECTED_SDR="rtlsdr"
+SDR_DEVICE=""            # RTL-SDR index or serial; empty = pick automatically
+SDR_DEVICE_SET_BY_USER=false
+SDR_INDEX=""             # resolved from SDR_DEVICE; empty = unknown
+SDR_SERIAL=""
+RTLSDR_ORDER_KNOWN=false # true when rtl_test gave librtlsdr's own order
+WANT_XNG=false           # set up the xng station (recommended)
+COMMAND=""               # status, update or uninstall
+PURGE=false              # uninstall --purge
+AUTO_UPDATE=""           # --auto-update yes/no; empty asks
+XNG_HTTP_PORT=8080
+XNG_METRICS_PORT=9090
+WANT_ADSB=false          # feed ADS-B to Airframes' partners (Airframes doesn't ingest it)
+ADSB_LAT=""
+ADSB_LON=""
+ADSB_ALT=""
+ADSB_NAME=""
+ADSB_SDR_DEVICE=""
+PLANEWATCH_KEY=""
 STATION_IDENT=""
 FEED_HOST=""
 FEED_PORT=""
 FREQUENCIES=""
 CREATE_SERVICE=false
+NO_SERVICE=false         # --no-service: print the run command, create no service
 SHOW_RUN_CMD=true
 
 # Detected SDRs
 declare -a DETECTED_SDRS=()
+
+# Detected software already on this machine (see detect_existing_setup)
+declare -a ADSB_SOFTWARE=()
+declare -a ACARS_SOFTWARE=()
+declare -a ADSB_DEVICES=()   # RTL-SDR indexes/serials named in ADS-B configs
+declare -a RTLSDR_SERIALS=() # serials of plugged-in RTL-SDRs, in USB order
+
+# Running as root without sudo (minimal images, some Pi setups): run the
+# commands directly instead of failing on every "sudo ...".
+if [ "$(id -u)" -eq 0 ] && ! command -v sudo >/dev/null 2>&1; then
+  sudo() { "$@"; }
+fi
 
 # ===========================================================================
 # Section 5: Package manager abstraction
@@ -151,6 +183,8 @@ pkg_translate() {
         zlib-dev)        echo "zlib1g-dev" ;;
         docker)          echo "docker.io" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     dnf)
@@ -175,6 +209,8 @@ pkg_translate() {
         zlib-dev)        echo "zlib-devel" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     pacman)
@@ -199,6 +235,8 @@ pkg_translate() {
         zlib-dev)        echo "zlib" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     apk)
@@ -223,6 +261,8 @@ pkg_translate() {
         zlib-dev)        echo "zlib-dev" ;;
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "libqrencode-tools" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
     brew)
@@ -247,6 +287,8 @@ pkg_translate() {
         zlib-dev)        echo "" ;; # system provided
         docker)          echo "docker" ;;
         docker-compose)  echo "docker-compose" ;;
+        qrencode)        echo "qrencode" ;;
+        *)               echo "$generic" ;;
       esac
       ;;
   esac
@@ -272,7 +314,12 @@ pkg_install() {
 
   case "$PKG" in
     apt)
-      sudo apt-get install -y -qq "${pkgs[@]}"
+      # A fresh or long-idle system has no or stale package lists: refresh
+      # them and try again when the first attempt fails
+      if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"; then
+        sudo apt-get update -qq || true
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}"
+      fi
       ;;
     dnf)
       sudo dnf install -y -q "${pkgs[@]}"
@@ -361,8 +408,11 @@ detect_distro() {
 
   # Linux distro detection
   if [ -f /etc/os-release ]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
+    # Read only ID and ID_LIKE: sourcing the file would overwrite our VERSION
+    # (it sets VERSION="12 (bookworm)" and friends).
+    local ID ID_LIKE
+    ID=$(. /etc/os-release && echo "${ID:-}")
+    ID_LIKE=$(. /etc/os-release && echo "${ID_LIKE:-}")
     case "$ID" in
       debian)    DISTRO="debian" ;;
       ubuntu)    DISTRO="ubuntu" ;;
@@ -514,6 +564,13 @@ ui_choose() {
   shift
   local -a options=("$@")
 
+  # Nobody to ask: take the first (default) option.
+  if [ "$IS_TTY" != true ]; then
+    info "${prompt} ${options[0]} (default)" >&2
+    echo "${options[0]}"
+    return 0
+  fi
+
   if [ "$HAS_GUM" = true ]; then
     gum choose --header "$prompt" "${options[@]}"
   else
@@ -526,8 +583,10 @@ ui_choose() {
     echo >&2
     local choice
     while true; do
-      echo -ne "  ${BOLD}Select [1-${#options[@]}]: ${RESET}" >&2
-      read -r choice
+      echo -ne "  ${BOLD}Select [1-${#options[@]}, Enter = 1]: ${RESET}" >&2
+      read -r choice || { echo >&2; err "No answer, stopping."; exit 1; }
+      # Enter takes the first option, like the highlighted item in gum
+      [ -z "$choice" ] && choice=1
       if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
         echo "${options[$((choice-1))]}"
         return 0
@@ -537,13 +596,27 @@ ui_choose() {
   fi
 }
 
+# gum's multi-select returns nothing when Enter is pressed without ticking
+# an item, which people do all the time. Then ask again as a single choice,
+# where Enter takes the highlighted item. Esc / Ctrl-C returns non-zero.
+gum_multichoice() {
+  local prompt="$1"
+  shift
+  local picked
+  picked=$(gum choose --no-limit --header "${prompt} (x or space ticks, enter goes on)" "$@") || return 1
+  if [ -z "$picked" ]; then
+    picked=$(gum choose --header "Nothing was ticked. Pick one (enter selects):" "$@") || return 1
+  fi
+  printf '%s\n' "$picked"
+}
+
 ui_multichoice() {
   local prompt="$1"
   shift
   local -a options=("$@")
 
   if [ "$HAS_GUM" = true ]; then
-    gum choose --no-limit --header "$prompt" "${options[@]}"
+    gum_multichoice "$prompt" "${options[@]}"
   else
     echo -e "\n  ${BOLD}${prompt}${RESET}" >&2
     echo -e "  ${DIM}(Enter numbers separated by spaces, e.g., 1 3 4)${RESET}" >&2
@@ -572,6 +645,12 @@ ui_confirm() {
     return 0
   fi
 
+  # Nobody to ask: go with the default.
+  if [ "$IS_TTY" != true ]; then
+    [ "$default" = "yes" ]
+    return
+  fi
+
   if [ "$HAS_GUM" = true ]; then
     if [ "$default" = "yes" ]; then
       gum confirm --default=yes "$prompt"
@@ -582,11 +661,11 @@ ui_confirm() {
     local yn
     if [ "$default" = "yes" ]; then
       echo -ne "  ${prompt} [Y/n] " >&2
-      read -r yn
+      read -r yn || yn=""
       [[ ! "$yn" =~ ^[Nn] ]]
     else
       echo -ne "  ${prompt} [y/N] " >&2
-      read -r yn
+      read -r yn || yn=""
       [[ "$yn" =~ ^[Yy] ]]
     fi
   fi
@@ -596,11 +675,16 @@ ui_input() {
   local prompt="$1"
   local default="${2:-}"
 
+  if [ "$IS_TTY" != true ]; then
+    echo "$default"
+    return 0
+  fi
+
   if [ "$HAS_GUM" = true ]; then
     if [ -n "$default" ]; then
-      gum input --placeholder "$prompt" --value "$default"
+      gum input --header "$prompt" --placeholder "$prompt" --value "$default"
     else
-      gum input --placeholder "$prompt"
+      gum input --header "$prompt" --placeholder "$prompt"
     fi
   else
     local val
@@ -716,6 +800,3530 @@ get_sdr_type() {
   else
     echo "rtlsdr"
   fi
+}
+
+# --- Software already on this machine -------------------------------------
+#
+# Many people run this on a box that already feeds ADS-B (PiAware, readsb,
+# FR24, ...). Airframes takes ACARS, VDL2 and HFDL, not ADS-B, so the decoder
+# installed here needs an SDR of its own, and must not grab the dongle the
+# ADS-B decoder is using.
+
+process_running() {
+  local name="$1"
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$name" 2>/dev/null; then
+    return 0
+  fi
+  # Process names in /proc are cut to 15 characters
+  grep -qxF "${name:0:15}" /proc/[0-9]*/comm 2>/dev/null
+}
+
+# RTL-SDR serial numbers in librtlsdr's index order. rtl_test lists them in
+# that order (even ones another program holds); without it, sysfs gives the
+# USB bus order, which is usually but not always the same.
+detect_rtlsdr_serials() {
+  RTLSDR_SERIALS=()
+  RTLSDR_ORDER_KNOWN=false
+  if [ -z "${AIRFRAMES_SYSFS_USB:-}" ] && command -v rtl_test >/dev/null 2>&1; then
+    local line
+    while IFS= read -r line; do
+      # "  0:  Realtek, RTL2838UHIDIR, SN: 00001090"
+      if [[ "$line" =~ ^[[:space:]]*[0-9]+:.*SN:[[:space:]]*([^[:space:]]*) ]]; then
+        RTLSDR_SERIALS+=("${BASH_REMATCH[1]:-unknown}")
+      fi
+    done < <(timeout 5 rtl_test -d 9999 2>&1 || true)
+    if [ ${#RTLSDR_SERIALS[@]} -gt 0 ]; then
+      RTLSDR_ORDER_KNOWN=true
+      return 0
+    fi
+  fi
+  local usb="${AIRFRAMES_SYSFS_USB:-/sys/bus/usb/devices}"
+  [ -d "$usb" ] || return 0
+  local dev vid pid serial
+  for dev in "$usb"/*; do
+    [ -f "$dev/idVendor" ] && [ -f "$dev/idProduct" ] || continue
+    vid=$(cat "$dev/idVendor" 2>/dev/null) || continue
+    pid=$(cat "$dev/idProduct" 2>/dev/null) || continue
+    case "${vid}:${pid}" in
+      0bda:2838|0bda:2832)
+        serial=$(cat "$dev/serial" 2>/dev/null || true)
+        RTLSDR_SERIALS+=("${serial:-unknown}")
+        ;;
+    esac
+  done
+}
+
+# RTL-SDR devices (index or serial) that ADS-B decoder configs ask for.
+detect_adsb_devices() {
+  ADSB_DEVICES=()
+  local f line
+  for f in /etc/default/dump1090-fa /etc/default/dump978-fa /etc/default/readsb \
+           /etc/default/dump1090-mutability /etc/default/dump1090 \
+           /boot/piaware-config.txt /boot/firmware/piaware-config.txt; do
+    [ -r "$f" ] || continue
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      # RECEIVER_SERIAL=00001090, --device 1090, --device-index 0,
+      # --sdr driver=rtlsdr,serial=00000978, rtlsdr-device-index 0
+      if [[ "$line" =~ RECEIVER_SERIAL=\"?([A-Za-z0-9._-]+) ]] ||
+         [[ "$line" =~ --device(-index)?[=[:space:]]+\"?([A-Za-z0-9._-]+) ]] ||
+         [[ "$line" =~ serial=([A-Za-z0-9._-]+) ]] ||
+         [[ "$line" =~ rtlsdr-device-index[[:space:]]+([0-9]+) ]]; then
+        local m="${BASH_REMATCH[${#BASH_REMATCH[@]}-1]}"
+        [ -n "$m" ] && ADSB_DEVICES+=("$m")
+      fi
+    done < "$f"
+  done
+}
+
+detect_existing_setup() {
+  ADSB_SOFTWARE=()
+  ACARS_SOFTWARE=()
+  [ "$OS" = "linux" ] || return 0
+
+  local name
+  for name in piaware dump1090-fa dump1090-mutability dump1090 readsb dump978-fa \
+              fr24feed rbfeeder pfclient adsbexchange-feed mlat-client tar1090; do
+    process_running "$name" && ADSB_SOFTWARE+=("$name")
+  done
+  for name in acarsdec dumpvdl2 dumphfdl vdlm2dec AIS-catcher acars_router; do
+    process_running "$name" && ACARS_SOFTWARE+=("$name")
+  done
+
+  # Docker setups (sdr-enthusiasts ultrafeeder, ACARS Hub, ...), if docker
+  # can be asked without a password.
+  if command -v docker >/dev/null 2>&1; then
+    local line
+    while IFS= read -r line; do
+      case "$line" in
+        *ultrafeeder*|*readsb*|*piaware*|*dump978*|*fr24*|*tar1090*|*adsb*)
+          ADSB_SOFTWARE+=("docker:${line%% *}") ;;
+        *acarshub*|*acarsdec*|*dumpvdl2*|*dumphfdl*|*vdlm2dec*|*acars_router*|*ais-catcher*|*aiscatcher*|*shipfeeder*)
+          ACARS_SOFTWARE+=("docker:${line%% *}") ;;
+      esac
+    done < <(timeout 5 docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null || true)
+  fi
+
+  detect_rtlsdr_serials
+  detect_adsb_devices
+}
+
+# Is this RTL-SDR (index $1, serial $2) one an ADS-B decoder is set to use?
+rtlsdr_used_by_adsb() {
+  local idx="$1" serial="$2" d
+  for d in "${ADSB_DEVICES[@]}"; do
+    [ "$d" = "$idx" ] && return 0
+    [ "$d" = "$serial" ] && return 0
+  done
+  # Common naming for dedicated ADS-B / UAT dongles
+  case "$serial" in
+    *1090*|*978*) return 0 ;;
+  esac
+  return 1
+}
+
+# Choose which RTL-SDR the Airframes decoder should open, leaving the ADS-B
+# dongle alone. Sets SDR_DEVICE to an index (librtlsdr numbering).
+# Returns 1 when ADS-B appears to use every RTL-SDR, 2 when ADS-B runs but
+# we can't tell which dongle it holds.
+pick_sdr_device() {
+  if [ "$SDR_DEVICE_SET_BY_USER" = true ]; then
+    resolve_sdr_device
+    return 0
+  fi
+  [ "${SELECTED_SDR:-rtlsdr}" = "rtlsdr" ] || return 0
+
+  local count=${#RTLSDR_SERIALS[@]}
+  if [ "$count" -eq 0 ]; then
+    SDR_DEVICE="0"
+    resolve_sdr_device
+    return 0
+  fi
+
+  local adsb_active=false
+  { [ ${#ADSB_SOFTWARE[@]} -gt 0 ] || [ "$WANT_ADSB" = true ]; } && adsb_active=true
+
+  local i free_idx="" claimed=0
+  for i in "${!RTLSDR_SERIALS[@]}"; do
+    if [ "$adsb_active" = true ] && rtlsdr_used_by_adsb "$i" "${RTLSDR_SERIALS[$i]}"; then
+      claimed=$((claimed + 1))
+      continue
+    fi
+    [ -z "$free_idx" ] && free_idx="$i"
+  done
+
+  if [ -z "$free_idx" ]; then
+    SDR_DEVICE=""
+    return 1
+  fi
+
+  # A running ADS-B decoder holds one of several dongles: be sure which.
+  if [ ${#ADSB_SOFTWARE[@]} -gt 0 ] && [ "$count" -ge 2 ]; then
+    # Nothing names the ADS-B dongle (Docker, or a config without a device)
+    [ "$claimed" -eq 0 ] && return 2
+    # A config names it by index, and the index order is a guess
+    if [ "$RTLSDR_ORDER_KNOWN" != true ]; then
+      local d s known
+      for d in "${ADSB_DEVICES[@]}"; do
+        [[ "$d" =~ ^[0-9]+$ ]] || continue
+        known=false
+        for s in "${RTLSDR_SERIALS[@]}"; do [ "$s" = "$d" ] && known=true; done
+        [ "$known" = true ] || return 2
+      done
+    fi
+  fi
+
+  SDR_DEVICE="$free_idx"
+  resolve_sdr_device
+  return 0
+}
+
+# Is serial $1 one only one dongle has?
+rtlsdr_serial_unique() {
+  local s="$1"
+  [ -n "$s" ] && [ "$s" != "unknown" ] || return 1
+  [ "$(printf '%s\n' "${RTLSDR_SERIALS[@]}" | grep -cxF -- "$s")" -eq 1 ]
+}
+
+# Split SDR_DEVICE (an index or a serial) into SDR_INDEX and SDR_SERIAL,
+# each empty when unknown.
+resolve_sdr_device() {
+  SDR_INDEX=""
+  SDR_SERIAL=""
+  local dev="$SDR_DEVICE" i
+  [ -n "$dev" ] || return 0
+  # A serial wins over an index: "00000001" is a serial when a dongle has it
+  for i in "${!RTLSDR_SERIALS[@]}"; do
+    if [ "${RTLSDR_SERIALS[$i]}" = "$dev" ]; then
+      SDR_SERIAL="$dev"
+      rtlsdr_serial_unique "$dev" && SDR_INDEX="$i"
+      return 0
+    fi
+  done
+  if [[ "$dev" =~ ^[0-9]+$ ]]; then
+    SDR_INDEX="$dev"
+    if [ "$dev" -lt ${#RTLSDR_SERIALS[@]} ] && rtlsdr_serial_unique "${RTLSDR_SERIALS[$dev]}"; then
+      SDR_SERIAL="${RTLSDR_SERIALS[$dev]}"
+    fi
+  else
+    SDR_SERIAL="$dev"
+  fi
+}
+
+# What to pass to acarsdec -r, vdlm2dec -r, dumpvdl2 --rtlsdr and readsb
+# --device. They read an all-digit value as an index, so a serial such as
+# 00000001 is only passed when it has a letter in it.
+rtl_device_arg() {
+  if [ -n "$SDR_SERIAL" ] && [[ ! "$SDR_SERIAL" =~ ^[0-9]+$ ]]; then
+    echo "$SDR_SERIAL"
+  elif [ -n "$SDR_INDEX" ]; then
+    echo "$SDR_INDEX"
+  elif [ -n "$SDR_SERIAL" ]; then
+    echo "$SDR_SERIAL"
+  else
+    echo "0"
+  fi
+}
+
+# SoapySDR (dumphfdl) picks an RTL-SDR by serial only.
+soapy_rtl_arg() {
+  if [ -n "$SDR_SERIAL" ]; then
+    echo "driver=rtlsdr,serial=${SDR_SERIAL}"
+  else
+    echo "driver=rtlsdr"
+  fi
+}
+
+# For messages: "0 (serial 00000001)"
+sdr_device_label() {
+  if [ -n "$SDR_INDEX" ] && [ -n "$SDR_SERIAL" ]; then
+    echo "${SDR_INDEX} (serial ${SDR_SERIAL})"
+  elif [ -n "$SDR_SERIAL" ]; then
+    echo "serial ${SDR_SERIAL}"
+  else
+    echo "${SDR_INDEX:-0}"
+  fi
+}
+
+join_by() {
+  local sep="$1" out="" item
+  shift
+  for item in "$@"; do out+="${out:+$sep}${item}"; done
+  echo "$out"
+}
+
+# Explain what is already on the machine.
+show_existing_setup() {
+  if [ ${#ADSB_SOFTWARE[@]} -gt 0 ]; then
+    echo
+    info "Found ADS-B software on this machine: ${BOLD}$(join_by ', ' "${ADSB_SOFTWARE[@]}")${RESET}"
+    echo -e "  Airframes doesn't ingest ADS-B itself; it goes to Airframes' partners"
+    echo -e "  ${BOLD}Airplanes.Live${RESET} and ${BOLD}Plane Watch${RESET}, from the decoder you already run."
+    echo -e "  ACARS, VDL2, HFDL and airband voice for Airframes need another SDR."
+  fi
+
+  if [ ${#ACARS_SOFTWARE[@]} -gt 0 ]; then
+    echo
+    info "Found ACARS/VDL2/HFDL software already running: ${BOLD}$(join_by ', ' "${ACARS_SOFTWARE[@]}")${RESET}"
+    echo -e "  Setting up xng offers to take it over, keeping station names and SDRs"
+    echo -e "  (and switching back is one command). Or keep feeding Airframes from it:"
+    echo -e "  ${DIM}https://docs.airframes.io/docs/feeding/how${RESET}"
+  fi
+  return 0
+}
+
+check_existing_setup() {
+  detect_existing_setup
+  show_existing_setup
+}
+
+# Once the decoders are chosen: pick the RTL-SDR for the ACARS/VDL2/HFDL
+# decoders, leaving ADS-B dongles alone. Asks when it can't tell; an
+# unattended run stops instead of guessing (--device overrides).
+check_sdr_for_decoders() {
+  report_step sdr-check
+  [ ${#SELECTED_DECODERS[@]} -gt 0 ] || return 0
+  if [ "${SELECTED_SDR:-rtlsdr}" != "rtlsdr" ]; then
+    [ -n "$SDR_DEVICE" ] || SDR_DEVICE="0"
+    return 0
+  fi
+
+  local interactive=false
+  [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ] && interactive=true
+
+  local rc=0
+  pick_sdr_device || rc=$?
+  local n=${#RTLSDR_SERIALS[@]}
+
+  if [ "$rc" -eq 2 ]; then
+    warn "Found ${n} RTL-SDRs and ADS-B software (${ADSB_SOFTWARE[*]}), but can't tell which dongle ADS-B uses."
+    if [ "$interactive" = true ]; then
+      local -a opts=()
+      local i
+      for i in "${!RTLSDR_SERIALS[@]}"; do
+        opts+=("Device ${i}, serial ${RTLSDR_SERIALS[$i]}")
+      done
+      local pick
+      pick=$(ui_choose "Which RTL-SDR should ${SELECTED_DECODERS[*]} use (not the ADS-B one)?" "${opts[@]}")
+      pick="${pick#Device }"
+      SDR_DEVICE="${pick%%,*}"
+      resolve_sdr_device
+      ok "${SELECTED_DECODERS[*]} will use RTL-SDR $(sdr_device_label)"
+      return 0
+    fi
+    err "Stopped so the ADS-B dongle isn't taken. Pass --device <index|serial> to choose one."
+    exit 1
+  fi
+
+  # A new ADS-B decoder installed in this run needs a dongle too
+  local adsb_needs_sdr=false
+  if [ "$WANT_ADSB" = true ] && ! adsb_source_ready; then
+    adsb_needs_sdr=true
+  fi
+
+  local blocked=false
+  if [ "$rc" -eq 1 ]; then
+    warn "Found ${n} RTL-SDR(s) (serial $(join_by ', ' "${RTLSDR_SERIALS[@]}")), and ADS-B appears to use all of them."
+    warn "Plug in another SDR for ${SELECTED_DECODERS[*]}, or pass --device <index|serial> if this is wrong."
+    blocked=true
+  elif [ "$adsb_needs_sdr" = true ] && [ "$n" -lt 2 ] && [ "$SDR_DEVICE_SET_BY_USER" = false ]; then
+    warn "ADS-B and ${SELECTED_DECODERS[*]} each need their own SDR, and only ${n} RTL-SDR is plugged in."
+    blocked=true
+  elif [ "$SDR_DEVICE_SET_BY_USER" = true ]; then
+    info "${SELECTED_DECODERS[*]} will use RTL-SDR $(sdr_device_label), as set with --device."
+  elif [ "$n" -gt 0 ] && { [ ${#ADSB_SOFTWARE[@]} -gt 0 ] || [ "$adsb_needs_sdr" = true ]; }; then
+    ok "RTL-SDRs: $(join_by ', ' "${RTLSDR_SERIALS[@]}"). ${SELECTED_DECODERS[*]} will use $(sdr_device_label), leaving ADS-B its own."
+  fi
+
+  if [ "$blocked" = true ]; then
+    if [ "$interactive" = true ]; then
+      echo
+      if ! ui_confirm "Install anyway (you can plug in another SDR later)?" "yes"; then
+        REPORT_ARMED=false; info "Stopped. Nothing was installed."
+        exit 0
+      fi
+    else
+      err "Stopped so the ADS-B dongle isn't taken. Pass --device <index|serial> to use one anyway."
+      exit 1
+    fi
+  fi
+  [ -n "$SDR_DEVICE" ] || SDR_DEVICE="0"
+  resolve_sdr_device
+  if [[ " ${SELECTED_DECODERS[*]} " == *" dumphfdl "* ]] && [ -z "$SDR_SERIAL" ] && [ "${SDR_INDEX:-0}" != "0" ]; then
+    warn "dumphfdl (SoapySDR) picks an RTL-SDR by serial, and the serial of device ${SDR_INDEX} isn't known."
+    warn "It will open the first free RTL-SDR; pass --device <serial> to be sure."
+  fi
+  return 0
+}
+
+# ===========================================================================
+# Section 8b: ADS-B for Airframes' partner networks
+# ===========================================================================
+#
+# Airframes does not ingest ADS-B. When asked for "adsb", this installer
+# feeds Airframes' ADS-B partners instead:
+#   - Airplanes.Live: their feed client (github.com/airplanes-live/feed),
+#     Beast to feed.airplanes.live:30004 and MLAT to :31090. On the docker
+#     path, ultrafeeder sends both itself.
+#   - Plane Watch: their docker feeder, which needs an API key from
+#     https://atc.plane.watch.
+# The Beast data comes from the ADS-B decoder already on the machine
+# (127.0.0.1:30005), or from readsb (wiedehopf's installer) or ultrafeeder
+# installed here when there is none.
+
+AIRPLANES_LIVE_REPO="https://github.com/airplanes-live/feed.git"
+AIRPLANES_LIVE_DIR="/usr/local/share/airplanes"
+READSB_INSTALL_URL="https://raw.githubusercontent.com/wiedehopf/adsb-scripts/master/readsb-install.sh"
+PLANEWATCH_IMAGE="ghcr.io/plane-watch/docker-plane-watch:latest"
+ULTRAFEEDER_IMAGE="ghcr.io/sdr-enthusiasts/docker-adsb-ultrafeeder:latest"
+
+# Is a Beast stream already served on 127.0.0.1:30005?
+adsb_source_ready() {
+  [ "${XNG_SERVES_BEAST:-false}" = true ] && return 0
+  (exec 3<>/dev/tcp/127.0.0.1/30005) 2>/dev/null && return 0
+  [ ${#ADSB_SOFTWARE[@]} -gt 0 ]
+}
+
+# "120", "120m", "394ft" -> "120m" / "394ft" (what mlat-client and the
+# partner feeders expect). Empty on bad input.
+normalize_altitude() {
+  local a="${1// /}"
+  if [[ "$a" =~ ^-?[0-9]+(\.[0-9]+)?(m|ft)$ ]]; then echo "$a"
+  elif [[ "$a" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then echo "${a}m"
+  fi
+}
+
+valid_coord() {  # valid_coord <value> <limit>
+  [[ "$1" =~ ^-?[0-9]{1,3}(\.[0-9]+)?$ ]] && awk -v v="$1" -v l="$2" 'BEGIN { exit !(v >= -l && v <= l && v != 0) }'
+}
+
+# Antenna location and MLAT name: from options, else asked. Exits when they
+# are missing and there is nobody to ask, before anything is installed.
+adsb_collect_location() {
+  local tries
+  if [ "$IS_TTY" = true ]; then
+    if [ -z "$ADSB_LAT" ] || [ -z "$ADSB_LON" ] || [ -z "$ADSB_ALT" ]; then
+      echo
+      info "ADS-B feeds and MLAT need your antenna's position."
+      info "Partners never show the exact spot."
+    fi
+    tries=0
+    until valid_coord "$ADSB_LAT" 90; do
+      [ $((tries++)) -lt 5 ] || { err "No valid latitude, stopping."; exit 1; }
+      ADSB_LAT=$(ui_input "Antenna latitude, decimal degrees (e.g. 38.68001)")
+    done
+    tries=0
+    until valid_coord "$ADSB_LON" 180; do
+      [ $((tries++)) -lt 5 ] || { err "No valid longitude, stopping."; exit 1; }
+      ADSB_LON=$(ui_input "Antenna longitude, decimal degrees (e.g. -120.99436)")
+    done
+    tries=0
+    until [ -n "$(normalize_altitude "$ADSB_ALT")" ]; do
+      [ $((tries++)) -lt 5 ] || { err "No valid altitude, stopping."; exit 1; }
+      ADSB_ALT=$(ui_input "Antenna altitude above sea level, with m or ft (e.g. 120m)")
+    done
+    if [ -z "$ADSB_NAME" ]; then
+      ADSB_NAME=$(ui_input "Name for the MLAT map (no spaces)" "${STATION_IDENT:-$(hostname -s 2>/dev/null || echo airframes)}")
+    fi
+  fi
+
+  local missing=()
+  valid_coord "$ADSB_LAT" 90 || missing+=("--lat")
+  valid_coord "$ADSB_LON" 180 || missing+=("--lon")
+  [ -n "$(normalize_altitude "$ADSB_ALT")" ] || missing+=("--alt")
+  if [ ${#missing[@]} -gt 0 ]; then
+    err "ADS-B feeding needs the antenna position: $(join_by ', ' "${missing[@]}")"
+    echo "  e.g. curl -sSL https://install.airframes.sh/installer | bash -s -- -y adsb --lat 38.68001 --lon -120.99436 --alt 120m"
+    exit 1
+  fi
+  ADSB_ALT=$(normalize_altitude "$ADSB_ALT")
+  ADSB_NAME="${ADSB_NAME:-${STATION_IDENT:-$(hostname -s 2>/dev/null || echo airframes)}}"
+  ADSB_NAME="${ADSB_NAME//[^A-Za-z0-9._-]/_}"
+
+  if [ -z "$PLANEWATCH_KEY" ] && [ "$IS_TTY" = true ]; then
+    echo
+    info "Plane Watch needs a free API key: create a feeder at ${BOLD}https://atc.plane.watch${RESET}"
+    PLANEWATCH_KEY=$(ui_input "Plane Watch API key (leave blank to skip)")
+  fi
+  return 0
+}
+
+# RTL-SDR for a readsb/ultrafeeder installed here: --adsb-device, else a
+# serial that says 1090, else the first one the other decoders don't use.
+# readsb reads an all-digit value as an index, so such serials become one.
+adsb_pick_device() {
+  [ -n "$ADSB_SDR_DEVICE" ] && return 0
+  local i serial taken
+  for i in "${!RTLSDR_SERIALS[@]}"; do
+    taken=false
+    if [ ${#SELECTED_DECODERS[@]} -gt 0 ] &&
+       { [ "$i" = "$SDR_INDEX" ] || { [ -n "$SDR_SERIAL" ] && [ "${RTLSDR_SERIALS[$i]}" = "$SDR_SERIAL" ]; }; }; then
+      taken=true
+    fi
+    serial="${RTLSDR_SERIALS[$i]}"
+    if [[ "$serial" == *1090* ]] && [ "$taken" = false ]; then
+      adsb_set_device "$i"; return 0
+    fi
+  done
+  for i in "${!RTLSDR_SERIALS[@]}"; do
+    if [ ${#SELECTED_DECODERS[@]} -gt 0 ] &&
+       { [ "$i" = "$SDR_INDEX" ] || { [ -n "$SDR_SERIAL" ] && [ "${RTLSDR_SERIALS[$i]}" = "$SDR_SERIAL" ]; }; }; then
+      continue
+    fi
+    adsb_set_device "$i"; return 0
+  done
+  ADSB_SDR_DEVICE="0"
+}
+
+adsb_set_device() {
+  local i="$1" serial="${RTLSDR_SERIALS[$1]}"
+  if rtlsdr_serial_unique "$serial" && [[ ! "$serial" =~ ^[0-9]+$ ]]; then
+    ADSB_SDR_DEVICE="$serial"
+  else
+    ADSB_SDR_DEVICE="$i"
+  fi
+}
+
+install_readsb_native() {
+  step "Installing readsb (ADS-B decoder) with wiedehopf's installer"
+  local tmp
+  tmp=$(mktemp -d)
+  curl -fsSL "$READSB_INSTALL_URL" -o "${tmp}/readsb-install.sh"
+  sudo bash "${tmp}/readsb-install.sh"
+  rm -rf "$tmp"
+
+  if [ -f /etc/default/readsb ]; then
+    sudo sed -i -E "/^[[:space:]]*#/b; s/--device[ =][^ \"]*/--device ${ADSB_SDR_DEVICE}/" /etc/default/readsb
+    substep "readsb uses RTL-SDR ${ADSB_SDR_DEVICE}"
+  fi
+  if command -v readsb-set-location >/dev/null 2>&1 || [ -x /usr/local/bin/readsb-set-location ]; then
+    sudo /usr/local/bin/readsb-set-location "$ADSB_LAT" "$ADSB_LON" >/dev/null
+  fi
+  sudo systemctl restart readsb 2>/dev/null || true
+  ok "readsb installed (map at http://$(hostname -I 2>/dev/null | awk '{print $1}')/tar1090)"
+}
+
+feed_airplanes_live_native() {
+  step "Feeding Airplanes.Live"
+  if [ -f /etc/default/airplanes ]; then
+    ok "Already set up for Airplanes.Live (/etc/default/airplanes); leaving it as it is."
+    return 0
+  fi
+  if [ -f /boot/airplanes-config.txt ]; then
+    ok "This is an Airplanes.Live image, which already feeds Airplanes.Live."
+    return 0
+  fi
+
+  command -v git >/dev/null 2>&1 || pkg_install git
+  sudo mkdir -p "$AIRPLANES_LIVE_DIR"
+  if [ ! -d "${AIRPLANES_LIVE_DIR}/git/.git" ]; then
+    sudo git clone --depth 1 "$AIRPLANES_LIVE_REPO" "${AIRPLANES_LIVE_DIR}/git"
+  fi
+
+  # Same settings the Airplanes.Live setup dialogs write
+  sudo tee /etc/default/airplanes >/dev/null << EOF
+INPUT="127.0.0.1:30005"
+REDUCE_INTERVAL="0.5"
+
+# feed name for checking MLAT sync, also shown on the MLAT map
+USER="${ADSB_NAME}"
+
+LATITUDE="${ADSB_LAT}"
+LONGITUDE="${ADSB_LON}"
+
+ALTITUDE="${ADSB_ALT}"
+
+# source for 978 data (dump978 --raw-port); harmless when not receiving 978
+UAT_INPUT="127.0.0.1:30978"
+
+RESULTS="--results beast,connect,127.0.0.1:30104"
+RESULTS2="--results basestation,listen,31015"
+RESULTS3="--results beast,listen,30157"
+RESULTS4="--results beast,connect,127.0.0.1:30187"
+# add --privacy between the quotes below to hide the feed name on the mlat map
+PRIVACY=""
+INPUT_TYPE="dump1090"
+
+MLATSERVER="feed.airplanes.live:31090"
+TARGET="--net-connector feed.airplanes.live,30004,beast_reduce_plus_out,feed.airplanes.live,64004"
+NET_OPTIONS="--net-heartbeat 60 --net-ro-size 1280 --net-ro-interval 0.2 --net-ro-port 0 --net-sbs-port 0 --net-bi-port 30187 --net-bo-port 0 --net-ri-port 0 --write-json-every 1 --uuid-file /usr/local/share/airplanes/airplanes-uuid"
+JSON_OPTIONS="--max-range 450 --json-location-accuracy 2 --range-outline-hours 24"
+EOF
+
+  (cd "${AIRPLANES_LIVE_DIR}/git" && sudo bash ./update.sh)
+  ok "Feeding Airplanes.Live. Check it at ${BOLD}https://airplanes.live/myfeed${RESET}"
+}
+
+feed_planewatch_docker() {
+  [ -n "$PLANEWATCH_KEY" ] || return 0
+  step "Feeding Plane Watch"
+  if ! ensure_docker; then
+    warn "Plane Watch's feeder runs in Docker; skipping it."
+    return 0
+  fi
+  local dir="${CONFIG_DIR}/planewatch"
+  sudo mkdir -p "$dir"
+  sudo tee "${dir}/docker-compose.yml" >/dev/null << EOF
+services:
+  planewatch:
+    image: ${PLANEWATCH_IMAGE}
+    container_name: airframes-planewatch
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      API_KEY: "${PLANEWATCH_KEY}"
+      BEASTHOST: "127.0.0.1"
+      BEASTPORT: "30005"
+      LAT: "${ADSB_LAT}"
+      LONG: "${ADSB_LON}"
+      ALT: "${ADSB_ALT}"
+      ENABLE_MLAT: "true"
+      TZ: "${TZ:-UTC}"
+EOF
+  sudo chmod 600 "${dir}/docker-compose.yml"
+  (cd "$dir" && sudo docker compose up -d)
+  ok "Feeding Plane Watch. Check it at ${BOLD}https://atc.plane.watch${RESET}"
+}
+
+# Docker path with no ADS-B decoder yet: ultrafeeder decodes and feeds
+# Airplanes.Live (Beast + MLAT) itself.
+install_ultrafeeder_docker() {
+  ensure_docker || return 1
+  step "Setting up ADS-B Ultrafeeder (Docker)"
+  local dev="$ADSB_SDR_DEVICE"
+  local dir="${CONFIG_DIR}/adsb"
+  sudo mkdir -p "$dir"
+  sudo tee "${dir}/docker-compose.yml" >/dev/null << EOF
+services:
+  ultrafeeder:
+    image: ${ULTRAFEEDER_IMAGE}
+    container_name: airframes-ultrafeeder
+    restart: unless-stopped
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    ports:
+      - "8080:80"
+      - "30005:30005"
+    environment:
+      READSB_DEVICE_TYPE: "rtlsdr"
+      READSB_RTLSDR_DEVICE: "${dev}"
+      READSB_GAIN: "autogain"
+      READSB_LAT: "${ADSB_LAT}"
+      READSB_LON: "${ADSB_LON}"
+      READSB_ALT: "${ADSB_ALT}"
+      MLAT_USER: "${ADSB_NAME}"
+      TZ: "${TZ:-UTC}"
+      ULTRAFEEDER_CONFIG: "adsb,feed.airplanes.live,30004,beast_reduce_plus_out;mlat,feed.airplanes.live,31090,39003"
+    tmpfs:
+      - /run:exec,size=256M
+      - /tmp:size=128M
+      - /var/log:size=32M
+EOF
+  (cd "$dir" && sudo docker compose up -d)
+  ok "Ultrafeeder is decoding ADS-B and feeding Airplanes.Live (map at http://localhost:8080)"
+}
+
+setup_adsb() {
+  [ "$WANT_ADSB" = true ] || return 0
+  report_step adsb
+  echo
+  step "ADS-B for Airframes' partners (Airplanes.Live, Plane Watch)"
+
+  if adsb_source_ready; then
+    if [ "${XNG_SERVES_BEAST:-false}" = true ]; then
+      ok "Using xng's ADS-B on port 30005."
+    elif [ ${#ADSB_SOFTWARE[@]} -gt 0 ]; then
+      ok "Using your ADS-B decoder (${ADSB_SOFTWARE[*]}) on port 30005."
+    else
+      ok "Using the ADS-B data already served on port 30005."
+    fi
+    feed_airplanes_live_native
+  elif [ "$SELECTED_METHOD" = "docker" ]; then
+    adsb_pick_device
+    install_ultrafeeder_docker
+  else
+    adsb_pick_device
+    install_readsb_native
+    feed_airplanes_live_native
+  fi
+
+  feed_planewatch_docker
+
+  if [ -z "$PLANEWATCH_KEY" ]; then
+    info "To feed Plane Watch too: create a feeder at https://atc.plane.watch, then run this again with --planewatch-key <key>."
+  fi
+}
+
+# ===========================================================================
+# Section 8c: Airframes sign-in, station registration and the xng station
+# ===========================================================================
+#
+# The recommended setup: one xng process runs every SDR on the machine
+# (ACARS, VDL2, HFDL, AIS, airband voice, ADS-B, ...) and feeds each mode to
+# its own Airframes ingest. The person signs in with a device code (the same
+# sign-in as Airwaves OS and `xng atc login`: client airframes-feeder, scope
+# atc:feed), and the station is registered on their account right away
+# (POST /feeder/station), so nothing waits in "pending" on the website.
+#
+# Files:
+#   /etc/xng/station.toml   written here from the person's choices
+#   /etc/xng/atc.json       the sign-in (rotating refresh token, mode 0600).
+#                           Only xng refreshes it once it runs.
+
+AIRFRAMES_API="${AIRFRAMES_API:-https://api.airframes.io}"
+AIRFRAMES_APP="${AIRFRAMES_APP:-https://app.airframes.io}"
+XNG_CONFIG_DIR="${XNG_CONFIG_DIR:-/etc/xng}"
+XNG_IMAGE_REPO="ghcr.io/airframesio/xng"
+XNG_VERSION_FALLBACK="0.24.0"
+FEEDER_CLIENT_ID="airframes-feeder"
+FEEDER_SCOPE="atc:feed"
+# One radio hears airband channels within 2 MHz of each other (xng captures
+# 2.4 MHz around their middle), as in Airwaves OS.
+AIRBAND_MAX_SPAN_KHZ=2000
+
+# SDRs found for xng: "kind|serial|index|name" (index counts within a kind)
+declare -a XNG_SDRS=()
+# Job per SDR, same order as XNG_SDRS: acars, vdl2, hfdl, airband, ais, adsb,
+# uat, sonde, iridium, keep-adsb (left to the ADS-B decoder), keep-old (left
+# to a decoder set up before, see offer_old_decoder_switch) or off
+declare -a XNG_JOBS=()
+# Airband channels picked from the directory: "mhz|label"
+declare -a AIRBAND_CHANNELS=()
+XNG_MODES_ARG=""          # --modes "serial=mode,..."
+XNG_AIRBAND_ARG=""        # --airband "120.500,121.800" or "nearest"
+XNG_METHOD=""             # native or docker (auto when empty)
+XNG_VERSION=""
+SIGNIN_MODE="auto"        # auto, yes (--sign-in), no (--no-sign-in)
+AF_USERNAME=""
+AF_ACCESS_TOKEN=""
+STATION_LAT=""
+STATION_LON=""
+STATION_REGISTERED=""
+XNG_SERVES_BEAST=false    # xng's ADS-B session serves Beast on :30005
+
+# JSON field from stdin: json_field <python expression on d>, e.g. "d['user_code']"
+json_field() {
+  python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    v = eval(sys.argv[1], {"d": d})
+except Exception:
+    sys.exit(1)
+if v is None:
+    sys.exit(1)
+print(v if not isinstance(v, (dict, list)) else json.dumps(v))
+' "$1" 2>/dev/null
+}
+
+ensure_python3() {
+  command -v python3 >/dev/null 2>&1 && return 0
+  substep "Installing python3 (used to read Airframes API replies)"
+  pkg_install python3 >/dev/null 2>&1 || true
+  command -v python3 >/dev/null 2>&1 || { err "python3 is needed and could not be installed"; return 1; }
+}
+
+# POST JSON to the Airframes API: af_post <path> <json> [bearer]. Sets
+# AF_BODY to the reply and AF_HTTP to the status code (000: no connection).
+# Not for $(...): the variables would stay in the subshell.
+AF_HTTP=""
+AF_BODY=""
+af_post() {
+  local path="$1" body="$2" bearer="${3:-}" out
+  local -a auth=()
+  [ -n "$bearer" ] && auth=(-H "Authorization: Bearer ${bearer}")
+  AF_BODY=""
+  out=$(curl -sS -m 20 -w '\n%{http_code}' -X POST "${AIRFRAMES_API}${path}" \
+    -H 'Content-Type: application/json' -H "User-Agent: airframes-installer/${VERSION}" \
+    "${auth[@]}" --data "$body" 2>/dev/null) || { AF_HTTP="000"; return 1; }
+  AF_HTTP="${out##*$'\n'}"
+  AF_BODY="${out%$'\n'*}"
+}
+
+af_get() {
+  curl -sS -m 20 -H "User-Agent: airframes-installer/${VERSION}" "${AIRFRAMES_API}$1" 2>/dev/null
+}
+
+# JSON-quote a string
+json_str() {
+  python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+# Who the saved sign-in belongs to, or empty.
+saved_signin_user() {
+  [ -r "${XNG_CONFIG_DIR}/atc.json" ] || sudo test -r "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null || return 0
+  sudo cat "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null |
+    json_field "d['username'] if d.get('refresh_token') else None" || true
+}
+
+# --- QR codes in the terminal ----------------------------------------------
+# The sign-in link as a QR code, so a phone can open it with the code filled
+# in. qrencode is optional: the installer tries to install it once, and shows
+# only the link when it's missing, when the terminal is too narrow, or when
+# AIRFRAMES_NO_QR=1.
+
+# Terminal width in columns (AIRFRAMES_COLUMNS overrides, for tests)
+term_columns() {
+  local cols=""
+  if [ -n "${AIRFRAMES_COLUMNS:-}" ]; then echo "$AIRFRAMES_COLUMNS"; return 0; fi
+  cols=$( { stty size </dev/tty; } 2>/dev/null | awk '{print $2}' || true)
+  [ -n "$cols" ] && [ "$cols" -gt 0 ] 2>/dev/null || cols=$(tput cols 2>/dev/null || true)
+  [ -n "$cols" ] && [ "$cols" -gt 0 ] 2>/dev/null || cols="${COLUMNS:-80}"
+  echo "$cols"
+}
+
+# Does the terminal take UTF-8? (half-block QR codes need it)
+term_utf8() {
+  local cs
+  cs=$(locale charmap 2>/dev/null || true)
+  case "${cs:-${LC_ALL:-${LC_CTYPE:-${LANG:-}}}}" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*) return 0 ;;
+  esac
+  return 1
+}
+
+QR_INSTALL_TRIED=false
+ensure_qrencode() {
+  command -v qrencode >/dev/null 2>&1 && return 0
+  [ "$QR_INSTALL_TRIED" = true ] && return 1
+  QR_INSTALL_TRIED=true
+  [ -n "${PKG:-}" ] || return 1
+  substep "Installing qrencode (for a QR code you can scan)"
+  pkg_install qrencode >/dev/null 2>&1 || true
+  command -v qrencode >/dev/null 2>&1
+}
+
+# show_qr <url>: put the QR code (indented by 4) in QR_TEXT, or return 1
+# with the reason in QR_SKIPPED (off, missing, narrow). Not for $(...).
+QR_TEXT=""
+QR_SKIPPED=""
+show_qr() {
+  local url="$1" modules width cols type indent="    "
+  QR_TEXT=""; QR_SKIPPED=""
+  if [ -n "${AIRFRAMES_NO_QR:-}" ]; then QR_SKIPPED=off; return 1; fi
+  if ! ensure_qrencode; then QR_SKIPPED=missing; return 1; fi
+  # ASCII output draws each module as "##", so its width / 2 is the size
+  modules=$(qrencode -t ASCII -m 2 "$url" 2>/dev/null | awk '{ if (length($0) > w) w = length($0) } END { print int(w / 2) }' || true)
+  if [ -z "$modules" ] || ! [ "$modules" -gt 0 ] 2>/dev/null; then QR_SKIPPED=missing; return 1; fi
+  # Half blocks fit two rows in a line; without UTF-8, two spaces per module
+  if term_utf8; then type=ANSIUTF8; width=$modules; else type=ANSI; width=$((modules * 2)); fi
+  cols=$(term_columns)
+  if [ $((width + ${#indent})) -gt "$cols" ]; then QR_SKIPPED=narrow; return 1; fi
+  QR_TEXT=$(qrencode -t "$type" -m 2 "$url" 2>/dev/null | sed "s/^/${indent}/" || true)
+  if [ -z "$QR_TEXT" ]; then QR_SKIPPED=missing; return 1; fi
+  return 0
+}
+
+# Device-flow sign-in. Shows the code and link, waits for approval, then
+# saves the refresh token where xng reads it and keeps the access token for
+# registering the station. Returns 1 when skipped or it fails.
+airframes_signin() {
+  ensure_python3 || return 1
+  local resp code uri uri_full device expires interval
+  af_post "/auth/device/code" "{\"client_id\":\"${FEEDER_CLIENT_ID}\",\"scope\":\"${FEEDER_SCOPE}\"}" || true
+  resp="$AF_BODY"
+  if [ "${AF_HTTP:0:1}" != "2" ]; then
+    warn "Couldn't start the Airframes sign-in (HTTP ${AF_HTTP}). Continuing without it."
+    return 1
+  fi
+  device=$(json_field "d['device_code']" <<< "$resp") || return 1
+  code=$(json_field "d['user_code']" <<< "$resp") || return 1
+  uri=$(json_field "d['verification_uri']" <<< "$resp") || uri="${AIRFRAMES_APP}/device"
+  uri_full=$(json_field "d.get('verification_uri_complete') or d['verification_uri']" <<< "$resp") || uri_full="$uri"
+  expires=$(json_field "int(d.get('expires_in') or 900)" <<< "$resp") || expires=900
+  interval=$(json_field "int(d.get('interval') or 5)" <<< "$resp") || interval=5
+
+  echo
+  echo -e "  ${BOLD}Sign in to Airframes${RESET} to put this station on your account:"
+  echo
+  echo -e "    1. Open ${CYAN}${uri}${RESET} on any phone or computer"
+  echo -e "    2. Enter the code  ${BOLD}${code}${RESET}"
+  echo
+  # The link with the code in it, as a QR code for a phone and as text
+  if show_qr "$uri_full"; then
+    echo -e "  ${DIM}Or scan this with your phone's camera (the code is filled in):${RESET}"
+    echo "$QR_TEXT"
+  fi
+  if [ "$uri_full" != "$uri" ]; then
+    echo -e "  ${DIM}Or open this link, the code is filled in:${RESET} ${CYAN}${uri_full}${RESET}"
+  fi
+  [ "$QR_SKIPPED" = narrow ] && echo -e "  ${DIM}(Make the window wider to see a QR code.)${RESET}"
+  echo
+  echo -e "  ${DIM}Waiting for you to approve it (Ctrl-C to stop)...${RESET}"
+
+  local deadline=$(( $(date +%s) + expires )) err_code
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep "$interval"
+    af_post "/auth/token" "{\"grant_type\":\"urn:ietf:params:oauth:grant-type:device_code\",\"device_code\":\"${device}\",\"client_id\":\"${FEEDER_CLIENT_ID}\"}" || true
+    resp="$AF_BODY"
+    if [ "${AF_HTTP:0:1}" = "2" ]; then
+      airframes_save_signin "$resp" || return 1
+      return 0
+    fi
+    err_code=$(json_field "d.get('error')" <<< "$resp") || err_code=""
+    case "$err_code" in
+      authorization_pending) ;;
+      slow_down) interval=$((interval + 5)) ;;
+      access_denied) warn "The sign-in was declined."; return 1 ;;
+      expired_token) warn "The code expired."; return 1 ;;
+      *) warn "Sign-in failed (HTTP ${AF_HTTP}${err_code:+, $err_code})."; return 1 ;;
+    esac
+  done
+  warn "The code expired."
+  return 1
+}
+
+airframes_save_signin() {
+  local resp="$1" refresh feeder_id user_id
+  refresh=$(json_field "d['refresh_token']" <<< "$resp") || { err "Airframes returned no refresh token"; return 1; }
+  AF_ACCESS_TOKEN=$(json_field "d['access_token']" <<< "$resp") || AF_ACCESS_TOKEN=""
+  AF_USERNAME=$(json_field "d['user']['username']" <<< "$resp") || AF_USERNAME=""
+  user_id=$(json_field "str(d['user']['id'])" <<< "$resp") || user_id=""
+  # Keep the feeder id across sign-ins, so feeds keep their identity
+  feeder_id=$(sudo cat "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null | json_field "d['feeder_id']") ||
+    feeder_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
+  local api=""
+  [ "$AIRFRAMES_API" != "https://api.airframes.io" ] && api="$AIRFRAMES_API"
+  sudo mkdir -p "$XNG_CONFIG_DIR"
+  local tmp
+  tmp=$(mktemp)
+  chmod 600 "$tmp"
+  python3 -c '
+import json, sys
+api, refresh, user, uid, fid = sys.argv[1:6]
+d = {"api": api} if api else {}
+d.update(refresh_token=refresh, username=user, user_id=uid, feeder_id=fid)
+print(json.dumps(d, indent=2))
+' "$api" "$refresh" "$AF_USERNAME" "$user_id" "$feeder_id" > "$tmp"
+  sudo install -m 600 "$tmp" "${XNG_CONFIG_DIR}/atc.json"
+  rm -f "$tmp"
+  ok "Signed in to Airframes as ${BOLD}${AF_USERNAME:-your account}${RESET}"
+}
+
+# Sign in unless the person said not to, or a sign-in is already saved.
+signin_step() {
+  local saved
+  saved=$(saved_signin_user)
+  if [ -n "$saved" ] && [ "$SIGNIN_MODE" != "yes" ]; then
+    AF_USERNAME="$saved"
+    ok "Signed in to Airframes as ${BOLD}${saved}${RESET} (from an earlier run)"
+    return 0
+  fi
+  [ "$SIGNIN_MODE" = "no" ] && return 0
+  # Unattended runs sign in only when asked to (it needs a person)
+  if [ "$AUTO_YES" = true ] || [ "$IS_TTY" != true ]; then
+    [ "$SIGNIN_MODE" = "yes" ] || return 0
+  else
+    echo
+    info "Signing in puts this station on your Airframes account right away"
+    info "and lets airband audio feed Airframes ATC."
+    if ! ui_confirm "Sign in to Airframes now?" "yes"; then
+      info "Skipped. Your feed still counts; claim the station on the website later."
+      return 0
+    fi
+  fi
+  airframes_signin || info "Continuing without signing in. Run this again any time to sign in."
+}
+
+# Receiver position: from the ADS-B decoder when there is one, else asked.
+detect_station_location() {
+  [ -n "$STATION_LAT" ] && [ -n "$STATION_LON" ] && return 0
+  if [ -n "$ADSB_LAT" ] && [ -n "$ADSB_LON" ]; then
+    STATION_LAT="$ADSB_LAT"; STATION_LON="$ADSB_LON"; return 0
+  fi
+  local f lat lon
+  for f in /run/dump1090-fa/receiver.json /run/readsb/receiver.json /run/dump1090/receiver.json \
+           /run/adsb-feeder-ultrafeeder/readsb/receiver.json; do
+    [ -r "$f" ] || continue
+    lat=$(json_field "d['lat']" < "$f") || continue
+    lon=$(json_field "d['lon']" < "$f") || continue
+    if valid_coord "$lat" 90 && valid_coord "$lon" 180 && [ "$lat" != "0" ]; then
+      STATION_LAT="$lat"; STATION_LON="$lon"
+      ok "Receiver position from ${f%/*}: ${STATION_LAT}, ${STATION_LON}"
+      return 0
+    fi
+  done
+  if [ -r /etc/default/airplanes ]; then
+    lat=$(sed -n 's/^LATITUDE="\{0,1\}\([-0-9.]*\).*/\1/p' /etc/default/airplanes | head -1)
+    lon=$(sed -n 's/^LONGITUDE="\{0,1\}\([-0-9.]*\).*/\1/p' /etc/default/airplanes | head -1)
+    if valid_coord "$lat" 90 && valid_coord "$lon" 180; then
+      STATION_LAT="$lat"; STATION_LON="$lon"; return 0
+    fi
+  fi
+  if [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ]; then
+    echo
+    info "The receiver's position puts the station on the map (rounded)"
+    info "and finds the airband channels near you."
+    local v
+    v=$(ui_input "Latitude, decimal degrees (blank to skip)" "")
+    if [ -n "$v" ] && valid_coord "$v" 90; then
+      STATION_LAT="$v"
+      v=$(ui_input "Longitude, decimal degrees" "")
+      if valid_coord "$v" 180; then STATION_LON="$v"; else STATION_LAT=""; warn "Not a longitude; skipping the position."; fi
+    fi
+  fi
+}
+
+# A station ident Airframes accepts: letters, digits, '-' and '_', at most 40.
+normalize_station_ident() {
+  local id
+  id=$(echo "$1" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')
+  [[ "$id" =~ ^[A-Z0-9_-]{1,40}$ ]] || return 1
+  echo "$id"
+}
+
+choose_station_ident() {
+  local id suggestion host
+  if [ -n "$STATION_IDENT" ]; then
+    id=$(normalize_station_ident "$STATION_IDENT") || {
+      err "Station ID '${STATION_IDENT}' may only use letters, digits, '-' and '_' (40 at most)."
+      exit 1
+    }
+    STATION_IDENT="$id"
+    return 0
+  fi
+  host=$(hostname -s 2>/dev/null || echo station)
+  suggestion=$(normalize_station_ident "$MIG_STATION_SUGGESTION" 2>/dev/null ||
+               normalize_station_ident "${AF_USERNAME:+${AF_USERNAME}-}${host}" 2>/dev/null ||
+               normalize_station_ident "$host" 2>/dev/null || echo "STATION")
+  if [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ]; then
+    echo
+    info "Pick a station ID. It names your feed on Airframes; xng adds the mode,"
+    info "so ACARS feeds as ${suggestion}-ACARS."
+    if [ "$MIGRATING" = true ]; then
+      info "SDRs xng takes over keep the names their decoders fed under."
+    fi
+    while true; do
+      id=$(ui_input "Station ID" "$suggestion")
+      if id=$(normalize_station_ident "$id"); then break; fi
+      warn "Use letters, digits, '-' and '_' only (40 at most)."
+    done
+  elif [ "$AUTO_YES" = true ]; then
+    id="$suggestion"
+  else
+    id="$suggestion"
+  fi
+  STATION_IDENT="$id"
+}
+
+# The station's page on the Airframes website
+station_page_url() {
+  echo "${AIRFRAMES_APP}/stations/$1"
+}
+
+# Register the station on the signed-in account (needs the access token from
+# this run's sign-in). Asks for another ID when the ident is someone else's.
+register_station() {
+  [ -n "$AF_ACCESS_TOKEN" ] || return 0
+  local body resp status
+  while true; do
+    body="{\"ident\": $(json_str "$STATION_IDENT"), \"source_type\": \"xng\""
+    if [ -n "$STATION_LAT" ] && [ -n "$STATION_LON" ]; then
+      body+=", \"latitude\": ${STATION_LAT}, \"longitude\": ${STATION_LON}"
+    fi
+    body+="}"
+    af_post "/feeder/station" "$body" "$AF_ACCESS_TOKEN" || true
+    resp="$AF_BODY"
+    case "$AF_HTTP" in
+      200|201)
+        if [ "$(json_field "d.get('created')" <<< "$resp")" = "True" ]; then status="created on your account"
+        elif [ "$(json_field "d.get('claimed')" <<< "$resp")" = "True" ]; then status="claimed for your account"
+        else status="already on your account"; fi
+        ok "Station ${BOLD}${STATION_IDENT}${RESET} ${status}"
+        substep "Its page: $(station_page_url "$STATION_IDENT")"
+        STATION_REGISTERED="$STATION_IDENT"
+        return 0
+        ;;
+      409)
+        warn "Station ID ${STATION_IDENT} belongs to someone else."
+        if [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ]; then
+          STATION_IDENT=""
+          choose_station_ident
+          continue
+        fi
+        err "Pick another with --station-id."
+        exit 1
+        ;;
+      *)
+        warn "Couldn't register the station (HTTP ${AF_HTTP}); it appears once data arrives."
+        return 0
+        ;;
+    esac
+  done
+}
+
+# --- Hardware --------------------------------------------------------------
+
+# Every SDR on USB, for xng: kind, serial, per-kind index, name. RTL-SDRs
+# come in librtlsdr order (see detect_rtlsdr_serials).
+detect_xng_sdrs() {
+  XNG_SDRS=()
+  local i
+  for i in "${!RTLSDR_SERIALS[@]}"; do
+    XNG_SDRS+=("rtlsdr|${RTLSDR_SERIALS[$i]}|${i}|RTL-SDR")
+  done
+  local usb="${AIRFRAMES_SYSFS_USB:-/sys/bus/usb/devices}"
+  [ -d "$usb" ] || return 0
+  local dev vid pid serial kind name
+  declare -A seen=()
+  for dev in "$usb"/*; do
+    [ -f "$dev/idVendor" ] && [ -f "$dev/idProduct" ] || continue
+    vid=$(cat "$dev/idVendor" 2>/dev/null) || continue
+    pid=$(cat "$dev/idProduct" 2>/dev/null) || continue
+    case "${vid}:${pid}" in
+      1d50:60a1) kind=airspy;   name="Airspy R2/Mini" ;;
+      03eb:800c) kind=airspyhf; name="Airspy HF+" ;;
+      1d50:6089|1d50:cc15|1fc9:000c) kind=hackrf; name="HackRF" ;;
+      1df7:*)    kind=sdrplay;  name="SDRplay RSP" ;;
+      *) continue ;;
+    esac
+    serial=$(cat "$dev/serial" 2>/dev/null || echo unknown)
+    local n=${seen[$kind]:-0}
+    seen[$kind]=$((n + 1))
+    XNG_SDRS+=("${kind}|${serial}|${n}|${name}")
+  done
+}
+
+sdr_field() { local IFS='|'; local -a f; read -ra f <<< "$1"; echo "${f[$2]}"; }
+
+# xng's selector for an SDR
+xng_sdr_selector() {
+  local kind serial idx
+  kind=$(sdr_field "$1" 0); serial=$(sdr_field "$1" 1); idx=$(sdr_field "$1" 2)
+  local count
+  count=$(printf '%s\n' "${XNG_SDRS[@]}" | grep -c "^${kind}|")
+  if [ "$serial" != "unknown" ] &&
+     [ "$(printf '%s\n' "${XNG_SDRS[@]}" | grep -c "^${kind}|${serial}|")" -eq 1 ]; then
+    echo "driver=${kind},serial=${serial}"
+  elif [ "$count" -le 1 ]; then
+    echo "driver=${kind}"
+  else
+    echo "driver=${kind},serial=${serial}"
+  fi
+}
+
+# Jobs an SDR can do, best first
+sdr_jobs_for() {
+  case "$(sdr_field "$1" 0)" in
+    airspyhf) echo "hfdl off" ;;
+    sdrplay)  echo "hfdl vdl2 acars airband ais adsb off" ;;
+    airspy)   echo "vdl2 acars airband ais adsb off" ;;
+    hackrf)   echo "vdl2 acars airband ais adsb iridium off" ;;
+    *)        echo "acars vdl2 airband ais adsb uat sonde iridium off" ;;
+  esac
+}
+
+job_label() {
+  case "$1" in
+    acars)     echo "ACARS (VHF 129-131 MHz), fed to Airframes" ;;
+    vdl2)      echo "VDL Mode 2 (VHF 136 MHz), fed to Airframes" ;;
+    hfdl)      echo "HFDL (HF 3-22 MHz), fed to Airframes" ;;
+    airband)   echo "Airband voice (tower, approach), fed to Airframes ATC" ;;
+    ais)       echo "AIS ships (162 MHz), fed to Airframes" ;;
+    adsb)      echo "ADS-B 1090 MHz, for Airframes' ADS-B partners" ;;
+    uat)       echo "UAT 978 MHz (US ADS-B), shown on the xng dashboard" ;;
+    sonde)     echo "Weather balloons (400-406 MHz), shown on the xng dashboard" ;;
+    iridium)   echo "Iridium (1626 MHz, needs an L-band antenna), fed to Airframes" ;;
+    keep-adsb) echo "Leave it to the ADS-B decoder already using it" ;;
+    keep-old)  echo "Leave it to the decoder set up before" ;;
+    off)       echo "Don't use it" ;;
+  esac
+}
+
+# Does the running ADS-B decoder hold this SDR?
+sdr_used_by_adsb() {
+  [ ${#ADSB_SOFTWARE[@]} -gt 0 ] || return 1
+  [ "$(sdr_field "$1" 0)" = "rtlsdr" ] || return 1
+  rtlsdr_used_by_adsb "$(sdr_field "$1" 2)" "$(sdr_field "$1" 1)"
+}
+
+# Default job per SDR: ADS-B dongles stay with ADS-B; HF radios do HFDL;
+# RTL-SDRs take ACARS, VDL2, airband, AIS in turn (as Airwaves OS does).
+default_jobs() {
+  XNG_JOBS=()
+  local i rtl_n=0 sdr
+  local -a rtl_cycle=(acars vdl2 airband ais)
+  for i in "${!XNG_SDRS[@]}"; do
+    sdr="${XNG_SDRS[$i]}"
+    if sdr_used_by_adsb "$sdr"; then
+      XNG_JOBS+=("keep-adsb"); continue
+    fi
+    case "$(sdr_field "$sdr" 0)" in
+      airspyhf|sdrplay) XNG_JOBS+=("hfdl") ;;
+      rtlsdr)
+        local serial
+        serial=$(sdr_field "$sdr" 1)
+        if [[ "$serial" == *1090* ]] && [ ${#ADSB_SOFTWARE[@]} -eq 0 ]; then XNG_JOBS+=("adsb")
+        elif [[ "$serial" == *978* ]]; then XNG_JOBS+=("uat")
+        else XNG_JOBS+=("${rtl_cycle[$((rtl_n % 4))]}"); rtl_n=$((rtl_n + 1)); fi
+        ;;
+      *) XNG_JOBS+=("vdl2") ;;
+    esac
+  done
+  # Airband needs the sign-in to feed Airframes ATC; without one the SDR
+  # is more useful on VDL2.
+  if [ -z "$AF_USERNAME" ]; then
+    for i in "${!XNG_JOBS[@]}"; do
+      if [ "${XNG_JOBS[$i]}" = "airband" ]; then XNG_JOBS[$i]="vdl2"; fi
+    done
+  fi
+  return 0
+}
+
+# --modes "00000001=acars,00000002=airband,1=vdl2": serial or index (RTL)
+apply_modes_arg() {
+  [ -n "$XNG_MODES_ARG" ] || return 0
+  local item key mode i matched
+  IFS=', ' read -ra items <<< "$XNG_MODES_ARG"
+  for item in "${items[@]}"; do
+    [ -n "$item" ] || continue
+    key="${item%%=*}"; mode="${item#*=}"
+    local known=" acars vdl2 hfdl airband ais adsb uat sonde iridium off "
+    case "$known" in
+      *" $mode "*) ;;
+      *) err "--modes: unknown mode '${mode}' (acars, vdl2, hfdl, airband, ais, adsb, uat, sonde, iridium, off)"; exit 1 ;;
+    esac
+    matched=false
+    for i in "${!XNG_SDRS[@]}"; do
+      if [ "$(sdr_field "${XNG_SDRS[$i]}" 1)" = "$key" ]; then XNG_JOBS[$i]="$mode"; matched=true; fi
+    done
+    if [ "$matched" = false ] && [[ "$key" =~ ^[0-9]+$ ]] && [ "$((10#$key))" -lt ${#XNG_SDRS[@]} ]; then
+      key=$((10#$key))
+      XNG_JOBS[$key]="$mode"; matched=true
+    fi
+    [ "$matched" = true ] || { err "--modes: no SDR with serial or number '${key}'"; exit 1; }
+  done
+}
+
+# Ask what each SDR should do.
+tui_assign_jobs() {
+  local i sdr label default choice
+  for i in "${!XNG_SDRS[@]}"; do
+    sdr="${XNG_SDRS[$i]}"
+    label="$(sdr_field "$sdr" 3), serial $(sdr_field "$sdr" 1)"
+    default="${XNG_JOBS[$i]}"
+    local -a opts=() jobs=()
+    if sdr_used_by_adsb "$sdr"; then
+      jobs+=("keep-adsb")
+      label+=" (used by ${ADSB_SOFTWARE[0]})"
+    fi
+    if [ -n "${MIG_FROM[$i]:-}" ]; then
+      if [ "$MIGRATING" = true ]; then label+=" (was ${MIG_FROM[$i]})"
+      else jobs+=("keep-old"); label+=" (used by ${MIG_FROM[$i]})"; fi
+    fi
+    local j
+    for j in $(sdr_jobs_for "$sdr"); do
+      [ "$j" = "airband" ] && [ -z "$AF_USERNAME" ] && continue
+      # One ADS-B decoder is enough
+      [ "$j" = "adsb" ] && [ ${#ADSB_SOFTWARE[@]} -gt 0 ] && continue
+      jobs+=("$j")
+    done
+    # Default first
+    local -a ordered=("$default")
+    for j in "${jobs[@]}"; do [ "$j" != "$default" ] && ordered+=("$j"); done
+    for j in "${ordered[@]}"; do opts+=("$(job_label "$j")"); done
+    choice=$(ui_choose "What should the ${label} do?" "${opts[@]}")
+    for j in "${ordered[@]}"; do
+      if [ "$(job_label "$j")" = "$choice" ]; then XNG_JOBS[$i]="$j"; fi
+    done
+  done
+  return 0
+}
+
+xng_has_job() {
+  local j
+  for j in "${XNG_JOBS[@]}"; do [ "$j" = "$1" ] && return 0; done
+  return 1
+}
+
+# --- Airband channels from the Airframes directory -------------------------
+
+# Nearby voice channels: lines "mhz|label|distance_nm", nearest first.
+fetch_airband_directory() {
+  [ -n "$STATION_LAT" ] && [ -n "$STATION_LON" ] || return 1
+  af_get "/v1/atc/frequencies?near=${STATION_LAT},${STATION_LON}&radius_nm=60&band=VHF&limit=60" |
+    python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+seen = set()
+for f in d.get("data", []):
+    mhz = f.get("frequencyMhz")
+    if not mhz or not (118.0 <= mhz <= 137.0) or f.get("streamable") is False:
+        continue
+    key = "%.3f" % mhz
+    if key in seen:
+        continue
+    seen.add(key)
+    fac = f.get("facility") or {}
+    ident = fac.get("ident") or ""
+    svc = f.get("service") or ""
+    name = f.get("name") or fac.get("name") or ""
+    label = " ".join(x for x in (ident, svc) if x) or name
+    label = label.replace("|", "/").replace("\"", "")[:60]
+    dist = f.get("distanceNm")
+    print("%s|%s|%s" % (key, label, "" if dist is None else round(dist)))
+'
+}
+
+# Keep channels within one radio's reach of the first (nearest) one.
+airband_fit_span() {
+  local first="" line mhz khz lo hi
+  local -a out=()
+  for line in "$@"; do
+    mhz="${line%%|*}"
+    khz=$(awk -v m="$mhz" 'BEGIN{printf "%d", m*1000+0.5}')
+    if [ -z "$first" ]; then lo=$khz; hi=$khz; first=1; out+=("$line"); continue; fi
+    local nlo=$lo nhi=$hi
+    [ "$khz" -lt "$nlo" ] && nlo=$khz
+    [ "$khz" -gt "$nhi" ] && nhi=$khz
+    if [ $((nhi - nlo)) -le "$AIRBAND_MAX_SPAN_KHZ" ]; then
+      lo=$nlo; hi=$nhi; out+=("$line")
+    fi
+  done
+  printf '%s\n' "${out[@]}"
+}
+
+choose_airband_channels() {
+  xng_has_job airband || return 0
+  AIRBAND_CHANNELS=()
+  local -a dir=()
+  mapfile -t dir < <(fetch_airband_directory 2>/dev/null || true)
+  if [ ${#dir[@]} -eq 0 ]; then
+    warn "No airband channels found near your position in the Airframes directory."
+    warn "The airband SDR goes to VDL2 instead; add the position and run this again to change it."
+    local i
+    for i in "${!XNG_JOBS[@]}"; do if [ "${XNG_JOBS[$i]}" = "airband" ]; then XNG_JOBS[$i]="vdl2"; fi; done
+    return 0
+  fi
+
+  if [ -n "$XNG_AIRBAND_ARG" ] && [ "$XNG_AIRBAND_ARG" != "nearest" ]; then
+    # --airband "120.500,121.800": only channels the directory has
+    local want line m found
+    IFS=', ' read -ra want <<< "$XNG_AIRBAND_ARG"
+    for m in "${want[@]}"; do
+      [ -n "$m" ] || continue
+      m=$(awk -v m="$m" 'BEGIN{printf "%.3f", m}')
+      found=false
+      for line in "${dir[@]}"; do
+        [ "${line%%|*}" = "$m" ] && { AIRBAND_CHANNELS+=("${line%|*}"); found=true; break; }
+      done
+      [ "$found" = true ] || warn "${m} MHz isn't in the Airframes directory near you; skipped."
+    done
+  elif [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ] && [ -z "$XNG_AIRBAND_ARG" ]; then
+    local -a opts=() line
+    for line in "${dir[@]:0:30}"; do
+      IFS='|' read -r m l d <<< "$line"
+      opts+=("${m} MHz  ${l}${d:+  (${d} nm)}")
+    done
+    local picked
+    picked=$(ui_multichoice "Airband channels to feed (from the Airframes directory, within 2 MHz of each other)" "${opts[@]}") || picked=""
+    local p
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      m="${p%% MHz*}"
+      for line in "${dir[@]}"; do
+        if [ "${line%%|*}" = "$m" ]; then AIRBAND_CHANNELS+=("${line%|*}"); fi
+      done
+    done <<< "$picked"
+  fi
+  # Nearest that fit, when nothing was picked (or "nearest")
+  if [ ${#AIRBAND_CHANNELS[@]} -eq 0 ]; then
+    local -a near=()
+    for line in "${dir[@]:0:12}"; do near+=("${line%|*}"); done
+    mapfile -t AIRBAND_CHANNELS < <(airband_fit_span "${near[@]}" | head -8)
+  else
+    local before=${#AIRBAND_CHANNELS[@]}
+    mapfile -t AIRBAND_CHANNELS < <(airband_fit_span "${AIRBAND_CHANNELS[@]}")
+    [ ${#AIRBAND_CHANNELS[@]} -ge "$before" ] ||
+      warn "Kept the channels within 2 MHz of ${AIRBAND_CHANNELS[0]%%|*} MHz: one radio can't hear wider than that."
+  fi
+  local c
+  info "Airband channels: $(for c in "${AIRBAND_CHANNELS[@]}"; do printf '%s (%s)  ' "${c%%|*}" "${c#*|}"; done)"
+}
+
+# --- station.toml ------------------------------------------------------------
+
+toml_str() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+render_station_toml() {
+  local pos=""
+  [ -n "$STATION_LAT" ] && [ -n "$STATION_LON" ] && pos=$(printf '%.4f,%.4f' "$STATION_LAT" "$STATION_LON")
+  echo "# Written by the Airframes installer (install.airframes.sh) v${VERSION}."
+  echo "# Run the installer again to change it; xng reads it at start."
+  echo "station-id = $(toml_str "$STATION_IDENT")"
+  echo
+  echo "[outputs]"
+  echo "feed-airframes = true"
+  echo "http = \"0.0.0.0:${XNG_HTTP_PORT}\""
+  echo "metrics = \"0.0.0.0:${XNG_METRICS_PORT}\""
+  if xng_has_job adsb; then
+    echo "beast = \"0.0.0.0:30005\""
+    echo "sbs = \"0.0.0.0:30003\""
+  fi
+  echo
+  echo "[outputs.airframes]"
+  echo "enabled = true"
+  echo "auto-suffix = true"
+  if xng_has_job airband && [ -n "$AF_USERNAME" ]; then
+    echo
+    echo "[outputs.airband.atc]"
+    echo "credentials = $(toml_str "${XNG_CONFIG_DIR}/atc.json")"
+    echo "station-name = $(toml_str "$STATION_IDENT")"
+    echo "location-precision-m = 500"
+  fi
+  local i sdr job c
+  for i in "${!XNG_SDRS[@]}"; do
+    sdr="${XNG_SDRS[$i]}"; job="${XNG_JOBS[$i]}"
+    case "$job" in off|keep-adsb|keep-old|"") continue ;; esac
+    echo
+    echo "[[session]]"
+    echo "sdr = $(toml_str "$(xng_sdr_selector "$sdr")")"
+    echo "mode = \"${job}\""
+    render_migrated_settings "$i" "$job"
+    [ -n "$pos" ] && echo "receiver-pos = \"${pos}\""
+    if [ "$job" = "airband" ]; then
+      for c in "${AIRBAND_CHANNELS[@]}"; do
+        echo
+        echo "[[session.airband.channel]]"
+        echo "freq = \"${c%%|*}\""
+        if [ -n "${c#*|}" ]; then echo "label = $(toml_str "${c#*|}")"; fi
+      done
+    fi
+  done
+  return 0
+}
+
+# --- Installing xng ------------------------------------------------------------
+
+xng_latest_version() {
+  local tag
+  tag=$(curl -fsSL -m 15 https://api.github.com/repos/airframesio/xng/releases/latest 2>/dev/null |
+        json_field "d['tag_name']") || tag=""
+  # The API allows 60 calls an hour per address (shared ones run out); the
+  # release page redirects to the latest tag without that limit
+  if [ -z "$tag" ]; then
+    tag=$(curl -fsSIL -m 15 -o /dev/null -w '%{url_effective}' https://github.com/airframesio/xng/releases/latest 2>/dev/null || true)
+    case "$tag" in */releases/tag/*) tag="${tag##*/}" ;; *) tag="" ;; esac
+  fi
+  tag="${tag#v}"
+  echo "${tag:-$XNG_VERSION_FALLBACK}"
+}
+
+# Refresh apt's package lists once per run (a fresh system has none)
+APT_UPDATED=false
+apt_update_once() {
+  [ "$APT_UPDATED" = true ] && return 0
+  # Only remember a refresh that worked, so a later step tries again
+  if sudo apt-get update -qq >/dev/null 2>&1; then APT_UPDATED=true; fi
+  return 0
+}
+
+# SoapySDR and its modules for the SDRs xng will open
+install_xng_runtime() {
+  [ "$PKG" = "apt" ] || return 0
+  apt_update_once
+  local -a pkgs=() m p
+  for p in libsoapysdr0.8 libairspy0 libairspyhf1; do
+    apt-cache show "$p" >/dev/null 2>&1 && pkgs+=("$p")
+  done
+  for m in rtlsdr airspy airspyhf hackrf; do
+    for p in "soapysdr0.8-module-${m}" "soapysdr-module-${m}"; do
+      if apt-cache show "$p" >/dev/null 2>&1; then pkgs+=("$p"); break; fi
+    done
+  done
+  if [ ${#pkgs[@]} -gt 0 ]; then
+    sudo apt-get install -y -qq "${pkgs[@]}" >/dev/null || warn "Couldn't install ${pkgs[*]}"
+  fi
+  return 0
+}
+
+# Keep the DVB-T kernel driver off the RTL-SDRs
+blacklist_dvb() {
+  [ "$OS" = "linux" ] || return 0
+  [ -f /etc/modprobe.d/airframes-rtlsdr.conf ] && return 0
+  sudo mkdir -p /etc/modprobe.d
+  printf 'blacklist dvb_usb_rtl28xxu\nblacklist rtl2832\nblacklist rtl2830\n' |
+    sudo tee /etc/modprobe.d/airframes-rtlsdr.conf >/dev/null
+  sudo modprobe -r dvb_usb_rtl28xxu 2>/dev/null || true
+}
+
+# Native install: the release .deb on apt systems (it brings SoapySDR and the
+# SDR libraries), else the tarball, when the binary runs here; else 1 so the
+# caller can use Docker. Releases from 0.23.2 have amd64, arm64 and armhf
+# builds for glibc 2.35 and up (Bookworm, Ubuntu 22.04, Pi OS 32-bit).
+XNG_BIN=/usr/local/bin/xng
+# Check a downloaded release file against the release's SHA256SUMS.
+# Stops the installer on a mismatch; carries on (with a note) when the
+# release publishes no checksums (xng before 0.24.0).
+verify_release_file() {
+  local base="$1" name="$2" file="$3" sums="${XNG_SUMS_FILE:-}" want got
+  [ "$sums" = none ] && return 0
+  if [ -z "$sums" ]; then
+    sums=$(mktemp)
+    if ! curl -fsSL "${base}/SHA256SUMS" -o "$sums" 2>/dev/null || [ ! -s "$sums" ]; then
+      rm -f "$sums"
+      XNG_SUMS_FILE=none
+      substep "This xng release has no SHA256SUMS; not checking the download"
+      return 0
+    fi
+    XNG_SUMS_FILE="$sums"
+  fi
+  want=$(awk -v n="$name" '$2 == n || $2 == "*"n {print $1}' "$sums" | head -1)
+  if [ -z "$want" ]; then
+    substep "SHA256SUMS doesn't list ${name}; not checking it"
+    return 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum "$file" | awk '{print $1}')
+  else got=$(shasum -a 256 "$file" | awk '{print $1}'); fi
+  if [ "$got" != "$want" ]; then
+    warn "${name} doesn't match the release's SHA256SUMS (got ${got}, expected ${want})."
+    warn "The download was corrupted or changed on the way, so it isn't installed."
+    return 1
+  fi
+  substep "Checked ${name} (SHA-256)"
+  return 0
+}
+
+install_xng_native() {
+  local ver="$1" target debarch
+  case "$ARCH" in
+    amd64) target="x86_64-unknown-linux-gnu";      debarch=amd64 ;;
+    arm64) target="aarch64-unknown-linux-gnu";     debarch=arm64 ;;
+    armv7) target="armv7-unknown-linux-gnueabihf"; debarch=armhf ;;
+    *) return 1 ;;
+  esac
+  [ "$OS" = "linux" ] || return 1
+  local tmp base="https://github.com/airframesio/xng/releases/download/v${ver}"
+  tmp=$(mktemp -d)
+
+  if [ "$PKG" = "apt" ] && command -v dpkg >/dev/null 2>&1 &&
+     [ "$(dpkg --print-architecture 2>/dev/null)" = "$debarch" ]; then
+    substep "Downloading xng ${ver} (${debarch}.deb)"
+    if curl -fsSL "${base}/xng-${ver}-${debarch}.deb" -o "${tmp}/xng.deb" 2>/dev/null; then
+      if ! verify_release_file "$base" "xng-${ver}-${debarch}.deb" "${tmp}/xng.deb"; then
+        substep "Trying the tarball instead"
+      elif chmod 644 "${tmp}/xng.deb" && apt_update_once &&
+           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${tmp}/xng.deb" >/dev/null 2>&1; then
+        # The package's own binary, not the first xng on PATH (an older
+        # tarball install in /usr/local/bin would win there)
+        local deb_bin="" pkg_name
+        pkg_name=$(dpkg-deb -f "${tmp}/xng.deb" Package 2>/dev/null || echo xng)
+        deb_bin=$(dpkg -L "$pkg_name" 2>/dev/null | grep -E '/s?bin/xng$' | head -1 || true)
+        [ -n "$deb_bin" ] || deb_bin=/usr/bin/xng
+        [ -x "$deb_bin" ] || deb_bin=""
+        if [ -n "$deb_bin" ] && "$deb_bin" --version >/dev/null 2>&1; then
+          XNG_BIN="$deb_bin"
+          rm -rf "$tmp"
+          ok "Installed $("$XNG_BIN" --version 2>/dev/null | head -1) (package)"
+          return 0
+        fi
+        substep "The xng ${ver} package doesn't run here; trying the tarball"
+      else
+        substep "apt couldn't install the xng ${ver} package; trying the tarball"
+      fi
+    fi
+  fi
+
+  install_xng_runtime
+  substep "Downloading xng ${ver} (${target})"
+  if ! curl -fsSL "${base}/xng-v${ver}-${target}.tar.gz" -o "${tmp}/xng.tgz"; then
+    rm -rf "$tmp"; return 1
+  fi
+  if ! verify_release_file "$base" "xng-v${ver}-${target}.tar.gz" "${tmp}/xng.tgz"; then
+    rm -rf "$tmp"; return 1
+  fi
+  if ! tar xzf "${tmp}/xng.tgz" -C "$tmp"; then
+    rm -rf "$tmp"; return 1
+  fi
+  local bin
+  bin=$(find "$tmp" -type f -name xng -perm -u+x | head -1)
+  if [ -z "$bin" ] || ! "$bin" --version >/dev/null 2>&1; then
+    local why=""
+    [ -n "$bin" ] && why=$("$bin" --version 2>&1 | grep -o "GLIBC_[0-9.]*\|lib[A-Za-z0-9_.-]*: cannot open" | head -1)
+    substep "The xng ${ver} binary doesn't run on this system${why:+ (${why})}"
+    rm -rf "$tmp"; return 1
+  fi
+  sudo install -m 755 "$bin" /usr/local/bin/xng
+  XNG_BIN=/usr/local/bin/xng
+  rm -rf "$tmp"
+  ok "Installed $("$XNG_BIN" --version 2>/dev/null | head -1)"
+}
+
+# RTL-SDR, Airspy and HackRF access for the plugdev group (xng runs as xng:plugdev)
+SDR_UDEV_RULE=/etc/udev/rules.d/60-airframes-sdr.rules
+install_sdr_udev_rule() {
+  sudo mkdir -p "$(dirname "$SDR_UDEV_RULE")"
+  sudo tee "$SDR_UDEV_RULE" >/dev/null << 'EOF'
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", GROUP="plugdev", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", GROUP="plugdev", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="60a1", GROUP="plugdev", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="03eb", ATTRS{idProduct}=="800c", GROUP="plugdev", MODE="0664"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="6089", GROUP="plugdev", MODE="0664"
+EOF
+  sudo udevadm control --reload-rules 2>/dev/null || true
+  sudo udevadm trigger 2>/dev/null || true
+}
+
+install_xng_service_native() {
+  if ! id xng >/dev/null 2>&1; then
+    sudo useradd --system --no-create-home --shell /usr/sbin/nologin xng 2>/dev/null || true
+  fi
+  sudo usermod -aG plugdev xng 2>/dev/null || true
+  sudo mkdir -p /var/lib/xng /var/cache/xng
+  sudo chown -R xng: "$XNG_CONFIG_DIR" /var/lib/xng /var/cache/xng 2>/dev/null || true
+  sudo tee /etc/systemd/system/xng-station.service >/dev/null << EOF
+[Unit]
+Description=xng station (Airframes feeder)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${XNG_BIN} station ${XNG_CONFIG_DIR}/station.toml
+Restart=on-failure
+RestartSec=10
+User=xng
+Group=plugdev
+Environment=XDG_CACHE_HOME=/var/cache/xng
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=${XNG_CONFIG_DIR} /var/lib/xng /var/cache/xng
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  [ -f "$SDR_UDEV_RULE" ] || install_sdr_udev_rule
+  if have_systemd; then
+    sudo systemctl daemon-reload
+    sudo systemctl enable xng-station >/dev/null 2>&1
+    sudo systemctl restart xng-station
+    ok "xng is running as the xng-station service"
+  else
+    warn "systemd isn't running here. Start xng with: xng station ${XNG_CONFIG_DIR}/station.toml"
+  fi
+}
+
+install_xng_docker() {
+  local ver="$1"
+  ensure_docker || return 1
+  local compose_dir="${CONFIG_DIR}/xng"
+  sudo mkdir -p "$compose_dir"
+  sudo tee "${compose_dir}/docker-compose.yml" >/dev/null << EOF
+services:
+  xng:
+    image: ${XNG_IMAGE_REPO}:${ver}
+    container_name: xng-station
+    restart: unless-stopped
+    network_mode: host
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    volumes:
+      - ${XNG_CONFIG_DIR}:${XNG_CONFIG_DIR}
+      - xng-cache:/var/cache/xng
+    command: ["station", "${XNG_CONFIG_DIR}/station.toml"]
+volumes:
+  xng-cache:
+EOF
+  if ! (cd "$compose_dir" && sudo docker compose pull -q && sudo docker compose up -d); then
+    err "Couldn't start the xng container (${compose_dir}/docker-compose.yml)"
+    return 1
+  fi
+  ok "xng is running in Docker (${compose_dir}/docker-compose.yml)"
+}
+
+# --- Switching old decoder setups to xng -------------------------------------
+#
+# Earlier setups run one decoder per SDR: acarsdec, dumpvdl2, dumphfdl,
+# vdlm2dec or AIS-catcher, as systemd services (this installer's
+# airframes-<decoder> units, wiedehopf's scripts, AIS-catcher's package),
+# Docker containers (sdr-enthusiasts images, AIS-catcher, shipfeeder) or the
+# docker-compose files the old installer wrote to ${CONFIG_DIR}/<decoder>.
+# They hold the SDRs xng needs. The installer offers to give each SDR the
+# same job in xng, with the same station name, gain and frequencies, and
+# stops the old decoders without removing them. What it stopped is written
+# to ${OLD_DECODERS_FILE}; `installer restore-decoders` stops xng and starts
+# them again.
+
+OLD_DECODERS_FILE="${CONFIG_DIR}/old-decoders.tsv"
+KEEP_OLD_DECODERS=false   # --keep-old-decoders: leave them running
+# Old decoders found, one per line, tab-separated:
+#   kind name program mode ident sdr-kind sdr-serial sdr-index gain channels state
+# kind: systemd, docker or compose (a compose file with no container).
+# state: running, enabled (starts at boot) or stopped.
+declare -a OLD_DECODERS=()
+declare -a OLD_UNITS=()        # what stop_old_decoders stops: "kind<TAB>name"
+# Per SDR (same index as XNG_SDRS), what the old decoder on it did
+declare -a MIG_FROM=() MIG_MODE=() MIG_IDENT=() MIG_GAIN=() MIG_CHANNELS=()
+MIG_STATION_SUGGESTION=""      # station ID the old decoders shared
+MIGRATING=false                # the person chose to switch them to xng
+
+# `docker`, or `sudo -n docker` when the user isn't in the docker group
+docker_ro() {
+  command -v docker >/dev/null 2>&1 || return 1
+  if timeout 10 docker "$@" 2>/dev/null; then return 0; fi
+  [ "$(id -u)" = 0 ] && return 1
+  timeout 10 sudo -n docker "$@" 2>/dev/null
+}
+
+# Field $2 (from 0) of a tab-separated line; tabs are whitespace to read, so
+# empty fields would collapse: split on \x1f instead.
+old_field() { local IFS=$'\x1f'; local -a f; read -ra f <<< "${1//$'\t'/$'\x1f'}"; echo "${f[$2]:-}"; }
+
+# Find the old decoders and read their settings. The reading is in Python
+# (shell words in ExecStart, EnvironmentFile variables, docker inspect JSON).
+collect_old_decoders() {
+  OLD_DECODERS=()
+  [ "$OS" = "linux" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  local inspect states line
+  inspect=$(mktemp); states=$(mktemp)
+  local -a names=()
+  if command -v docker >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      [ -n "$line" ] && names+=("$line")
+    done < <(docker_ro ps -a --format '{{.Names}}' || true)
+    if [ ${#names[@]} -gt 0 ]; then docker_ro inspect "${names[@]}" > "$inspect" || true; fi
+  fi
+  # systemd unit states, for the units that look like decoders
+  local f unit
+  if have_systemd; then
+    for f in /etc/systemd/system/*.service /lib/systemd/system/*.service /usr/lib/systemd/system/*.service; do
+      [ -f "$f" ] || continue
+      grep -qiE '^ExecStart=.*(acarsdec|dumpvdl2|dumphfdl|vdlm2dec|ais-?catcher)' "$f" 2>/dev/null || continue
+      unit=$(basename "$f" .service)
+      printf '%s\t%s\t%s\n' "$unit" \
+        "$(systemctl is-enabled "$unit" 2>/dev/null | head -1 || true)" \
+        "$(systemctl is-active "$unit" 2>/dev/null | head -1 || true)" >> "$states"
+    done
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] && OLD_DECODERS+=("$line")
+  done < <(python3 - "$inspect" "$states" "$CONFIG_DIR" <<'PY' || true
+import glob, json, os, re, shlex, sys
+
+inspect_path, states_path, config_dir = sys.argv[1:4]
+PROGRAMS = {"acarsdec": "acars", "vdlm2dec": "vdl2", "dumpvdl2": "vdl2",
+            "dumphfdl": "hfdl", "ais-catcher": "ais"}
+NAMES = {"ais-catcher": "AIS-catcher"}
+
+def program_of(word):
+    b = os.path.basename(word).lower()
+    if b in ("ais-catcher", "aiscatcher"):
+        return "ais-catcher"
+    return b if b in PROGRAMS else None
+
+def program_in(text):
+    t = text.lower()
+    for p in ("acarsdec", "dumpvdl2", "dumphfdl", "vdlm2dec"):
+        if p in t:
+            return p
+    if re.search(r"ais-?catcher|shipfeeder", t):
+        return "ais-catcher"
+    return None
+
+def num(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+def soapy(s, out):
+    kv = dict(p.split("=", 1) for p in s.split(",") if "=" in p)
+    drv = kv.get("driver", "").lower()
+    if drv:
+        out["kind"] = drv
+    if kv.get("serial"):
+        out["serial"] = kv["serial"]
+
+def rtl_dev(v, out):
+    out["kind"] = "rtlsdr"
+    out["serial"] = v
+    if re.fullmatch(r"\d{1,2}", v):
+        out["index"] = str(int(v))
+
+def mhz_list(words, lo, hi):
+    """Frequencies (MHz, kHz or Hz) within lo..hi MHz, as MHz floats."""
+    out = []
+    for w in words:
+        v = num(w)
+        if v is None:
+            continue
+        for mhz in (v, v / 1e3, v / 1e6):
+            if lo <= mhz <= hi:
+                out.append(mhz)
+                break
+    return out
+
+def parse_args(prog, argv):
+    r = {"ident": "", "kind": "", "serial": "", "index": "", "gain": "", "freqs": []}
+    sdr = {}
+    i, n = 0, len(argv)
+    rest = []
+    def val():
+        return argv[i + 1] if i + 1 < n else ""
+    while i < n:
+        a = argv[i]
+        key, eq, inline = a.partition("=")
+        if a.startswith("--") and eq:
+            a, v, step = key, inline, 1
+        else:
+            v, step = val(), 2
+        if prog in ("acarsdec", "vdlm2dec"):
+            if a in ("-i", "--station-id", "--ident"): r["ident"] = v
+            elif a in ("-r", "--rtlsdr"): rtl_dev(v, sdr)
+            elif a in ("-g", "--gain"): r["gain"] = v
+            elif a in ("--soapysdr", "-d"): soapy(v, sdr)
+            elif a in ("-s", "--airspy"): sdr["kind"] = "airspy"; step = 1
+            elif a in ("-o", "-j", "-p", "-l", "-n", "-N", "-m", "-t", "-b", "-c", "-A", "--output", "-e"):
+                pass
+            else:
+                rest.append(a); step = 1
+        elif prog in ("dumpvdl2", "dumphfdl"):
+            if a == "--station-id": r["ident"] = v
+            elif a == "--rtlsdr": rtl_dev(v, sdr)
+            elif a == "--soapysdr": soapy(v, sdr)
+            elif a == "--airspy": sdr["kind"] = "airspy"
+            elif a == "--sdrplay": sdr["kind"] = "sdrplay"
+            elif a == "--gain": r["gain"] = v
+            elif a.startswith("--") and a not in ("--utc", "--milliseconds", "--raw-frames", "--decode-fragments", "--prettify-xml", "--prettify-json", "--statsd"):
+                pass  # option with a value
+            else:
+                rest.append(a); step = 1
+        else:  # AIS-catcher
+            if a.startswith("-d:"):
+                sdr["kind"] = "rtlsdr"; sdr["index"] = a[3:]; step = 1
+            elif a == "-d" and v and not v.startswith("-"):
+                rtl_dev(v, sdr)
+            elif a == "-gr":
+                # -gr TUNER 38.6 RTLAGC off ...
+                j = i + 1
+                while j + 1 < n and not argv[j].startswith("-"):
+                    if argv[j].upper() == "TUNER" and num(argv[j + 1]) is not None:
+                        r["gain"] = argv[j + 1]
+                    j += 2
+                step = j - i
+            elif a == "-H":
+                j = i + 2
+                while j + 1 < n and not argv[j].startswith("-"):
+                    if argv[j].upper() == "ID":
+                        r["ident"] = argv[j + 1]
+                    j += 2
+                step = j - i
+            else:
+                step = 1
+        i += step
+    if prog in ("acarsdec", "vdlm2dec", "dumpvdl2"):
+        r["freqs"] = mhz_list(rest, 118, 138)
+    elif prog == "dumphfdl":
+        r["freqs"] = mhz_list([w for w in rest if num(w) and num(w) >= 1000], 2, 30)
+    r.update(sdr)
+    return r
+
+def env_settings(prog, env, r):
+    for k in ("FEED_ID", "STATION_ID", "AIRFRAMES_STATION_ID"):
+        if env.get(k) and not r["ident"]:
+            r["ident"] = env[k]
+    for k in ("SERIAL", "RTLSDR_DEVICE_SERIAL", "DEVICE_SERIAL"):
+        if env.get(k):
+            r["kind"] = r["kind"] or "rtlsdr"; r["serial"] = env[k]
+    for k in ("SOAPYSDRDRIVER", "SOAPYSDR", "SOAPY_DEVICE"):
+        if env.get(k):
+            soapy(env[k], r)
+    for k in ("GAIN", "RTLSDR_DEVICE_GAIN"):
+        if env.get(k) and not r["gain"]:
+            r["gain"] = env[k]
+    if env.get("FREQUENCIES") and not r["freqs"]:
+        words = re.split(r"[;,\s]+", env["FREQUENCIES"])
+        r["freqs"] = mhz_list(words, 118, 138) if prog != "dumphfdl" else mhz_list(words, 2, 30)
+
+def channels(prog, freqs):
+    if not freqs or prog == "ais-catcher":
+        return ""
+    lo, hi = min(freqs), max(freqs)
+    if prog == "dumphfdl":
+        if hi - lo > 0.24:   # the old capture was 250 kHz wide
+            return ""
+        return ",".join("%dk" % round(f * 1000) for f in sorted(set(freqs)))
+    if hi - lo > 1.9:        # more than one RTL-SDR capture
+        return ""
+    return ",".join("%.3f" % f for f in sorted(set(freqs)))
+
+def clean(s):
+    return re.sub(r"[\t\r\n]", " ", str(s or "")).strip()
+
+def emit(kind, name, prog, r, state):
+    gain = r["gain"] if num(r["gain"]) is not None and 0 <= num(r["gain"]) <= 60 else ""
+    print("\t".join(clean(x) for x in (
+        kind, name, NAMES.get(prog, prog), PROGRAMS[prog], r["ident"], r["kind"],
+        r["serial"], r["index"], gain, channels(prog, r["freqs"]), state)) )
+
+def env_file(path, env):
+    try:
+        for line in open(path):
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.replace("export ", "").strip()
+            try:
+                v = " ".join(shlex.split(v))
+            except ValueError:
+                v = v.strip().strip('"')
+            env[k] = v
+    except OSError:
+        pass
+
+def expand(words, env):
+    out = []
+    for w in words:
+        if re.fullmatch(r"\$\{?(\w+)\}?", w):
+            try:
+                out += shlex.split(env.get(re.sub(r"[${}]", "", w), ""))
+            except ValueError:
+                pass
+        else:
+            out.append(re.sub(r"\$\{?(\w+)\}?", lambda m: env.get(m.group(1), ""), w))
+    return out
+
+# systemd units
+states = {}
+for line in open(states_path):
+    p = line.rstrip("\n").split("\t")
+    if len(p) == 3:
+        states[p[0]] = p
+seen = set()
+for path in sorted(glob.glob("/etc/systemd/system/*.service")) + \
+            sorted(glob.glob("/lib/systemd/system/*.service")) + \
+            sorted(glob.glob("/usr/lib/systemd/system/*.service")):
+    unit = os.path.basename(path)[:-len(".service")]
+    if unit in seen or unit not in states or unit.startswith("xng"):
+        continue
+    seen.add(unit)
+    env, execs = {}, []
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        continue
+    for line in lines:
+        line = line.strip()
+        if line.startswith("EnvironmentFile="):
+            env_file(line.split("=", 1)[1].lstrip("-"), env)
+        elif line.startswith("Environment="):
+            try:
+                for kv in shlex.split(line.split("=", 1)[1]):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1); env[k] = v
+            except ValueError:
+                pass
+        elif line.startswith("ExecStart="):
+            execs.append(line.split("=", 1)[1].lstrip("-@+!:"))
+    for cmd in execs:
+        try:
+            words = expand(shlex.split(cmd), env)
+        except ValueError:
+            continue
+        if not words:
+            continue
+        prog = program_of(words[0])
+        argv = words[1:]
+        if not prog:
+            # A start script: use its line that runs the decoder
+            script = words[0] if os.path.isfile(words[0]) else ""
+            if words[0] in ("/bin/sh", "/bin/bash", "sh", "bash") and len(words) > 1:
+                script = words[-1] if os.path.isfile(words[-1]) else ""
+                if not script and "-c" in words:
+                    words = shlex.split(words[words.index("-c") + 1]); script = ""
+                    prog = program_of(words[0]) if words else None; argv = words[1:]
+            if script:
+                try:
+                    body = open(script, errors="replace").read()
+                except OSError:
+                    body = ""
+                for l in body.splitlines():
+                    l = l.strip()
+                    if l.startswith("#"):
+                        continue
+                    try:
+                        ws = expand(shlex.split(l), env)
+                    except ValueError:
+                        continue
+                    ws = [w for w in ws if w != "exec"]
+                    if ws and program_of(ws[0]):
+                        prog, argv = program_of(ws[0]), ws[1:]
+                        break
+            if not prog:
+                prog = program_in(cmd + " " + unit)
+                argv = []
+        if not prog:
+            continue
+        if prog == "ais-catcher":
+            # AIS-catcher's package keeps its options in /etc/AIS-catcher/config.cmd
+            cfg = "/etc/AIS-catcher/config.cmd"
+            if os.path.isfile(cfg):
+                try:
+                    for l in open(cfg):
+                        l = l.strip()
+                        if l and not l.startswith("#"):
+                            argv += shlex.split(l)
+                except (OSError, ValueError):
+                    pass
+        r = parse_args(prog, argv)
+        env_settings(prog, env, r)
+        _, enabled, active = states[unit]
+        state = "running" if active == "active" else ("enabled" if enabled == "enabled" else "stopped")
+        emit("systemd", unit, prog, r, state)
+        break
+
+# Docker containers
+containers = set()
+try:
+    data = json.load(open(inspect_path))
+except (OSError, ValueError):
+    data = []
+for c in data or []:
+    name = (c.get("Name") or "").lstrip("/")
+    cfg = c.get("Config") or {}
+    image = cfg.get("Image") or ""
+    if name.startswith("xng") or "acarshub" in image.lower():
+        continue
+    prog = program_in(image) or program_in(name)
+    if not prog:
+        continue
+    env = dict(e.split("=", 1) for e in (cfg.get("Env") or []) if "=" in e)
+    args = list(cfg.get("Entrypoint") or []) + list(cfg.get("Cmd") or [])
+    words = [w for w in args if program_of(w)]
+    argv = args[args.index(words[0]) + 1:] if words else args
+    r = parse_args(prog, argv)
+    env_settings(prog, env, r)
+    st = c.get("State") or {}
+    policy = ((c.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name") or "no"
+    state = "running" if st.get("Running") else ("enabled" if policy in ("always",) else "stopped")
+    emit("docker", name, prog, r, state)
+    containers.add(name)
+
+# docker-compose files from the old installer that never got a container
+for path in sorted(glob.glob(os.path.join(config_dir, "*", "docker-compose.yml"))):
+    d = os.path.basename(os.path.dirname(path))
+    if d == "xng" or d not in PROGRAMS or "airframes-" + d in containers:
+        continue
+    env = {}
+    try:
+        for l in open(path):
+            m = re.match(r'\s+([A-Z_]+):\s*"?(.*?)"?\s*$', l)
+            if m:
+                env[m.group(1)] = m.group(2)
+    except OSError:
+        continue
+    r = parse_args(d, [])
+    env_settings(d, env, r)
+    emit("compose", path, d, r, "stopped")
+PY
+)
+  rm -f "$inspect" "$states"
+  return 0
+}
+
+# Is this mode suffix one Airframes knows (as xng's auto-suffix)?
+known_suffix() {
+  case "$1" in ACARS|VDL2|HFDL|AIS|IMSL|IRDM|STDC|ADSB|UAT|SARSAT|DSC|NAVTEX|SONDE|ADSL|ATCS) return 0 ;; esac
+  return 1
+}
+
+# The station ID without its mode suffix: KE-KSEA-ACARS1 -> KE-KSEA
+ident_stem() {
+  local s="$1" last
+  [[ "$s" == *-* ]] || { echo "$s"; return 0; }
+  last="${s##*-}"
+  if known_suffix "$last" || known_suffix "$(echo "$last" | sed 's/[0-9]*$//')"; then
+    echo "${s%-*}"
+  else
+    echo "$s"
+  fi
+}
+
+# The ID xng feeds a mode under with auto-suffix (outputs/airframes.rs)
+xng_auto_ident() {
+  local base="$1" suffix last alpha
+  case "$2" in
+    acars) suffix=ACARS ;; vdl2) suffix=VDL2 ;; hfdl) suffix=HFDL ;; ais) suffix=AIS ;;
+    iridium) suffix=IRDM ;; adsb) suffix=ADSB ;; uat) suffix=UAT ;; sonde) suffix=SONDE ;;
+    *) echo "$base"; return 0 ;;
+  esac
+  if [[ "$base" == *-* ]]; then
+    last="${base##*-}"
+    alpha=$(echo "$last" | sed 's/[0-9]*$//')
+    known_suffix "$alpha" && base="${base%-*}"
+  fi
+  echo "${base}-${suffix}"
+}
+
+# The XNG_SDRS index of an old decoder's SDR, or nothing
+old_decoder_sdr() {
+  local kind serial idx i n=0 only=""
+  kind=$(old_field "$1" 5); serial=$(old_field "$1" 6); idx=$(old_field "$1" 7)
+  [ -n "$kind" ] || return 0
+  for i in "${!XNG_SDRS[@]}"; do
+    [ "$(sdr_field "${XNG_SDRS[$i]}" 0)" = "$kind" ] || continue
+    n=$((n + 1)); only="$i"
+    if [ -n "$serial" ] && [ "$(sdr_field "${XNG_SDRS[$i]}" 1)" = "$serial" ]; then echo "$i"; return 0; fi
+  done
+  if [ -n "$idx" ]; then
+    for i in "${!XNG_SDRS[@]}"; do
+      [ "$(sdr_field "${XNG_SDRS[$i]}" 0)" = "$kind" ] || continue
+      [ "$(sdr_field "${XNG_SDRS[$i]}" 2)" = "$idx" ] && { echo "$i"; return 0; }
+    done
+  fi
+  # No serial or index given: the only SDR of that kind
+  if [ -z "$serial" ] && [ -z "$idx" ] && [ "$n" -eq 1 ]; then echo "$only"; fi
+  return 0
+}
+
+old_decoder_line() {
+  local r="$1" what ident chans
+  what="$(old_field "$r" 2)"
+  ident=$(old_field "$r" 4); chans=$(old_field "$r" 9)
+  case "$(old_field "$r" 0)" in
+    systemd) what+=" (systemd ${BOLD}$(old_field "$r" 1)${RESET})" ;;
+    docker)  what+=" (Docker ${BOLD}$(old_field "$r" 1)${RESET})" ;;
+    compose) what+=" (compose file ${BOLD}$(old_field "$r" 1)${RESET})" ;;
+  esac
+  case "$(old_field "$r" 10)" in
+    running) what+=", running" ;; enabled) what+=", starts at boot" ;; *) what+=", stopped" ;;
+  esac
+  local -a parts=()
+  [ -n "$ident" ] && parts+=("station ${ident}")
+  if [ -n "$(old_field "$r" 7)" ] && [ "$(old_field "$r" 6)" = "$(old_field "$r" 7)" ]; then
+    parts+=("RTL-SDR $(old_field "$r" 7)")
+  elif [ -n "$(old_field "$r" 6)" ]; then parts+=("SDR serial $(old_field "$r" 6)")
+  elif [ -n "$(old_field "$r" 7)" ]; then parts+=("SDR $(old_field "$r" 7)")
+  elif [ -n "$(old_field "$r" 5)" ]; then parts+=("$(old_field "$r" 5)"); fi
+  [ -n "$(old_field "$r" 8)" ] && parts+=("gain $(old_field "$r" 8)")
+  [ -n "$chans" ] && parts+=("${chans//,/ }")
+  echo -e "  ${CYAN}●${RESET} ${what}"
+  [ ${#parts[@]} -gt 0 ] && echo -e "      ${DIM}$(join_by ', ' "${parts[@]}")${RESET}"
+  return 0
+}
+
+# Before the station ID is chosen: find old decoders, ask whether xng
+# should take them over, and suggest the station ID they fed under.
+find_old_decoders() {
+  collect_old_decoders
+  [ ${#OLD_DECODERS[@]} -gt 0 ] || return 0
+  local r stem
+  echo
+  info "Found decoders set up before on this machine:"
+  for r in "${OLD_DECODERS[@]}"; do old_decoder_line "$r"; done
+  if [ "$KEEP_OLD_DECODERS" = true ]; then
+    MIGRATING=false
+    return 0
+  fi
+  echo -e "  xng can take them over: each SDR keeps its job, station name, gain and"
+  echo -e "  frequencies. The old decoders are stopped, not removed, and"
+  echo -e "  ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders${RESET}"
+  echo -e "  switches back."
+
+  if ui_confirm "Switch them to xng?" "yes"; then
+    MIGRATING=true
+  else
+    MIGRATING=false
+  fi
+
+  [ "$MIGRATING" = true ] || return 0
+  declare -A count=()
+  for r in "${OLD_DECODERS[@]}"; do
+    [ -n "$(old_field "$r" 4)" ] || continue
+    stem=$(normalize_station_ident "$(ident_stem "$(old_field "$r" 4)")" 2>/dev/null) || continue
+    count[$stem]=$(( ${count[$stem]:-0} + 1 ))
+  done
+  local best="" k
+  for k in "${!count[@]}"; do
+    if [ -z "$best" ] || [ "${count[$k]}" -gt "${count[$best]}" ]; then best="$k"; fi
+  done
+  MIG_STATION_SUGGESTION="$best"
+  return 0
+}
+
+# After the default jobs: give each SDR an old decoder used the same job,
+# station name, gain and frequencies in xng (or leave it to the old decoder).
+apply_old_decoders() {
+  OLD_UNITS=()
+  # Other ACARS software this can't take over (no unit or container)
+  local others=() s r covered
+  for s in "${ACARS_SOFTWARE[@]}"; do
+    covered=false
+    for r in "${OLD_DECODERS[@]}"; do
+      case "${s#docker:}" in "$(old_field "$r" 1)"|"$(old_field "$r" 2)") covered=true ;; esac
+      [ "$(old_field "$r" 2)" = AIS-catcher ] && [ "${s#docker:}" = AIS-catcher ] && covered=true
+    done
+    [ "$covered" = true ] || others+=("$s")
+  done
+  if [ ${#others[@]} -gt 0 ]; then
+    warn "Also running: ${others[*]}. If it uses an SDR you give xng, stop it first."
+  fi
+  [ ${#OLD_DECODERS[@]} -gt 0 ] || return 0
+
+  local i running
+  for r in "${OLD_DECODERS[@]}"; do
+    i=$(old_decoder_sdr "$r")
+    if [ "$MIGRATING" = true ]; then
+      [ "$(old_field "$r" 0)" = compose ] || OLD_UNITS+=("$(old_field "$r" 0)"$'\t'"$(old_field "$r" 1)")
+    fi
+    if [ -z "$i" ]; then
+      [ -n "$(old_field "$r" 5)" ] || [ "$MIGRATING" = false ] ||
+        warn "Can't tell which SDR $(old_field "$r" 1) uses; check the job xng gives each SDR."
+      [ -z "$(old_field "$r" 5)" ] || [ "$MIGRATING" = false ] ||
+        warn "The SDR $(old_field "$r" 1) used isn't plugged in; its job isn't carried over."
+      continue
+    fi
+    # Two old decoders on one SDR: the running one wins
+    if [ -n "${MIG_FROM[$i]:-}" ]; then
+      running=$(old_field "$r" 10)
+      [ "$running" = running ] || continue
+    fi
+    MIG_FROM[$i]="$(old_field "$r" 1)"
+    if [ "$MIGRATING" = true ]; then
+      MIG_MODE[$i]="$(old_field "$r" 3)"
+      MIG_IDENT[$i]="$(old_field "$r" 4)"
+      MIG_GAIN[$i]="$(old_field "$r" 8)"
+      MIG_CHANNELS[$i]="$(old_field "$r" 9)"
+      XNG_JOBS[$i]="${MIG_MODE[$i]}"
+    else
+      XNG_JOBS[$i]="keep-old"
+    fi
+  done
+  if [ "$MIGRATING" = true ]; then
+    local -a took=()
+    for r in "${OLD_DECODERS[@]}"; do took+=("$(old_field "$r" 1)"); done
+    ok "xng takes over: $(join_by ', ' "${took[@]}")"
+  else
+    warn "Leaving them running. xng won't use their SDRs."
+  fi
+  return 0
+}
+
+# The IDs the sessions feed Airframes under, for the summary
+xng_feed_idents() {
+  local i job id out=()
+  for i in "${!XNG_SDRS[@]}"; do
+    job="${XNG_JOBS[$i]}"
+    case "$job" in acars|vdl2|hfdl|ais|iridium) ;; *) continue ;; esac
+    id=$(xng_auto_ident "$STATION_IDENT" "$job")
+    if [ "${MIG_MODE[$i]:-}" = "$job" ] && [ -n "${MIG_IDENT[$i]:-}" ]; then id="${MIG_IDENT[$i]}"; fi
+    out+=("$id")
+  done
+  join_by ', ' "${out[@]}"
+}
+
+# Settings carried over from an old decoder, for render_station_toml
+render_migrated_settings() {
+  local i="$1" job="$2" g c first=true
+  [ "${MIG_MODE[$i]:-}" = "$job" ] || return 0
+  g="${MIG_GAIN[$i]:-}"
+  if [ -n "$g" ]; then
+    [[ "$g" == *.* ]] || g="${g}.0"
+    echo "gain = ${g}"
+  fi
+  if [ -n "${MIG_CHANNELS[$i]:-}" ]; then
+    printf 'channels = ['
+    IFS=',' read -ra chans <<< "${MIG_CHANNELS[$i]}"
+    for c in "${chans[@]}"; do
+      [ "$first" = true ] || printf ', '
+      printf '"%s"' "$c"; first=false
+    done
+    printf ']\n'
+  fi
+  # Keep the station name the old decoder fed under when xng's would differ
+  local ident="${MIG_IDENT[$i]:-}"
+  if [ -n "$ident" ] && [ "$ident" != "$(xng_auto_ident "$STATION_IDENT" "$job")" ]; then
+    echo "airframes-station-id = $(toml_str "$ident")"
+  fi
+  return 0
+}
+
+# Stop the old decoders, without removing them, and write down how to
+# start them again.
+stop_old_decoders() {
+  [ ${#OLD_UNITS[@]} -gt 0 ] || return 0
+  local u kind name enabled active policy
+  sudo mkdir -p "$CONFIG_DIR"
+  if [ ! -f "$OLD_DECODERS_FILE" ]; then
+    printf '# Decoders the Airframes installer stopped when it switched this machine to xng.\n# Start them again with: curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders\n# kind\tname\twas-enabled\twas-active\trestart-policy\tstopped-at\n' |
+      sudo tee "$OLD_DECODERS_FILE" >/dev/null
+  fi
+  for u in "${OLD_UNITS[@]}"; do
+    kind="${u%%$'\t'*}"; name="${u#*$'\t'}"
+    case "$kind" in
+      systemd)
+        enabled=no; active=no
+        systemctl is-enabled --quiet "$name" 2>/dev/null && enabled=yes
+        systemctl is-active --quiet "$name" 2>/dev/null && active=yes
+        policy=""
+        sudo systemctl disable --now "$name" >/dev/null 2>&1 || true
+        ;;
+      docker)
+        enabled=""; policy=$(docker_ro inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$name" || echo no)
+        active=no
+        [ "$(docker_ro inspect -f '{{.State.Running}}' "$name" || true)" = true ] && active=yes
+        # So it doesn't come back when Docker or the machine restarts
+        sudo docker update --restart=no "$name" >/dev/null 2>&1 || true
+        sudo docker stop "$name" >/dev/null 2>&1 || true
+        ;;
+    esac
+    # Set up again after an earlier switch: keep the first record
+    if ! grep -q "^${kind}"$'\t'"${name}"$'\t' "$OLD_DECODERS_FILE" 2>/dev/null; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$kind" "$name" "${enabled:-}" "$active" "${policy:-}" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | sudo tee -a "$OLD_DECODERS_FILE" >/dev/null
+    fi
+    substep "Stopped ${name} (not removed)"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# installer restore-decoders: stop xng and start the old decoders again
+# ---------------------------------------------------------------------------
+cmd_restore_decoders() {
+  local -a rows=()
+  local line
+  if [ -r "$OLD_DECODERS_FILE" ]; then
+    while IFS= read -r line; do
+      case "$line" in "#"*|"") continue ;; esac
+      rows+=("$line")
+    done < "$OLD_DECODERS_FILE"
+  fi
+  if [ ${#rows[@]} -eq 0 ]; then
+    ok "The installer hasn't stopped any decoders here; nothing to restore."
+    return 0
+  fi
+  info "This stops xng and starts the decoders it took over again:"
+  local r
+  for r in "${rows[@]}"; do
+    case "$(old_field "$r" 0)" in
+      docker) echo -e "  ${CYAN}●${RESET} $(old_field "$r" 1) (Docker container)" ;;
+      *)      echo -e "  ${CYAN}●${RESET} $(old_field "$r" 1) (systemd service)" ;;
+    esac
+  done
+  if [ "$AUTO_YES" != true ] && ! ui_confirm "Switch back?" "yes"; then
+    info "Nothing changed."
+    return 0
+  fi
+  # xng first, so it lets go of the SDRs
+  if [ -f "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" ]; then
+    disable_auto_update
+    substep "Turned off xng's automatic updates"
+  fi
+  if [ -f /etc/systemd/system/xng-station.service ]; then
+    sudo systemctl disable --now xng-station >/dev/null 2>&1 || true
+    substep "Stopped xng-station (still installed)"
+  fi
+  if command -v docker >/dev/null 2>&1 && sudo docker inspect xng-station >/dev/null 2>&1; then
+    sudo docker update --restart=no xng-station >/dev/null 2>&1 || true
+    sudo docker stop xng-station >/dev/null 2>&1 || true
+    substep "Stopped the xng-station container (still there)"
+  fi
+  local kind name enabled active policy failed=0
+  for r in "${rows[@]}"; do
+    kind=$(old_field "$r" 0); name=$(old_field "$r" 1)
+    enabled=$(old_field "$r" 2); active=$(old_field "$r" 3); policy=$(old_field "$r" 4)
+    case "$kind" in
+      systemd)
+        [ "$enabled" = yes ] && { sudo systemctl enable "$name" >/dev/null 2>&1 || true; }
+        if [ "$active" = yes ] || [ "$enabled" = yes ]; then
+          if sudo systemctl start "$name" >/dev/null 2>&1; then substep "Started ${name}"
+          else warn "Couldn't start ${name}; see: journalctl -u ${name}"; failed=1; fi
+        else
+          substep "${name} was stopped before; left stopped"
+        fi
+        ;;
+      docker)
+        sudo docker update --restart="${policy:-unless-stopped}" "$name" >/dev/null 2>&1 || true
+        if [ "$active" = no ] && [ "$policy" = no ]; then
+          substep "${name} was stopped before; left stopped"
+        elif sudo docker start "$name" >/dev/null 2>&1; then substep "Started ${name}"
+        else warn "Couldn't start ${name}; see: docker logs ${name}"; failed=1; fi
+        ;;
+    esac
+  done
+  sudo mv "$OLD_DECODERS_FILE" "${OLD_DECODERS_FILE%.tsv}.restored-$(date -u +%Y%m%d%H%M%S).tsv"
+  if [ "$failed" = 0 ]; then
+    ok "Your old decoders are back. xng is stopped but still installed."
+  else
+    warn "Some decoders didn't start (see above). xng is stopped but still installed."
+  fi
+  info "Switch to xng again: curl -sSL https://install.airframes.sh/installer | bash -s -- xng"
+  info "Or remove xng:       curl -sSL https://install.airframes.sh/installer | bash -s -- uninstall"
+  return 0
+}
+
+setup_xng_station() {
+  step "Setting up the xng station"
+  ensure_python3 || exit 1
+  register_station
+  stop_old_decoders
+  local ver="${XNG_VERSION:-$(xng_latest_version)}"
+  # Stop an earlier xng so it lets go of the SDRs, the sign-in and its ports
+  if have_systemd && systemctl is-active --quiet xng-station 2>/dev/null; then
+    sudo systemctl stop xng-station
+  fi
+  if command -v docker >/dev/null 2>&1 && sudo docker inspect xng-station >/dev/null 2>&1; then
+    sudo docker stop xng-station >/dev/null 2>&1 || true
+  fi
+  # PiAware's SkyAware and others use 8080; take the next free port
+  if ! XNG_HTTP_PORT=$(free_port 8080); then
+    XNG_HTTP_PORT=8080
+    warn "Ports 8080-8089 are all taken; xng decodes anyway, but its dashboard won't start"
+  fi
+  if ! XNG_METRICS_PORT=$(free_port 9090); then
+    XNG_METRICS_PORT=9090
+    warn "Ports 9090-9099 are all taken; xng's metrics won't start"
+  fi
+  [ "$XNG_HTTP_PORT" = 8080 ] || substep "Port 8080 is taken; the xng dashboard uses ${XNG_HTTP_PORT}"
+  sudo mkdir -p "$XNG_CONFIG_DIR"
+  local tmp
+  tmp=$(mktemp)
+  render_station_toml > "$tmp"
+  sudo install -m 644 "$tmp" "${XNG_CONFIG_DIR}/station.toml"
+  rm -f "$tmp"
+  substep "Wrote ${XNG_CONFIG_DIR}/station.toml"
+  blacklist_dvb
+
+  xng_has_job adsb && XNG_SERVES_BEAST=true
+
+  local method="${XNG_METHOD}"
+  if [ -z "$method" ] || [ "$method" = "native" ]; then
+    report_step xng-install-native
+    if install_xng_native "$ver"; then
+      report_step xng-service
+      install_xng_service_native
+      return 0
+    fi
+    [ "$method" = "native" ] && { err "xng ${ver} has no build that runs here; try --xng-method docker."; return 1; }
+    info "Using the xng Docker image instead (it runs on every Linux, 32-bit Pi included)."
+  fi
+  report_step xng-install-docker
+  install_xng_docker "$ver"
+}
+
+xng_summary() {
+  local host i
+  host=$(hostname -I 2>/dev/null | awk '{print $1}')
+  echo
+  if [ "$XNG_HEALTH" = failed ]; then
+    warn "Your Airframes station ${BOLD}${STATION_IDENT}${RESET} is set up, but xng isn't running yet (see above):"
+  else
+    ok "Your Airframes station ${BOLD}${STATION_IDENT}${RESET} is set up:"
+  fi
+  for i in "${!XNG_SDRS[@]}"; do
+    case "${XNG_JOBS[$i]}" in off|keep-old) continue ;; esac
+    echo -e "  ${GREEN}●${RESET} $(sdr_field "${XNG_SDRS[$i]}" 3) $(sdr_field "${XNG_SDRS[$i]}" 1): $(job_label "${XNG_JOBS[$i]}")"
+  done
+  echo -e "  Dashboard:  ${CYAN}http://${host:-localhost}:${XNG_HTTP_PORT}${RESET}"
+  if [ -n "$STATION_REGISTERED" ]; then
+    echo -e "  On Airframes: ${CYAN}$(station_page_url "$STATION_REGISTERED")${RESET} (signed in as ${AF_USERNAME})"
+  else
+    if [ ${#OLD_UNITS[@]} -gt 0 ] || [ "$MIGRATING" = true ]; then
+      echo -e "  On Airframes: your feeds keep their names: $(xng_feed_idents)"
+    else
+      echo -e "  On Airframes: your feed shows up as ${STATION_IDENT}-ACARS, -VDL2, ... once data arrives."
+    fi
+    echo -e "  Claim it:   ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- sign-in${RESET}"
+  fi
+  echo -e "  Check it:   ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- status${RESET}"
+  if [ ${#OLD_UNITS[@]} -gt 0 ]; then
+    local u names=()
+    for u in "${OLD_UNITS[@]}"; do names+=("${u#*$'\t'}"); done
+    echo -e "  Stopped, not removed: $(join_by ', ' "${names[@]}")"
+    echo -e "  Switch back: ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders${RESET}"
+  fi
+}
+
+# How far the Airframes API's clock (its Date header) is ahead of this one,
+# in seconds (negative: behind). Empty when the header can't be read; fails
+# when the API doesn't answer.
+api_clock_offset() {
+  local hdr remote
+  hdr=$(curl -sS -I -m 15 "${AIRFRAMES_API}/" 2>/dev/null | tr -d '\r' || true)
+  [ -n "$hdr" ] || return 1
+  remote=$(printf '%s\n' "$hdr" | sed -n 's/^[Dd]ate: *//p' | head -1)
+  [ -n "$remote" ] || return 0
+  remote=$(date -u -d "$remote" +%s 2>/dev/null || true)
+  [ -n "$remote" ] || return 0
+  echo $(( remote - $(date -u +%s) ))
+}
+
+# ---------------------------------------------------------------------------
+# Before installing: disk space, network, clock. Warnings only.
+# ---------------------------------------------------------------------------
+preflight_checks() {
+  local free code skew
+  free=$(df -Pk / 2>/dev/null | awk 'NR == 2 {print int($4 / 1024)}' || true)
+  if [ -n "$free" ] && [ "$free" -lt 300 ]; then
+    warn "Only ${free} MB free on /. xng needs about 100 MB, plus room for logs; free some space if the install fails."
+  fi
+  code=$(curl -sS -o /dev/null -m 15 -w '%{http_code}' https://api.github.com/repos/airframesio/xng/releases/latest 2>/dev/null || true)
+  case "$code" in
+    ""|000) warn "Can't reach GitHub, where xng is downloaded from. Check this machine's internet connection and DNS." ;;
+  esac
+  if ! skew=$(api_clock_offset); then
+    warn "Can't reach ${AIRFRAMES_API}. Signing in and feeding need it."
+    return 0
+  fi
+  [ -n "$skew" ] || return 0
+  skew=${skew#-}
+  if [ "$skew" -gt 300 ]; then
+    warn "This machine's clock is off by $(( skew / 60 )) minutes. Sign-in and downloads can fail, and message times will be wrong."
+    if command -v timedatectl >/dev/null 2>&1; then
+      info "Turn on time sync with: sudo timedatectl set-ntp true"
+    fi
+  fi
+  return 0
+}
+
+# Whole xng flow, after the menu: sign in, station, hardware, jobs.
+plan_xng_station() {
+  report_step xng-prepare
+  ensure_python3 || exit 1
+  report_step preflight
+  preflight_checks
+  report_step sign-in
+  signin_step
+  report_step station-id
+  detect_station_location
+  find_old_decoders
+  choose_station_ident
+  report_step sdr-detect
+  detect_xng_sdrs
+  if [ ${#XNG_SDRS[@]} -eq 0 ]; then
+    warn "No SDR found on USB. xng is set up anyway; plug one in and run this again to choose its job."
+  fi
+  report_step plan
+  default_jobs
+  apply_old_decoders
+  apply_modes_arg
+  if [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ] && [ -z "$XNG_MODES_ARG" ] && [ ${#XNG_SDRS[@]} -gt 0 ]; then
+    tui_assign_jobs
+  fi
+  # An xng ADS-B session feeds the partners through its Beast output. Without
+  # anyone to ask, only when the antenna position was given.
+  if xng_has_job adsb && [ "$WANT_ADSB" = false ]; then
+    if [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ]; then
+      WANT_ADSB=true
+    elif [ -n "$ADSB_LAT" ] && [ -n "$ADSB_LON" ] && [ -n "$ADSB_ALT" ]; then
+      WANT_ADSB=true
+    else
+      info "xng decodes ADS-B on one SDR. To feed it to Airframes' partners, run this"
+      info "again with: -y xng adsb --lat <deg> --lon <deg> --alt <120m>"
+    fi
+  fi
+  # An ADS-B decoder already here: offer the partner feeds too
+  if [ "$WANT_ADSB" = false ] && [ ${#ADSB_SOFTWARE[@]} -gt 0 ] && [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ]; then
+    ui_confirm "Also feed your ADS-B (${ADSB_SOFTWARE[0]}) to Airframes' partners Airplanes.Live and Plane Watch?" "yes" &&
+      WANT_ADSB=true
+  fi
+  choose_airband_channels
+}
+
+# Lines for the summary before installing
+xng_plan_lines() {
+  local i
+  echo -e "  ${BOLD}xng station:${RESET} ${STATION_IDENT}${AF_USERNAME:+  (account ${AF_USERNAME})}"
+  [ -n "$STATION_LAT" ] && echo -e "  ${BOLD}Position:${RESET}    ${STATION_LAT}, ${STATION_LON}"
+  if [ ${#XNG_SDRS[@]} -eq 0 ]; then
+    echo -e "  ${BOLD}SDRs:${RESET}        none plugged in yet"
+  fi
+  local from ident
+  for i in "${!XNG_SDRS[@]}"; do
+    from=""
+    if [ -n "${MIG_FROM[$i]:-}" ] && [ "${MIG_MODE[$i]:-}" = "${XNG_JOBS[$i]}" ]; then
+      ident="${MIG_IDENT[$i]:-}"
+      [ -n "$ident" ] || ident=$(xng_auto_ident "$STATION_IDENT" "${XNG_JOBS[$i]}")
+      from="  ${DIM}(was ${MIG_FROM[$i]}, feeds as ${ident})${RESET}"
+    fi
+    echo -e "  ${BOLD}SDR ${i}:${RESET}       $(sdr_field "${XNG_SDRS[$i]}" 3) $(sdr_field "${XNG_SDRS[$i]}" 1): $(job_label "${XNG_JOBS[$i]}")${from}"
+  done
+  if [ ${#OLD_UNITS[@]} -gt 0 ]; then
+    local u names=()
+    for u in "${OLD_UNITS[@]}"; do names+=("${u#*$'\t'}"); done
+    echo -e "  ${BOLD}Stops:${RESET}       $(join_by ', ' "${names[@]}") (not removed)"
+  fi
+  if [ ${#AIRBAND_CHANNELS[@]} -gt 0 ]; then
+    local c chan_list=""
+    for c in "${AIRBAND_CHANNELS[@]}"; do chan_list+="${c%%|*} "; done
+    echo -e "  ${BOLD}Airband:${RESET}     ${chan_list}MHz"
+  fi
+}
+
+
+# ============================================================================
+# Section 8d: Checking, updating and removing the xng station
+# ============================================================================
+# `installer status` prints a report to paste when asking for help,
+# `installer update` moves xng to the latest release and keeps its
+# configuration, and `installer uninstall [--purge]` removes it.
+
+XNG_HEALTH=""        # ok, waiting or failed, after verify_xng_station
+
+# A TCP port something already listens on (bash /dev/tcp, no ss needed)
+port_in_use() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+# The first of preferred, preferred+1, ... that nothing listens on
+free_port() {
+  local p="$1" n
+  for n in 0 1 2 3 4 5 6 7 8 9; do
+    if ! port_in_use "$((p + n))"; then echo "$((p + n))"; return 0; fi
+  done
+  return 1
+}
+
+# Where the station runs: native (systemd unit), docker or nothing
+xng_runs_where() {
+  if [ -f /etc/systemd/system/xng-station.service ]; then echo native
+  elif [ -f "${CONFIG_DIR}/xng/docker-compose.yml" ]; then echo docker
+  fi
+  return 0
+}
+
+# The binary the service starts (falls back to the first xng on PATH)
+xng_service_bin() {
+  local b=""
+  [ -f /etc/systemd/system/xng-station.service ] &&
+    b=$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' /etc/systemd/system/xng-station.service | head -1)
+  [ -n "$b" ] || b=$(command -v xng 2>/dev/null || true)
+  echo "$b"
+}
+
+xng_installed_version() {
+  case "$(xng_runs_where)" in
+    native)
+      local b; b=$(xng_service_bin)
+      [ -n "$b" ] && "$b" --version 2>/dev/null | awk 'NR==1{print $NF}' | sed 's/^v//'
+      ;;
+    docker)
+      sed -n "s|.*image: *${XNG_IMAGE_REPO}:\(.*\)|\1|p" "${CONFIG_DIR}/xng/docker-compose.yml" | head -1
+      ;;
+  esac
+  return 0
+}
+
+# host:port of the station's dashboard, from station.toml
+xng_http_addr() {
+  local port=""
+  [ -r "${XNG_CONFIG_DIR}/station.toml" ] &&
+    port=$(sed -n 's/^http *= *"[^"]*:\([0-9]*\)".*/\1/p' "${XNG_CONFIG_DIR}/station.toml" | head -1)
+  echo "127.0.0.1:${port:-8080}"
+}
+
+# active, failed, restarting, stopped or missing
+xng_service_state() {
+  case "$(xng_runs_where)" in
+    native)
+      if ! have_systemd; then echo unknown; return 0; fi
+      local s; s=$(systemctl is-active xng-station 2>/dev/null || true)
+      case "$s" in
+        active) echo active ;;
+        activating) echo restarting ;;
+        failed) echo failed ;;
+        *) echo stopped ;;
+      esac
+      ;;
+    docker)
+      local s; s=$(sudo docker inspect -f '{{.State.Status}} {{.State.Restarting}}' xng-station 2>/dev/null || true)
+      case "$s" in
+        "running false") echo active ;;
+        *true) echo restarting ;;
+        "") echo missing ;;
+        exited*|dead*) echo failed ;;
+        *) echo stopped ;;
+      esac
+      ;;
+    *) echo missing ;;
+  esac
+}
+
+xng_recent_log() {
+  local n="${1:-30}"
+  case "$(xng_runs_where)" in
+    native) have_systemd && sudo journalctl -u xng-station -n "$n" --no-pager -o cat 2>/dev/null ;;
+    docker) sudo docker logs --tail "$n" xng-station 2>&1 ;;
+  esac
+  return 0
+}
+
+xng_state_json() {
+  curl -fsS -m 4 "http://$(xng_http_addr)/api/state" 2>/dev/null
+}
+
+# Names of other SDR programs running (from /proc, so no procps needed)
+sdr_programs_running() {
+  local f c
+  for f in /proc/[0-9]*/comm; do
+    c=$(cat "$f" 2>/dev/null) || continue
+    case "$c" in
+      dump1090*|readsb|rtl_tcp|rtl_fm|rtl_433|acarsdec|dumpvdl2|dumphfdl|vdlm2dec|AIS-catcher|ais-catcher) echo "$c" ;;
+    esac
+  done | sort -u | tr '\n' ' ' | sed 's/ $//'
+  return 0
+}
+
+# Plain-English hints for the errors people hit most
+xng_log_hints() {
+  local log="$1" shown=false
+  hint() { echo -e "  ${YELLOW}→${RESET} $*"; shown=true; }
+  if echo "$log" | grep -qiE 'LIBUSB_ERROR_BUSY|usb_claim_interface|resource busy'; then
+    hint "Another program has the SDR. Stop it, or run the installer again and give that SDR a different job."
+    local who; who=$(sdr_programs_running)
+    [ -n "$who" ] && echo "      Running now: ${who}"
+  fi
+  if echo "$log" | grep -qiE 'dvb_usb|kernel driver is active'; then
+    hint "The TV tuner kernel driver holds the RTL-SDR. The installer blocked it; reboot once (sudo reboot)."
+  fi
+  if echo "$log" | grep -qiE 'LIBUSB_ERROR_ACCESS|permission denied.*usb|insufficient permissions'; then
+    hint "No permission for the SDR. Unplug it and plug it back in (the installer added a udev rule), or reboot."
+  fi
+  if echo "$log" | grep -qiE 'no (sdr|device)s? (found|matching)|device not found|no such device|serial .* not found'; then
+    hint "An SDR in ${XNG_CONFIG_DIR}/station.toml isn't plugged in, or its serial changed. Run the installer again to pick SDRs."
+  fi
+  if echo "$log" | grep -qiE 'GLIBC_|cannot open shared object'; then
+    hint "This xng build doesn't run on this system. Run: curl -sSL https://install.airframes.sh/installer | bash -s -- update --xng-method docker"
+  fi
+  if echo "$log" | grep -qiE 'address (already )?in use'; then
+    hint "A port xng wants is taken. Run the installer again; it picks free ports."
+  fi
+  if echo "$log" | grep -qiE 'invalid_grant|refresh token|401 Unauthorized'; then
+    hint "The Airframes sign-in expired. Run the installer again and sign in (xng keeps feeding unclaimed meanwhile)."
+  fi
+  if echo "$log" | grep -qiE 'failed to parse|unknown field|expected .* at line'; then
+    hint "xng couldn't read ${XNG_CONFIG_DIR}/station.toml. Run the installer again to rewrite it."
+  fi
+  [ "$shown" = true ]
+}
+
+# After setup: wait for the station to come up and show what it's doing
+verify_xng_station() {
+  report_step verify
+  local where state="" i json=""
+  where=$(xng_runs_where)
+  [ -n "$where" ] || return 0
+  if [ "$where" = native ] && ! have_systemd; then return 0; fi
+  step "Checking the station"
+  for i in $(seq 1 20); do
+    state=$(xng_service_state)
+    if [ "$state" = active ]; then
+      json=$(xng_state_json || true)
+      [ -n "$json" ] && break
+    fi
+    sleep 2
+  done
+
+  if [ "$state" != active ]; then
+    XNG_HEALTH=failed
+    err "xng isn't running (${state})."
+    local log; log=$(xng_recent_log 40)
+    if [ -n "$log" ]; then
+      echo "$log" | tail -12 | sed 's/^/    /'
+      echo
+    fi
+    xng_log_hints "$log" || true
+    info "For help, run the installer with ${BOLD}status${RESET} and paste the report in the Airframes Discord:"
+    echo -e "    ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- status${RESET}"
+    return 0
+  fi
+
+  if [ -z "$json" ]; then
+    XNG_HEALTH=waiting
+    ok "xng is running"
+    warn "Its dashboard (http://$(xng_http_addr)) didn't answer yet; check again in a minute with: xng status --http $(xng_http_addr)"
+    return 0
+  fi
+
+  XNG_HEALTH=ok
+  ok "xng is running"
+  xng_print_sessions "$json"
+  local log; log=$(xng_recent_log 60)
+  if xng_log_hints "$log" >/dev/null 2>&1; then
+    warn "xng logged problems while starting:"
+    xng_log_hints "$log" || true
+  fi
+  substep "\"awaiting traffic\" is normal for the first minutes; messages come as aircraft talk."
+}
+
+# One line per session from the dashboard's /api/state
+xng_print_sessions() {
+  printf '%s' "$1" | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+now = s.get("now") or 0
+tot = s.get("totals") or {}
+seen = s.get("last_seen") or {}
+for x in s.get("sessions") or []:
+    mode = x.get("mode") or "?"
+    sdr = (x.get("sdr") or "?").split(",")[0].replace("driver=", "")
+    serial = x.get("serial") or ""
+    n = tot.get(mode) or 0
+    t = seen.get(mode)
+    if not n:
+        st = "awaiting traffic"
+    elif t:
+        ago = max(0, now - t)
+        st = "%d msgs, last %s" % (n, "%ds ago" % ago if ago < 90 else "%dm ago" % (ago // 60))
+    else:
+        st = "%d msgs" % n
+    print("    %-6s %-9s %-10s %s" % (mode.upper(), sdr, serial[-8:], st))
+' 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# installer status
+# ---------------------------------------------------------------------------
+cmd_status() {
+  local where ver state user="" ident="" json
+  where=$(xng_runs_where)
+  echo
+  echo -e "${BOLD}Airframes station report${RESET}  (installer v${VERSION}, $(date -u '+%Y-%m-%d %H:%M UTC'))"
+  echo "  System:   ${OS}/${ARCH} ${DISTRO} $(uname -r 2>/dev/null)"
+  [ -r /etc/os-release ] && echo "  OS:       $(. /etc/os-release; echo "${PRETTY_NAME:-?}")"
+  if [ -z "$where" ]; then
+    echo "  xng:      not installed"
+  else
+    ver=$(xng_installed_version)
+    state=$(xng_service_state)
+    echo "  xng:      ${ver:-?} (${where}), service ${state}"
+    local latest; latest=$(xng_latest_version)
+    if [ -n "$ver" ] && [ -n "$latest" ] && [ "$ver" != "$latest" ]; then
+      echo "            xng ${latest} is out: run the installer with \"update\""
+    fi
+  fi
+  if [ -n "$where" ]; then
+    if auto_update_enabled; then echo "  Updates:  automatic (weekly)"; else echo "  Updates:  by hand (\"update\"; \"auto-update on\" automates it)"; fi
+  fi
+  if [ -r "${XNG_CONFIG_DIR}/station.toml" ]; then
+    ident=$(sed -n 's/^station-id *= *"\(.*\)"/\1/p' "${XNG_CONFIG_DIR}/station.toml" | head -1)
+    echo "  Station:  ${ident:-?}"
+    sed -n 's/^mode *= *"\(.*\)"/\1/p' "${XNG_CONFIG_DIR}/station.toml" | sort | uniq -c |
+      awk '{printf "%s%s x%d", (NR>1?", ":"            jobs: "), $2, $1} END {if (NR) print ""}'
+  fi
+  if sudo test -r "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null; then
+    user=$(sudo cat "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null | json_field "d.get('username')" || true)
+    echo "  Sign-in:  ${user:-signed in} (Airframes account)"
+    [ -n "$ident" ] && echo "  Page:     $(station_page_url "$ident")"
+  else
+    echo "  Sign-in:  none (feeding unclaimed; run the installer with \"sign-in\" to claim it)"
+  fi
+
+  echo "  SDRs:"
+  local usb
+  usb=$(lsusb 2>/dev/null | grep -iE '0bda:2838|0bda:2832|1d50:60a1|03eb:800c|1d50:6089|1df7:|RTL28|Airspy|HackRF|SDRplay' || true)
+  if [ -n "$usb" ]; then echo "$usb" | sed 's/^/            /'; else echo "            none found on USB"; fi
+  local busy
+  busy=$(sdr_programs_running)
+  [ -n "$busy" ] && echo "  Also running: ${busy}"
+  if [ -n "$ident" ]; then
+    local fed; fed=$(airframes_feed_lines "$ident")
+    if [ -n "$fed" ]; then echo "  Airframes:"; echo "$fed"; fi
+  fi
+  local adsb; adsb=$(adsb_status_lines)
+  if [ -n "$adsb" ]; then echo "  ADS-B:"; echo "$adsb"; fi
+  lsmod 2>/dev/null | grep -q '^dvb_usb_rtl28xxu' && echo "  Warning:  the dvb_usb_rtl28xxu kernel driver is loaded (reboot to release RTL-SDRs)"
+
+  if [ -n "$where" ]; then
+    json=$(xng_state_json || true)
+    if [ -n "$json" ]; then
+      echo "  Sessions:"
+      xng_print_sessions "$json"
+    else
+      echo "  Sessions: dashboard at http://$(xng_http_addr) not answering"
+    fi
+    echo "  Recent log:"
+    # Hide anything that looks like a credential before it's pasted anywhere
+    xng_recent_log 15 | sed -E 's/((refresh_|access_)?token|bearer|password|secret)("?[ :=]+)"[^"]*"/\1\3"[hidden]"/Ig; s/((refresh_|access_)?token|bearer|password|secret)([" :=]+)([^ ",=:[][^ ",]*)/\1\3[hidden]/Ig; s/^/    /'
+    local log; log=$(xng_recent_log 200)
+    if xng_log_hints "$log" >/dev/null 2>&1; then
+      echo
+      xng_log_hints "$log" || true
+    fi
+  fi
+  echo
+  info "Paste this report in the Airframes Discord if you need help (anything that looks like a token is hidden)."
+}
+
+# ---------------------------------------------------------------------------
+# installer update
+# ---------------------------------------------------------------------------
+cmd_update() {
+  local where cur ver
+  where=$(xng_runs_where)
+  if [ -z "$where" ] || [ ! -r "${XNG_CONFIG_DIR}/station.toml" ]; then
+    err "No xng station here yet. Run the installer without \"update\" to set one up."
+    exit 1
+  fi
+  ver="${XNG_VERSION:-$(xng_latest_version)}"
+  cur=$(xng_installed_version)
+  [ -n "$XNG_METHOD" ] && where="$XNG_METHOD"
+  if [ "$cur" = "$ver" ] && [ -z "$XNG_METHOD" ]; then
+    ok "xng ${cur} is the latest release; nothing to update."
+    verify_xng_station
+    return 0
+  fi
+  step "Updating xng ${cur:-?} to ${ver}"
+  local from; from=$(xng_runs_where)
+  # Stop the current station first: both would want the same SDRs
+  if [ "$from" = native ]; then
+    have_systemd && sudo systemctl stop xng-station 2>/dev/null || true
+  else
+    sudo docker stop xng-station >/dev/null 2>&1 || true
+  fi
+  local done_as=""
+  if [ "$where" = native ]; then
+    if install_xng_native "$ver"; then
+      install_xng_service_native
+      done_as=native
+    else
+      warn "xng ${ver} has no build that runs here; trying the Docker image."
+    fi
+  fi
+  if [ -z "$done_as" ] && install_xng_docker "$ver"; then
+    done_as=docker
+  fi
+  if [ -z "$done_as" ]; then
+    err "The update failed; starting the xng you had again."
+    if [ "$from" = native ]; then
+      sudo rm -rf "${CONFIG_DIR}/xng"
+      have_systemd && sudo systemctl start xng-station 2>/dev/null || true
+    else
+      sudo docker start xng-station >/dev/null 2>&1 || true
+    fi
+    exit 1
+  fi
+  # Remove the old deployment only once the new one runs
+  if [ "$done_as" = docker ] && [ -f /etc/systemd/system/xng-station.service ]; then
+    sudo systemctl disable xng-station >/dev/null 2>&1 || true
+    sudo rm -f /etc/systemd/system/xng-station.service
+    have_systemd && sudo systemctl daemon-reload
+  fi
+  if [ "$done_as" = native ] && [ -f "${CONFIG_DIR}/xng/docker-compose.yml" ]; then
+    (cd "${CONFIG_DIR}/xng" && sudo docker compose down >/dev/null 2>&1) || sudo docker rm -f xng-station >/dev/null 2>&1 || true
+    sudo rm -f "${CONFIG_DIR}/xng/docker-compose.yml"
+  fi
+  verify_xng_station
+}
+
+# ---------------------------------------------------------------------------
+# installer uninstall [--purge]
+# ---------------------------------------------------------------------------
+cmd_uninstall() {
+  local where
+  where=$(xng_runs_where)
+  if [ -z "$where" ] && [ ! -d "$XNG_CONFIG_DIR" ]; then
+    ok "No xng station here; nothing to remove."
+    return 0
+  fi
+  if [ "$PURGE" = true ]; then
+    info "This stops xng and removes it, its configuration and the Airframes sign-in on this computer."
+  else
+    info "This stops xng and removes it. ${XNG_CONFIG_DIR} (configuration and sign-in) stays, so setting up again is quick; add --purge to remove it too."
+  fi
+  if [ "$AUTO_YES" != true ] && ! ui_confirm "Remove the xng station?"; then
+    info "Nothing removed."
+    return 0
+  fi
+  if [ -f "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" ]; then
+    disable_auto_update
+    substep "Turned off automatic updates"
+  fi
+  if [ -f /etc/systemd/system/xng-station.service ]; then
+    sudo systemctl disable --now xng-station >/dev/null 2>&1 || true
+    sudo rm -f /etc/systemd/system/xng-station.service
+    have_systemd && sudo systemctl daemon-reload
+    substep "Removed the xng-station service"
+  fi
+  if [ -f "${CONFIG_DIR}/xng/docker-compose.yml" ]; then
+    (cd "${CONFIG_DIR}/xng" && sudo docker compose down -v >/dev/null 2>&1) || sudo docker rm -f xng-station >/dev/null 2>&1 || true
+    sudo rm -rf "${CONFIG_DIR}/xng"
+    substep "Removed the xng container"
+  fi
+  if command -v dpkg >/dev/null 2>&1 && dpkg -s xng >/dev/null 2>&1; then
+    sudo apt-get remove -y -qq xng >/dev/null 2>&1 && substep "Removed the xng package"
+  fi
+  if [ -x /usr/local/bin/xng ]; then
+    sudo rm -f /usr/local/bin/xng
+    substep "Removed /usr/local/bin/xng"
+  fi
+  if [ "$PURGE" = true ]; then
+    sudo rm -rf "$XNG_CONFIG_DIR" /var/lib/xng /var/cache/xng
+    substep "Removed ${XNG_CONFIG_DIR}, /var/lib/xng and /var/cache/xng"
+    info "The station stays on your Airframes account; remove it there if you don't want it: ${AIRFRAMES_APP}/stations"
+  fi
+  ok "xng is removed."
+  if [ -s "$OLD_DECODERS_FILE" ]; then
+    info "The decoders xng took over are still stopped. Start them again with:"
+    info "  curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# installer sign-in: put a station that was set up unclaimed on an account
+# ---------------------------------------------------------------------------
+# station.toml values the commands below need again
+toml_value() {
+  [ -r "${XNG_CONFIG_DIR}/station.toml" ] || return 0
+  sed -n "s/^$1 *= *\"\\(.*\\)\"/\\1/p" "${XNG_CONFIG_DIR}/station.toml" | head -1
+}
+
+xng_restart_station() {
+  case "$(xng_runs_where)" in
+    native) have_systemd && sudo systemctl restart xng-station ;;
+    docker) sudo docker restart xng-station >/dev/null ;;
+  esac
+  return 0
+}
+
+cmd_signin() {
+  if [ ! -r "${XNG_CONFIG_DIR}/station.toml" ]; then
+    err "No xng station here yet. Run the installer without \"sign-in\" to set one up (it asks to sign in)."
+    exit 1
+  fi
+  ensure_python3 || exit 1
+  # --station-id renames the station; otherwise keep the one it has
+  local saved_ident; saved_ident=$(toml_value station-id)
+  [ -n "$STATION_IDENT" ] || STATION_IDENT="$saved_ident"
+  local pos; pos=$(toml_value receiver-pos)
+  if [ -n "$pos" ]; then STATION_LAT="${pos%%,*}"; STATION_LON="${pos#*,}"; fi
+  info "Station ${BOLD}${STATION_IDENT}${RESET}"
+  SIGNIN_MODE=yes
+  if ! airframes_signin; then
+    err "Not signed in; nothing changed."
+    exit 1
+  fi
+  register_station
+  if [ "$STATION_IDENT" != "$saved_ident" ]; then
+    sudo sed -i "s/^station-id *= *.*/station-id = $(toml_str "$STATION_IDENT" | sed 's/[\/&]/\\&/g')/" "${XNG_CONFIG_DIR}/station.toml"
+    substep "Station ID is now ${STATION_IDENT}"
+  fi
+  # Airband audio feeds Airframes ATC only with the sign-in
+  if grep -q '^mode *= *"airband"' "${XNG_CONFIG_DIR}/station.toml" &&
+     ! grep -q '^\[outputs\.airband\.atc\]' "${XNG_CONFIG_DIR}/station.toml"; then
+    local tmp; tmp=$(mktemp)
+    {
+      cat "${XNG_CONFIG_DIR}/station.toml"
+      echo
+      echo "[outputs.airband.atc]"
+      echo "credentials = $(toml_str "${XNG_CONFIG_DIR}/atc.json")"
+      echo "station-name = $(toml_str "$STATION_IDENT")"
+      echo "location-precision-m = 500"
+    } > "$tmp"
+    sudo install -m 644 "$tmp" "${XNG_CONFIG_DIR}/station.toml"
+    rm -f "$tmp"
+    substep "Airband audio now feeds Airframes ATC"
+  elif ! grep -q '^mode *= *"airband"' "${XNG_CONFIG_DIR}/station.toml"; then
+    info "To add airband audio for Airframes ATC, run the installer again and give an SDR the airband job."
+  fi
+  [ "$(xng_runs_where)" = native ] && sudo chown xng: "${XNG_CONFIG_DIR}/atc.json" 2>/dev/null
+  xng_restart_station
+  verify_xng_station
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Automatic updates: a weekly systemd timer running "installer -y update"
+# ---------------------------------------------------------------------------
+AUTO_UPDATE_UNIT="airframes-xng-update"
+
+auto_update_enabled() {
+  have_systemd && systemctl is-enabled --quiet "${AUTO_UPDATE_UNIT}.timer" 2>/dev/null
+}
+
+enable_auto_update() {
+  have_systemd || { warn "Automatic updates need systemd; run the installer with \"update\" now and then."; return 0; }
+  sudo tee "/etc/systemd/system/${AUTO_UPDATE_UNIT}.service" >/dev/null << EOF
+[Unit]
+Description=Update xng to the latest release (Airframes installer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=AIRFRAMES_NO_TTY=1
+Environment="XNG_CONFIG_DIR=${XNG_CONFIG_DIR//%/%%}"
+ExecStart=/bin/bash -c 'curl -fsSL https://install.airframes.sh/installer | bash -s -- -y --no-tui update'
+EOF
+  sudo tee "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" >/dev/null << EOF
+[Unit]
+Description=Weekly xng update check (Airframes installer)
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now "${AUTO_UPDATE_UNIT}.timer" >/dev/null 2>&1 || true
+  ok "xng updates itself weekly (turn it off with: installer auto-update off)"
+}
+
+disable_auto_update() {
+  if [ -f "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" ]; then
+    sudo systemctl disable --now "${AUTO_UPDATE_UNIT}.timer" >/dev/null 2>&1 || true
+    # An update already running would put xng back
+    sudo systemctl stop "${AUTO_UPDATE_UNIT}.service" >/dev/null 2>&1 || true
+    sudo rm -f "/etc/systemd/system/${AUTO_UPDATE_UNIT}.timer" "/etc/systemd/system/${AUTO_UPDATE_UNIT}.service"
+    have_systemd && sudo systemctl daemon-reload
+  fi
+  return 0
+}
+
+# During setup: ask (default yes), or follow --auto-update / --no-auto-update
+setup_auto_update() {
+  have_systemd || return 0
+  report_step auto-update
+  case "$AUTO_UPDATE" in
+    yes) enable_auto_update ;;
+    no)  return 0 ;;
+    *)
+      auto_update_enabled && return 0
+      if [ "$AUTO_YES" != true ] && [ "$IS_TTY" = true ]; then
+        if ui_confirm "Keep xng up to date automatically (checks weekly)?" "yes"; then
+          enable_auto_update
+        else
+          info "Update by hand with: curl -sSL https://install.airframes.sh/installer | bash -s -- update"
+        fi
+      fi
+      ;;
+  esac
+  return 0
+}
+
+cmd_auto_update() {
+  case "$AUTO_UPDATE" in
+    yes) enable_auto_update ;;
+    no)  disable_auto_update; ok "Automatic updates are off" ;;
+    *)   if auto_update_enabled; then info "Automatic updates are on (weekly)"; else info "Automatic updates are off"; fi ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Is Airframes hearing this station? One line per mode xng feeds it
+# ---------------------------------------------------------------------------
+# xng's auto-suffix: the station id per mode Airframes ingests
+feed_suffix() {
+  case "$1" in
+    acars) echo ACARS ;; vdl2) echo VDL2 ;; hfdl) echo HFDL ;;
+    ais) echo AIS ;; iridium) echo IRDM ;;
+  esac
+}
+
+feed_ident() {
+  local base="$1" sfx="$2" last
+  last="${base##*-}"; last="${last%%[0-9]*}"
+  case "$last" in
+    ACARS|VDL2|HFDL|AIS|IMSL|IRDM|STDC|ADSB|UAT|SARSAT|DSC|NAVTEX|SONDE|ADSL|ATCS)
+      [ "$base" != "${base%-*}" ] && base="${base%-*}" ;;
+  esac
+  echo "${base}-${sfx}"
+}
+
+airframes_feed_lines() {
+  local base="$1" m sfx id out code body
+  command -v python3 >/dev/null 2>&1 || return 0
+  [ -r "${XNG_CONFIG_DIR}/station.toml" ] || return 0
+  local suffix=true
+  grep -q '^auto-suffix *= *true' "${XNG_CONFIG_DIR}/station.toml" || suffix=false
+  local row own
+  # One "mode|airframes-station-id" row per session; the ID is set when the
+  # session keeps the name an old decoder fed under
+  for row in $(awk -F'"' '/^\[\[session\]\]/ { if (m != "") print m "|" o; m = ""; o = "" }
+                          /^mode *=/ { m = $2 } /^airframes-station-id *=/ { o = $2 }
+                          END { if (m != "") print m "|" o }' "${XNG_CONFIG_DIR}/station.toml" | sort -u); do
+    m="${row%%|*}"; own="${row#*|}"
+    sfx=$(feed_suffix "$m"); [ -n "$sfx" ] || continue
+    if [ -n "$own" ]; then id="$own"
+    elif [ "$suffix" = true ]; then id=$(feed_ident "$base" "$sfx"); else id="$base"; fi
+    out=$(curl -sS -m 10 -w '\n%{http_code}' "${AIRFRAMES_API}/stations/ident/${id}" 2>/dev/null || true)
+    code="${out##*$'\n'}"; body="${out%$'\n'*}"
+    case "$code" in
+      2??) ;;
+      *) echo "            ${id}: couldn't ask Airframes (no answer from ${AIRFRAMES_API})"; continue ;;
+    esac
+    printf '%s' "$body" | python3 -c '
+import json, sys, datetime
+ident = sys.argv[1]
+try:
+    d = json.loads(sys.stdin.read() or "null")
+except Exception:
+    d = None
+if not isinstance(d, dict):
+    print("            %s: not seen yet (it shows up once the first message arrives)" % ident); sys.exit(0)
+t = d.get("lastReportAt")
+if not t:
+    print("            %s: on Airframes, nothing received yet" % ident); sys.exit(0)
+try:
+    s = t.replace("Z", "+00:00")
+    at = datetime.datetime.fromisoformat(s)
+    if at.tzinfo is None: at = at.replace(tzinfo=datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - at).total_seconds()
+except Exception:
+    print("            %s: last heard %s" % (ident, t)); sys.exit(0)
+def ago(x):
+    x = max(0, int(x))
+    if x < 120: return "%d s ago" % x
+    if x < 7200: return "%d min ago" % (x // 60)
+    if x < 172800: return "%d h ago" % (x // 3600)
+    return "%d days ago" % (x // 86400)
+note = "" if age < 3600 else "  <- nothing for a while; check the antenna and the log below"
+print("            %s: last heard %s%s" % (ident, ago(age), note))
+' "$id" || true
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# ADS-B partner feeds, for the status report
+# ---------------------------------------------------------------------------
+adsb_status_lines() {
+  local u s c any=false
+  for u in readsb dump1090-fa dump1090-mutability piaware airplanes-feed airplanes-mlat; do
+    if have_systemd && systemctl list-unit-files "${u}.service" 2>/dev/null | grep -q "^${u}\.service"; then
+      s=$(systemctl is-active "$u" 2>/dev/null || true)
+      echo "            ${u}: ${s:-unknown}"; any=true
+    fi
+  done
+  if command -v docker >/dev/null 2>&1; then
+    for c in airframes-ultrafeeder airframes-planewatch ultrafeeder; do
+      s=$(sudo docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || true)
+      [ -n "$s" ] && { echo "            ${c} (Docker): ${s}"; any=true; }
+    done
+  fi
+  [ "$any" = true ] && [ -f /etc/default/airplanes ] &&
+    echo "            Check the Airplanes.Live feed at https://airplanes.live/myfeed"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# installer fix: find the common problems and repair them, one at a time
+# ---------------------------------------------------------------------------
+# Each problem is explained with what the fix does, then asked about (-y
+# applies them all). Without a terminal and without -y nothing is changed:
+# the run only lists what it would do.
+FIX_FOUND=0          # problems found
+FIX_DONE=0           # problems fixed
+FIX_LEFT=0           # problems skipped or not fixable here
+FIX_RESTART=false    # station.toml or drivers changed: xng must restart
+
+# fix_problem <what is wrong> <what the fix does> <question>; 0 = go ahead
+fix_problem() {
+  FIX_FOUND=$((FIX_FOUND + 1))
+  echo
+  warn "$1"
+  echo -e "  ${BOLD}Fix:${RESET} $2"
+  if [ "$AUTO_YES" = true ]; then return 0; fi
+  if [ "$IS_TTY" != true ]; then
+    substep "Not changed: there's no terminal to ask on. Run with -y to apply the fixes."
+    FIX_LEFT=$((FIX_LEFT + 1))
+    return 1
+  fi
+  if ui_confirm "$3" "yes"; then return 0; fi
+  substep "Skipped"
+  FIX_LEFT=$((FIX_LEFT + 1))
+  return 1
+}
+
+fix_done()   { FIX_DONE=$((FIX_DONE + 1)); ok "$*"; }
+fix_failed() { FIX_LEFT=$((FIX_LEFT + 1)); err "$*"; }
+fix_fine()   { echo -e "  ${GREEN}ok${RESET}  $*"; }
+
+# A problem the installer can't repair by itself: say what to do instead
+fix_manual() {
+  FIX_FOUND=$((FIX_FOUND + 1)); FIX_LEFT=$((FIX_LEFT + 1))
+  echo
+  warn "$1"
+  echo -e "  ${BOLD}To fix it:${RESET} $2"
+}
+
+# Clock: time sync on, and not minutes away from the Airframes API's clock
+fix_clock() {
+  local ntp="" offset="" skew=""
+  if command -v timedatectl >/dev/null 2>&1; then
+    ntp=$(timedatectl show -p NTP --value 2>/dev/null || true)
+  fi
+  offset=$(api_clock_offset 2>/dev/null || true)
+  [ -n "$offset" ] && skew=${offset#-}
+  if [ -n "$skew" ] && [ "$skew" -gt 300 ]; then
+    if fix_problem "This machine's clock is off by $(( skew / 60 )) minutes. Sign-in and downloads can fail, and message times are wrong." \
+        "set the clock from the Airframes API's time and turn on network time sync (timedatectl set-ntp true) so it stays right." \
+        "Set the clock and turn on time sync?"; then
+      if sudo date -u -s "@$(( $(date -u +%s) + offset ))" >/dev/null 2>&1; then
+        command -v timedatectl >/dev/null 2>&1 && sudo timedatectl set-ntp true 2>/dev/null
+        fix_done "Clock set to $(date -u '+%Y-%m-%d %H:%M UTC')"
+        FIX_RESTART=true
+      elif command -v timedatectl >/dev/null 2>&1 && sudo timedatectl set-ntp true 2>/dev/null; then
+        fix_done "Turned on time sync; the clock catches up within a few minutes"
+      else
+        fix_failed "Couldn't set the clock. Install a time sync service (sudo apt-get install systemd-timesyncd) and check that UDP port 123 is open."
+      fi
+    fi
+  elif [ "$ntp" = no ]; then
+    if fix_problem "Network time sync is off, so the clock will drift (a Pi has no clock battery and starts wrong after a power cut)." \
+        "turn it on with timedatectl set-ntp true." \
+        "Turn on time sync?"; then
+      if sudo timedatectl set-ntp true 2>/dev/null; then fix_done "Turned on time sync"
+      else fix_failed "Couldn't turn on time sync. Install systemd-timesyncd (sudo apt-get install systemd-timesyncd)."; fi
+    fi
+  elif [ -n "$skew" ]; then
+    fix_fine "Clock is right${ntp:+ (time sync on)}"
+  else
+    fix_fine "Clock not checked (${AIRFRAMES_API} didn't answer)"
+  fi
+}
+
+# The DVB-T TV driver must stay off the RTL-SDRs
+fix_dvb_driver() {
+  [ "$OS" = linux ] || return 0
+  local loaded=false
+  lsmod 2>/dev/null | grep -q '^dvb_usb_rtl28xxu' && loaded=true
+  if [ ! -f /etc/modprobe.d/airframes-rtlsdr.conf ]; then
+    if fix_problem "The TV tuner (DVB-T) kernel driver isn't blocked. It grabs RTL-SDRs at boot, so xng can't open them." \
+        "block it in /etc/modprobe.d/airframes-rtlsdr.conf and unload it now." \
+        "Block the TV tuner driver?"; then
+      blacklist_dvb
+      if lsmod 2>/dev/null | grep -q '^dvb_usb_rtl28xxu'; then
+        fix_done "Blocked the TV tuner driver. It's still loaded: reboot once (sudo reboot)."
+      else
+        fix_done "Blocked the TV tuner driver"
+      fi
+      FIX_RESTART=true
+    fi
+  elif [ "$loaded" = true ]; then
+    if fix_problem "The TV tuner (DVB-T) kernel driver is blocked but still loaded, so it holds the RTL-SDRs." \
+        "unload it (modprobe -r dvb_usb_rtl28xxu)." \
+        "Unload the TV tuner driver?"; then
+      sudo modprobe -r dvb_usb_rtl28xxu 2>/dev/null || true
+      if lsmod 2>/dev/null | grep -q '^dvb_usb_rtl28xxu'; then
+        fix_failed "It's in use and won't unload. Reboot once (sudo reboot)."
+      else
+        fix_done "Unloaded the TV tuner driver"; FIX_RESTART=true
+      fi
+    fi
+  else
+    fix_fine "TV tuner driver blocked"
+  fi
+}
+
+# Native installs run xng as xng:plugdev; the udev rule lets it open the SDRs
+fix_udev_rule() {
+  [ "$OS" = linux ] && [ "$(xng_runs_where)" = native ] || return 0
+  if [ -f "$SDR_UDEV_RULE" ]; then
+    fix_fine "SDR permissions (udev rule) in place"
+    return 0
+  fi
+  if fix_problem "The udev rule that lets xng open the SDRs is missing, so xng gets \"permission denied\"." \
+      "write ${SDR_UDEV_RULE} and reload udev." \
+      "Add the udev rule?"; then
+    install_sdr_udev_rule
+    sudo usermod -aG plugdev xng 2>/dev/null || true
+    fix_done "Added ${SDR_UDEV_RULE}. If xng still can't open an SDR, unplug it and plug it back in."
+    FIX_RESTART=true
+  fi
+}
+
+# station.toml names SDRs by serial. When an SDR is swapped (or its serial
+# rewritten with rtl_eeprom), xng can't find it: point that job at the SDR
+# that is plugged in instead, when there's exactly one candidate.
+sdr_kind_label() {
+  case "$1" in
+    rtlsdr) echo RTL-SDR ;; airspy) echo Airspy ;; airspyhf) echo "Airspy HF+" ;;
+    hackrf) echo HackRF ;; sdrplay) echo SDRplay ;; *) echo "$1" ;;
+  esac
+}
+
+fix_sdr_serials() {
+  local toml="${XNG_CONFIG_DIR}/station.toml"
+  [ -r "$toml" ] || return 0
+  detect_rtlsdr_serials
+  detect_xng_sdrs
+  local -a wanted=() missing=()
+  local sel kind serial s
+  while IFS= read -r sel; do
+    [[ "$sel" =~ driver=([a-z]+),serial=([^,\"]+) ]] || continue
+    wanted+=("${BASH_REMATCH[1]}|${BASH_REMATCH[2]}")
+  done < <(sed -n 's/^sdr *= *"\(.*\)"/\1/p' "$toml")
+  [ ${#wanted[@]} -gt 0 ] || { fix_fine "station.toml names no SDRs by serial"; return 0; }
+  for s in "${wanted[@]}"; do
+    printf '%s\n' "${XNG_SDRS[@]}" | grep "^${s}|" >/dev/null || missing+=("$s")
+  done
+  if [ ${#missing[@]} -eq 0 ]; then
+    fix_fine "Every SDR in station.toml is plugged in"
+    return 0
+  fi
+  local m new k cands
+  local label
+  for m in "${missing[@]}"; do
+    kind="${m%%|*}"; serial="${m#*|}"; label=$(sdr_kind_label "$kind")
+    # Plugged-in SDRs of that kind that no job uses yet
+    cands=()
+    for k in "${XNG_SDRS[@]}"; do
+      [ "$(sdr_field "$k" 0)" = "$kind" ] || continue
+      s="${kind}|$(sdr_field "$k" 1)"
+      printf '%s\n' "${wanted[@]}" | grep -xF "$s" >/dev/null || cands+=("$(sdr_field "$k" 1)")
+    done
+    local nmiss
+    nmiss=$(printf '%s\n' "${missing[@]}" | grep -c "^${kind}|")
+    new="${cands[0]:-}"
+    if [ ${#cands[@]} -eq 1 ] && [ "$nmiss" -eq 1 ] && [ "$new" != unknown ] &&
+       [[ "$serial" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$new" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      if fix_problem "station.toml has a job for the ${label} with serial ${serial}, which isn't plugged in. The ${label} with serial ${new} is plugged in and has no job." \
+          "give serial ${new} that job in ${toml} (the old file is kept as station.toml.bak)." \
+          "Use the SDR with serial ${new}?"; then
+        sudo cp "$toml" "${toml}.bak"
+        sudo sed -i "s/^sdr *= *\"driver=${kind},serial=${serial//./\\.}\"/sdr = \"driver=${kind},serial=${new}\"/" "$toml"
+        fix_done "The job for ${serial} now uses ${new}"
+        FIX_RESTART=true
+      fi
+    elif [ ${#cands[@]} -eq 0 ]; then
+      fix_manual "station.toml has a job for the ${label} with serial ${serial}, which isn't plugged in." \
+        "plug it in, or run the installer again to give the SDRs here their jobs: curl -sSL https://install.airframes.sh/installer | bash"
+    else
+      fix_manual "station.toml has a job for the ${label} with serial ${serial}, which isn't plugged in, and more than one other ${label} could take it (${cands[*]})." \
+        "run the installer again and pick which SDR does what: curl -sSL https://install.airframes.sh/installer | bash"
+    fi
+  done
+}
+
+# The weekly update timer: both units there, the timer enabled, the last
+# run not failed
+fix_auto_update() {
+  have_systemd || return 0
+  local d=/etc/systemd/system timer="${AUTO_UPDATE_UNIT}.timer" svc="${AUTO_UPDATE_UNIT}.service" why=""
+  if [ ! -f "$d/$timer" ] && [ ! -f "$d/$svc" ]; then
+    fix_fine "Automatic updates off (turn on with: auto-update on)"
+    return 0
+  fi
+  if [ ! -f "$d/$timer" ] || [ ! -f "$d/$svc" ]; then why="one of its two systemd units is missing"
+  elif ! systemctl is-enabled --quiet "$timer" 2>/dev/null; then why="its timer isn't enabled, so it never runs"
+  elif systemctl is-failed --quiet "$svc" 2>/dev/null; then why="its last run failed"
+  elif ! grep -q 'install.airframes.sh/installer' "$d/$svc"; then why="its service doesn't run the installer"
+  fi
+  if [ -z "$why" ]; then
+    fix_fine "Automatic updates on (weekly)"
+    return 0
+  fi
+  if [ "$why" = "its last run failed" ]; then
+    local log; log=$(sudo journalctl -u "$svc" -n 6 --no-pager -o cat 2>/dev/null || true)
+    [ -n "$log" ] && { echo "  Last run:"; echo "$log" | sed 's/^/    /'; }
+  fi
+  if fix_problem "The weekly xng update is broken: ${why}." \
+      "write its timer and service again and enable them (run \"update\" to see an update error right away)." \
+      "Set up the weekly update again?"; then
+    sudo systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+    enable_auto_update >/dev/null
+    if systemctl is-enabled --quiet "$timer" 2>/dev/null; then fix_done "The weekly update is set up again"
+    else fix_failed "Couldn't enable ${timer}; see: systemctl status ${timer}"; fi
+  fi
+}
+
+# The station itself: installed as a service or container that is enabled
+# and running. Runs last, so it also restarts xng for the fixes above.
+fix_service() {
+  local where state
+  where=$(xng_runs_where)
+  state=$(xng_service_state)
+  if [ "$where" = native ] && ! have_systemd; then
+    fix_fine "xng service not checked (systemd isn't running here)"
+    return 0
+  fi
+  if [ "$where" = docker ] && [ "$state" = missing ]; then state=stopped; fi
+  case "$state" in
+    active|restarting)
+      local enabled=true
+      [ "$where" = native ] && ! systemctl is-enabled --quiet xng-station 2>/dev/null && enabled=false
+      if [ "$enabled" = false ]; then
+        if fix_problem "xng is running, but the xng-station service isn't enabled, so it won't start after a reboot." \
+            "enable it (systemctl enable xng-station)." "Enable the service?"; then
+          sudo systemctl enable xng-station >/dev/null 2>&1 || true
+          fix_done "xng starts at boot again"
+        fi
+      fi
+      if [ "$FIX_RESTART" = true ]; then
+        if fix_problem "xng needs a restart to use the fixes above." "restart it." "Restart xng?"; then
+          xng_restart_station
+          FIX_DONE=$((FIX_DONE + 1))
+          FIX_CHECK=true
+        fi
+      elif [ "$state" = restarting ]; then
+        fix_manual "xng keeps restarting." "see the log hints below, or run the installer with \"status\" and paste the report in the Airframes Discord."
+        FIX_CHECK=true
+      else
+        fix_fine "xng is running ($where)"
+      fi
+      ;;
+    *)
+      if fix_problem "xng isn't running (${state})." \
+          "start it again$([ "$where" = native ] && echo " (systemctl reset-failed, enable and restart xng-station)" || echo " (docker compose up -d)")." \
+          "Start xng?"; then
+        if [ "$where" = native ]; then
+          sudo systemctl reset-failed xng-station >/dev/null 2>&1 || true
+          sudo systemctl enable xng-station >/dev/null 2>&1 || true
+          sudo systemctl restart xng-station 2>/dev/null || true
+        else
+          (cd "${CONFIG_DIR}/xng" && sudo docker compose up -d >/dev/null 2>&1) ||
+            sudo docker start xng-station >/dev/null 2>&1 || true
+        fi
+        FIX_DONE=$((FIX_DONE + 1))
+        FIX_CHECK=true
+      fi
+      ;;
+  esac
+}
+FIX_CHECK=false      # xng was (re)started: check that it came up
+
+cmd_fix() {
+  local where
+  where=$(xng_runs_where)
+  if [ -z "$where" ]; then
+    err "No xng station here yet. Run the installer without \"fix\" to set one up."
+    return 1
+  fi
+  step "Looking for problems"
+  fix_clock
+  fix_dvb_driver
+  fix_udev_rule
+  fix_sdr_serials
+  fix_auto_update
+  fix_service
+  if [ "$FIX_CHECK" = true ]; then
+    verify_xng_station
+    if [ "$XNG_HEALTH" = failed ]; then FIX_LEFT=$((FIX_LEFT + 1)); FIX_DONE=$((FIX_DONE > 0 ? FIX_DONE - 1 : 0)); fi
+  fi
+  echo
+  if [ "$FIX_FOUND" -eq 0 ]; then
+    ok "Nothing to fix."
+  elif [ "$FIX_LEFT" -eq 0 ]; then
+    ok "Fixed ${FIX_DONE} of ${FIX_FOUND} problem$([ "$FIX_FOUND" -eq 1 ] || echo s)."
+  else
+    warn "${FIX_LEFT} of ${FIX_FOUND} problem$([ "$FIX_FOUND" -eq 1 ] || echo s) left. For help, run the installer with \"status\" and paste the report in the Airframes Discord:"
+    echo -e "    ${CYAN}curl -sSL https://install.airframes.sh/installer | bash -s -- status${RESET}"
+    return 1
+  fi
+  return 0
+}
+
+run_command() {
+  case "$COMMAND" in
+    status)    cmd_status ;;
+    update)    show_banner; cmd_update ;;
+    uninstall) show_banner; cmd_uninstall ;;
+    signin)    show_banner; cmd_signin ;;
+    restoredecoders) show_banner; cmd_restore_decoders ;;
+    autoupdate) cmd_auto_update ;;
+    fix)       show_banner; cmd_fix || exit 1 ;;
+  esac
 }
 
 # ===========================================================================
@@ -843,6 +4451,7 @@ declare -A DECODER_DOCKER_IMAGE=(
 )
 
 DECODER_LIST=("acarsdec" "dumpvdl2" "dumphfdl" "vdlm2dec")
+ADSB_MENU_LABEL="ADS-B — fed to Airframes' partners Airplanes.Live and Plane Watch"
 
 get_cmake_flags_for_sdr() {
   local decoder="$1"
@@ -944,6 +4553,134 @@ api_report_status() {
     -H "Content-Type: application/json" \
     -d "{\"token\":\"${TOKEN}\",\"status\":\"${status}\",\"message\":\"${message}\",\"percent\":${percent}}" \
     >/dev/null 2>&1 &
+}
+
+# ---------------------------------------------------------------------------
+# Opt-in install report. At the end of an install (or when it fails), the
+# installer shows a small anonymous report and asks whether to send it
+# (default no). It holds the installer version, OS, distribution, CPU
+# architecture, SDR types, modes, install method, how long it took and
+# whether it worked or the step it failed at. Nothing that identifies the
+# person or station: no station ID, sign-in, hostname, serials, position or
+# IP (the API doesn't store the IP). -y doesn't send unless --report is
+# given; --no-report never asks.
+# ---------------------------------------------------------------------------
+REPORT_MODE=""            # --report yes, --no-report no, empty asks
+REPORT_ARMED=false        # true once an install starts; a "no" at a prompt unsets it
+REPORT_STEP="start"       # last step reached, named from a fixed list
+REPORT_STARTED=$(date +%s)
+
+report_step() { REPORT_STEP="$1"; }
+
+# Only letters, digits and . _ + - (every field is one of our own words)
+report_word() { printf '%s' "$1" | tr -cd 'A-Za-z0-9._+-' | cut -c1-40; }
+
+# JSON array from words: report_array a b c -> ["a","b","c"]
+report_array() {
+  local out="" w
+  for w in "$@"; do
+    w=$(report_word "$w")
+    [ -n "$w" ] && out+="${out:+,}\"${w}\""
+  done
+  echo "[${out}]"
+}
+
+report_payload() {
+  local outcome="$1" rc="$2" i job
+  local -a setup=() sdrs=() modes=()
+  [ "$WANT_XNG" = true ] && setup+=(xng)
+  setup+=("${SELECTED_DECODERS[@]}")
+  [ "$WANT_ADSB" = true ] && setup+=(adsb)
+  if [ "$WANT_XNG" = true ]; then
+    for i in "${!XNG_SDRS[@]}"; do
+      job="${XNG_JOBS[$i]:-off}"
+      sdrs+=("$(sdr_field "${XNG_SDRS[$i]}" 0)")
+      [ "$job" = off ] || modes+=("$job")
+    done
+  elif [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    sdrs+=("$SELECTED_SDR")
+    modes+=("${SELECTED_DECODERS[@]}")
+  fi
+  [ "$WANT_ADSB" = true ] && modes+=(adsb-partners)
+  local method="" xver=""
+  if [ "$WANT_XNG" = true ]; then
+    method=$(xng_runs_where)
+    xver=$(xng_installed_version 2>/dev/null || true)
+  elif [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    method="$SELECTED_METHOD"
+  fi
+  local step=""
+  [ "$outcome" = success ] || step="$REPORT_STEP"
+  local signed_in=false
+  [ -n "$STATION_REGISTERED" ] && signed_in=true
+  printf '{"installer_version":"%s","os":"%s","distro":"%s","arch":"%s","wsl":%s,"setup":%s,"sdrs":%s,"modes":%s,"method":"%s","xng_version":"%s","signed_in":%s,"outcome":"%s","failed_step":"%s","exit_code":%d,"duration_seconds":%d}\n' \
+    "$(report_word "$VERSION")" "$(report_word "$OS")" "$(report_word "$DISTRO")" "$(report_word "$ARCH")" \
+    "$IS_WSL" "$(report_array "${setup[@]}")" "$(report_array "${sdrs[@]}")" "$(report_array "${modes[@]}")" \
+    "$(report_word "$method")" "$(report_word "$xver")" "$signed_in" "$outcome" "$(report_word "$step")" \
+    "$rc" "$(( $(date +%s) - REPORT_STARTED ))"
+}
+
+# Readable lines for the person to check before they answer
+report_preview() {
+  local outcome="$1" i job
+  local -a sdrs=() modes=()
+  local what="${OS}/${DISTRO}/${ARCH}"
+  if [ "$WANT_XNG" = true ]; then
+    for i in "${!XNG_SDRS[@]}"; do
+      sdrs+=("$(sdr_field "${XNG_SDRS[$i]}" 0)")
+      job="${XNG_JOBS[$i]:-off}"; [ "$job" = off ] || modes+=("$job")
+    done
+  elif [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    sdrs+=("$SELECTED_SDR"); modes+=("${SELECTED_DECODERS[@]}")
+  fi
+  [ "$WANT_ADSB" = true ] && modes+=(adsb-partners)
+  echo -e "  ${DIM}Installer:${RESET} ${VERSION}   ${DIM}System:${RESET} ${what}"
+  echo -e "  ${DIM}SDRs:${RESET}      ${sdrs[*]:-none}"
+  echo -e "  ${DIM}Modes:${RESET}     ${modes[*]:-none}"
+  case "$outcome" in
+    success)     echo -e "  ${DIM}Result:${RESET}    worked" ;;
+    not_running) echo -e "  ${DIM}Result:${RESET}    installed, but xng isn't running" ;;
+    *)           echo -e "  ${DIM}Result:${RESET}    failed at: ${REPORT_STEP}" ;;
+  esac
+}
+
+send_install_report() {
+  local body="$1" code
+  code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' -X POST "${AIRFRAMES_API}/installer/report" \
+    -H 'Content-Type: application/json' -H "User-Agent: airframes-installer/${VERSION}" \
+    --data "$body" 2>/dev/null) || code=000
+  case "$code" in
+    2*) ok "Report sent. Thank you!" ;;
+    *)  substep "The report couldn't be sent (HTTP ${code}); that's fine, nothing else depends on it." ;;
+  esac
+}
+
+# Runs on exit (trap in main). Asks only once the install was confirmed, and
+# never after Ctrl-C.
+installer_exit() {
+  local rc="$1" outcome=success
+  [ "$REPORT_ARMED" = true ] || return 0
+  REPORT_ARMED=false
+  set +e
+  [ "$rc" -ge 128 ] && return 0
+  if [ "$rc" -ne 0 ]; then outcome=failed
+  elif [ "${XNG_HEALTH:-}" = failed ]; then outcome=not_running
+  fi
+  case "$REPORT_MODE" in
+    no) return 0 ;;
+    yes) ;;
+    *)
+      [ "$AUTO_YES" = true ] && return 0
+      [ "$IS_TTY" = true ] || return 0
+      echo
+      info "Help improve the installer: send Airframes this anonymous report?"
+      report_preview "$outcome"
+      echo -e "  ${DIM}No station ID, sign-in, hostname, serial numbers or location. Details: https://docs.airframes.io/docs/feeding/how${RESET}"
+      ui_confirm "Send it?" "no" || return 0
+      ;;
+  esac
+  send_install_report "$(report_payload "$outcome" "$rc")"
+  return 0
 }
 
 # ===========================================================================
@@ -1248,15 +4985,20 @@ ensure_docker() {
   if ! command -v docker >/dev/null 2>&1; then
     step "Installing Docker"
     if [ "$OS" = "linux" ]; then
-      curl -fsSL https://get.docker.com | sudo sh
-      sudo usermod -aG docker "$USER" 2>/dev/null || true
+      if ! curl -fsSL https://get.docker.com | sudo sh; then
+        err "Docker couldn't be installed (get.docker.com). Install it by hand and run this again."
+        return 1
+      fi
+      # $USER is unset under systemd (the weekly update) and in containers
+      local me; me="${USER:-$(id -un 2>/dev/null || true)}"
+      [ -n "$me" ] && [ "$me" != root ] && sudo usermod -aG docker "$me" 2>/dev/null || true
     elif [ "$OS" = "macos" ]; then
       err "Please install Docker Desktop from https://docker.com/products/docker-desktop"
       return 1
     fi
   fi
 
-  if ! docker info >/dev/null 2>&1; then
+  if ! docker info >/dev/null 2>&1 && ! sudo docker info >/dev/null 2>&1; then
     err "Docker is not running. Please start Docker and try again."
     return 1
   fi
@@ -1326,6 +5068,17 @@ install_with_docker() {
       SERVER_PORT: \"${port}\""
       ;;
   esac
+
+  # sdr-enthusiasts images pick the RTL-SDR by serial only
+  if [ "${SELECTED_SDR:-rtlsdr}" = "rtlsdr" ]; then
+    if [ -n "$SDR_SERIAL" ]; then
+      env_block+="
+      SERIAL: \"${SDR_SERIAL}\""
+    elif [ "${SDR_INDEX:-0}" != "0" ] || [ ${#RTLSDR_SERIALS[@]} -gt 1 ]; then
+      warn "The ${decoder} container picks its RTL-SDR by serial, and the serial of device ${SDR_INDEX:-0} isn't known."
+      warn "Set SERIAL in ${compose_file} to the dongle's serial (see rtl_test) before starting it."
+    fi
+  fi
 
   sudo tee "$compose_file" >/dev/null << EOF
 version: '3.8'
@@ -1439,6 +5192,22 @@ install_from_binary() {
 
   tar xzf "${tmpdir}/${decoder}.tar.gz" -C "$tmpdir"
 
+  # A binary built against a newer glibc, or missing a library, fails at
+  # start with "GLIBC_2.38 not found" and the like. Check before installing
+  # and build from source instead.
+  if [ -f "${tmpdir}/bin/${decoder}" ] && [ "$OS" = "linux" ] && command -v ldd >/dev/null 2>&1; then
+    local missing
+    missing=$(LD_LIBRARY_PATH="${tmpdir}/lib" ldd "${tmpdir}/bin/${decoder}" 2>&1 | grep "not found" || true)
+    if [ -n "$missing" ]; then
+      warn "The pre-built ${decoder} doesn't run on this system:"
+      echo "$missing" | sed 's/^[[:space:]]*/    /' >&2
+      info "Falling back to compile from source..."
+      rm -rf "$tmpdir"
+      install_from_source "$decoder"
+      return
+    fi
+  fi
+
   # Install binary
   if [ -f "${tmpdir}/bin/${decoder}" ]; then
     sudo install -m 0755 "${tmpdir}/bin/${decoder}" "/usr/local/bin/${decoder}"
@@ -1487,6 +5256,10 @@ build_run_command() {
   local port="${FEED_PORT:-${DECODER_FEED_PORT[$decoder]}}"
   local freqs="${FREQUENCIES:-$(get_frequencies "$decoder" "${SELECTED_REGION:-north_america}")}"
   local sdr="${SELECTED_SDR:-rtlsdr}"
+  [ -n "$SDR_INDEX$SDR_SERIAL" ] || resolve_sdr_device
+  local dev soapy_rtl
+  dev=$(rtl_device_arg)
+  soapy_rtl=$(soapy_rtl_arg)
 
   # The station ident, as an option for each decoder. Airframes files incoming
   # data under the ident the decoder sends: without it the feed lands on an
@@ -1509,7 +5282,7 @@ build_run_command() {
 
   case "$decoder" in
     acarsdec)
-      echo "acarsdec -v -o 4 -g 42${id_short} -j ${host}:${port} -r 0 ${freqs}"
+      echo "acarsdec -v -o 4 -g 42${id_short} -j ${host}:${port} -r ${dev} ${freqs}"
       ;;
     dumpvdl2)
       # dumpvdl2 takes frequencies in Hz
@@ -1522,7 +5295,7 @@ build_run_command() {
         fi
       done
       case "$sdr" in
-        rtlsdr)  echo "dumpvdl2 --rtlsdr 0${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
+        rtlsdr)  echo "dumpvdl2 --rtlsdr ${dev}${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
         airspy)  echo "dumpvdl2 --airspy 0${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
         sdrplay) echo "dumpvdl2 --soapysdr driver=sdrplay${id_long} --output decoded:json:udp:address=${host},port=${port}${freqs_hz}" ;;
       esac
@@ -1533,13 +5306,13 @@ build_run_command() {
         freq_args+=" ${f}"
       done
       case "$sdr" in
-        rtlsdr)  echo "dumphfdl --soapysdr driver=rtlsdr --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
+        rtlsdr)  echo "dumphfdl --soapysdr ${soapy_rtl} --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
         airspy)  echo "dumphfdl --soapysdr driver=airspy --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
         sdrplay) echo "dumphfdl --soapysdr driver=sdrplay --sample-rate 250000${id_long} --output decoded:json:tcp:address=${host},port=${port}${freq_args}" ;;
       esac
       ;;
     vdlm2dec)
-      echo "vdlm2dec -v -G -E -U${id_short} -j ${host}:${port} -r 0 ${freqs}"
+      echo "vdlm2dec -v -G -E -U${id_short} -j ${host}:${port} -r ${dev} ${freqs}"
       ;;
   esac
 }
@@ -1710,6 +5483,7 @@ EOF
 }
 
 install_manager_script() {
+  report_step manager
   step "Installing airframes manager"
 
   local install_dir="/usr/local/bin"
@@ -1780,14 +5554,37 @@ usage() {
   cat << EOF
 Airframes Installer v${VERSION}
 
-Usage: installer [OPTIONS] [DECODER...]
+Usage: installer [OPTIONS] [WHAT...]
 
-Decoders:
+With no WHAT, it asks what to set up.
+
+What to set up:
+  xng         Recommended. One xng station runs every SDR here (ACARS, VDL2,
+              HFDL, AIS, airband voice, ADS-B, ...) and feeds Airframes.
   acarsdec    VHF ACARS decoder
   dumpvdl2    VDL Mode 2 decoder
   dumphfdl    HF Data Link decoder
   vdlm2dec    VDL Mode 2 decoder (alternative)
   all         Install all decoders
+  status      Check the station and print a report to paste when asking
+              for help (no passwords or tokens in it)
+  update      Update xng to the latest release, keeping its configuration
+  fix         Find and repair common problems: xng stopped or failed, SDR
+              permissions, the TV tuner driver, the clock, an SDR whose
+              serial changed, the weekly update. Asks before each fix (-y
+              applies them all)
+  sign-in     Sign in to Airframes and put this station on your account
+              (for a station set up without signing in)
+  auto-update on|off
+              Update xng automatically every week (systemd timer)
+  uninstall   Remove the xng station (--purge also removes /etc/xng
+              and the sign-in)
+  restore-decoders
+              Stop xng and start the decoders it took over again
+              (acarsdec, dumpvdl2, dumphfdl, vdlm2dec, AIS-catcher)
+  adsb        ADS-B (1090 MHz) for Airframes' partners Airplanes.Live and
+              Plane Watch (Airframes doesn't ingest ADS-B itself). Uses the
+              ADS-B decoder already running, or installs readsb.
 
 Options:
   -h, --help              Show this help message
@@ -1796,17 +5593,62 @@ Options:
   --token TOKEN           Use station token from web wizard
   --region REGION         Set region (north_america, europe, asia_pacific)
   --sdr TYPE              Set SDR type (rtlsdr, airspy, sdrplay)
+  --device ID             RTL-SDR to use, by index or serial (default: the
+                          first one an ADS-B decoder isn't using)
   --method METHOD         Install method (binary, source, docker)
   --no-tui                Disable gum TUI, use plain menus
   --no-service            Don't offer to create systemd service
   --freq "F1 F2 ..."      Override frequencies
+  --station-id ID         Station ID from your station page on airframes.io
+
+xng options:
+  --sign-in               Sign in to Airframes (device code) even with -y
+  --no-sign-in            Don't sign in; the feed still counts, unclaimed
+  --modes "S=MODE,..."    Job per SDR, by serial or number: acars, vdl2, hfdl,
+                          airband, ais, adsb, uat, sonde, iridium or off
+  --airband "MHZ,..."     Airband channels (must be in the Airframes ATC
+                          directory near you), or "nearest" (default)
+  --xng-method METHOD     native or docker (default: native, else Docker)
+  --xng-version VER       xng version (default: latest release)
+  --auto-update           Update xng weekly (asked when interactive)
+  --no-auto-update        Don't set up automatic updates
+  --keep-old-decoders     Leave decoders set up before running (by default
+                          xng takes over their SDRs, station names, gain and
+                          frequencies, and stops them without removing them)
+  --lat / --lon           Receiver position (also used for ADS-B)
+
+Install report:
+  --report                Send the anonymous install report without asking
+                          (also with -y). It holds the installer version, OS,
+                          architecture, SDR types, modes and the step that
+                          failed, nothing that identifies you or the station
+  --no-report             Don't ask about the report
+
+ADS-B options:
+  --lat DEG / --lon DEG   Antenna position, decimal degrees
+  --alt ALT               Antenna altitude, e.g. 120m or 394ft
+  --mlat-name NAME        Name on the MLAT map (default: hostname)
+  --planewatch-key KEY    Also feed Plane Watch (key from atc.plane.watch)
+  --adsb-device ID        RTL-SDR for a new ADS-B decoder (index or serial)
 
 Examples:
-  bash <(curl -sSL https://install.airframes.sh/installer)
-  bash <(curl -sSL https://install.airframes.sh/installer) acarsdec
-  bash <(curl -sSL https://install.airframes.sh/installer) --token abc123
-  bash <(curl -sSL https://install.airframes.sh/installer) -y all --region north_america
-  bash <(curl -sSL https://install.airframes.sh/installer) dumpvdl2 --sdr airspy --method docker
+  curl -sSL https://install.airframes.sh/installer | bash
+  curl -sSL https://install.airframes.sh/installer | bash -s -- -y xng --sign-in --lat 38.68 --lon -120.99
+  curl -sSL https://install.airframes.sh/installer | bash -s -- -y xng --no-sign-in --modes "0=acars,1=vdl2"
+  curl -sSL https://install.airframes.sh/installer | bash -s -- status
+  curl -sSL https://install.airframes.sh/installer | bash -s -- update
+  curl -sSL https://install.airframes.sh/installer | bash -s -- fix
+  curl -sSL https://install.airframes.sh/installer | bash -s -- restore-decoders
+  curl -sSL https://install.airframes.sh/installer | bash -s -- acarsdec
+  curl -sSL https://install.airframes.sh/installer | bash -s -- -y acarsdec --station-id MY-STATION
+  curl -sSL https://install.airframes.sh/installer | bash -s -- --token abc123
+  curl -sSL https://install.airframes.sh/installer | bash -s -- -y all --region north_america
+  curl -sSL https://install.airframes.sh/installer | bash -s -- dumpvdl2 --device 00000002
+  curl -sSL https://install.airframes.sh/installer | bash -s -- -y adsb --lat 38.68 --lon -120.99 --alt 120m
+
+Airframes collects ACARS, VDL2, HFDL, AIS and airband voice. ADS-B goes to Airframes' partner
+networks. On a PiAware or other ADS-B box, "adsb" adds those feeds from the
+decoder you already run; ACARS/VDL2/HFDL need a second SDR.
 EOF
 }
 
@@ -1841,17 +5683,27 @@ parse_args() {
         SELECTED_METHOD="$2"
         shift 2
         ;;
+      --device)
+        SDR_DEVICE="$2"
+        SDR_DEVICE_SET_BY_USER=true
+        shift 2
+        ;;
       --no-tui)
         USE_GUM=false
         shift
         ;;
       --no-service)
         CREATE_SERVICE=false
+        NO_SERVICE=true
         SHOW_RUN_CMD=true
         shift
         ;;
       --freq)
         FREQUENCIES="$2"
+        shift 2
+        ;;
+      --station-id)
+        STATION_IDENT="$2"
         shift 2
         ;;
       acarsdec|dumpvdl2|dumphfdl|vdlm2dec)
@@ -1862,6 +5714,41 @@ parse_args() {
         SELECTED_DECODERS=("${DECODER_LIST[@]}")
         shift
         ;;
+      adsb|ads-b|ADSB)
+        WANT_ADSB=true
+        shift
+        ;;
+      xng|station)      WANT_XNG=true; shift ;;
+      status|doctor)    COMMAND=status; shift ;;
+      update|upgrade)   COMMAND=update; shift ;;
+      uninstall|remove) COMMAND=uninstall; shift ;;
+      --purge)          PURGE=true; shift ;;
+      signin|sign-in|login) COMMAND=signin; shift ;;
+      fix|repair)       COMMAND=fix; shift ;;
+      restore-decoders|switch-back) COMMAND=restoredecoders; shift ;;
+      migrate)          WANT_XNG=true; shift ;;
+      --keep-old-decoders) KEEP_OLD_DECODERS=true; WANT_XNG=true; shift ;;
+      auto-update|autoupdate)
+        COMMAND=autoupdate; shift
+        case "${1:-}" in on|yes) AUTO_UPDATE=yes; shift ;; off|no) AUTO_UPDATE=no; shift ;; esac ;;
+      --auto-update)    AUTO_UPDATE=yes; shift ;;
+      --no-auto-update) AUTO_UPDATE=no; shift ;;
+      --sign-in)        SIGNIN_MODE=yes; shift ;;
+      --no-sign-in)     SIGNIN_MODE=no; shift ;;
+      --report)         REPORT_MODE=yes; shift ;;
+      --no-report)      REPORT_MODE=no; shift ;;
+      --modes)          XNG_MODES_ARG="$2"; WANT_XNG=true; shift 2 ;;
+      --airband)        XNG_AIRBAND_ARG="$2"; WANT_XNG=true; shift 2 ;;
+      --xng-method)
+        case "$2" in native|docker) XNG_METHOD="$2" ;; *) err "--xng-method: native or docker"; exit 1 ;; esac
+        WANT_XNG=true; shift 2 ;;
+      --xng-version)    XNG_VERSION="${2#v}"; WANT_XNG=true; shift 2 ;;
+      --lat)            ADSB_LAT="$2"; shift 2 ;;
+      --lon)            ADSB_LON="$2"; shift 2 ;;
+      --alt)            ADSB_ALT="$2"; shift 2 ;;
+      --mlat-name)      ADSB_NAME="$2"; shift 2 ;;
+      --planewatch-key) PLANEWATCH_KEY="$2"; shift 2 ;;
+      --adsb-device)    ADSB_SDR_DEVICE="$2"; shift 2 ;;
       *)
         err "Unknown argument: $1"
         usage
@@ -1892,23 +5779,43 @@ BANNER
   echo
 }
 
+XNG_MENU_LABEL="Airframes station with xng (recommended): every SDR, every mode"
+ADSB_ONLY_MENU_LABEL="ADS-B only, for Airframes' partners Airplanes.Live and Plane Watch"
+CLASSIC_MENU_LABEL="Separate decoders (acarsdec, dumpvdl2, dumphfdl, vdlm2dec)"
+
+# First question: the xng station, ADS-B for partners, or separate decoders.
+tui_select_setup() {
+  step "What would you like to set up?"
+  echo -e "  ${DIM}xng decodes ACARS, VDL2, HFDL, AIS, airband voice and ADS-B, picks a job for${RESET}"
+  echo -e "  ${DIM}each SDR, and feeds Airframes. Sign in and your station is on your account.${RESET}"
+  local choice
+  choice=$(ui_choose "Set up:" "$XNG_MENU_LABEL" "$ADSB_ONLY_MENU_LABEL" "$CLASSIC_MENU_LABEL") || exit 0
+  case "$choice" in
+    "$XNG_MENU_LABEL")       WANT_XNG=true; ok "Setting up an xng station" ;;
+    "$ADSB_ONLY_MENU_LABEL") WANT_ADSB=true; ok "Setting up ADS-B for Airframes' partners" ;;
+    *)                       tui_select_decoders ;;
+  esac
+}
+
 tui_select_decoders() {
   if [ "$HAS_GUM" = true ]; then
-    step "Select decoders to install"
+    step "Select what to install"
 
     local -a labels=()
     for d in "${DECODER_LIST[@]}"; do
       labels+=("${DECODER_LABEL[$d]}")
     done
+    labels+=("$ADSB_MENU_LABEL")
 
     local selections
-    selections=$(gum choose --no-limit --header "Select decoders to install:" "${labels[@]}") || {
-      info "No decoders selected"
+    selections=$(gum_multichoice "Select what to install" "${labels[@]}") || {
+      REPORT_ARMED=false; info "Nothing selected"
       exit 0
     }
 
     SELECTED_DECODERS=()
     while IFS= read -r line; do
+      [[ "$line" == "$ADSB_MENU_LABEL" ]] && WANT_ADSB=true
       for d in "${DECODER_LIST[@]}"; do
         if [[ "$line" == "${DECODER_LABEL[$d]}" ]]; then
           SELECTED_DECODERS+=("$d")
@@ -1916,7 +5823,7 @@ tui_select_decoders() {
       done
     done <<< "$selections"
   else
-    step "Select decoders to install"
+    step "Select what to install"
     echo -e "  ${DIM}(Enter numbers separated by spaces, e.g., 1 3)${RESET}"
     echo
 
@@ -1925,28 +5832,36 @@ tui_select_decoders() {
       echo -e "  ${CYAN}${i}${RESET})  ${DECODER_LABEL[$d]}"
       ((i++))
     done
-    echo -e "  ${CYAN}5${RESET})  All of the above"
+    echo -e "  ${CYAN}5${RESET})  All four of the above"
+    echo -e "  ${CYAN}6${RESET})  ${ADSB_MENU_LABEL}"
     echo
 
     local choices
     echo -ne "  ${BOLD}Select: ${RESET}"
-    read -r choices
+    read -r choices || choices=""
 
     SELECTED_DECODERS=()
     for idx in $choices; do
       case "$idx" in
-        5) SELECTED_DECODERS=("${DECODER_LIST[@]}"); break ;;
+        5) SELECTED_DECODERS=("${DECODER_LIST[@]}") ;;
+        6) WANT_ADSB=true ;;
         [1-4]) SELECTED_DECODERS+=("${DECODER_LIST[$((idx-1))]}") ;;
       esac
     done
+    # de-duplicate (e.g. "1 5")
+    if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+      mapfile -t SELECTED_DECODERS < <(printf '%s\n' "${SELECTED_DECODERS[@]}" | awk '!seen[$0]++')
+    fi
   fi
 
-  if [ ${#SELECTED_DECODERS[@]} -eq 0 ]; then
-    info "No decoders selected. Bye!"
+  if [ ${#SELECTED_DECODERS[@]} -eq 0 ] && [ "$WANT_ADSB" = false ]; then
+    info "Nothing selected. Bye!"
     exit 0
   fi
 
-  ok "Selected: ${SELECTED_DECODERS[*]}"
+  local picked=("${SELECTED_DECODERS[@]}")
+  [ "$WANT_ADSB" = true ] && picked+=("adsb")
+  ok "Selected: ${picked[*]}"
 }
 
 tui_select_method() {
@@ -2011,30 +5926,108 @@ tui_select_sdr() {
   ok "SDR: ${SELECTED_SDR}"
 }
 
+# The station ID from the station's page on airframes.io. Without it the feed
+# lands on an anonymous station named after this machine.
+tui_station_id() {
+  [ -n "$STATION_IDENT" ] && return 0
+  [ "$IS_TTY" = true ] && [ "$AUTO_YES" = false ] || return 0
+  echo
+  echo -e "  ${DIM}Add a station at https://app.airframes.io and copy its Station ID here.${RESET}"
+  echo -e "  ${DIM}Leave it blank to feed without one (run again with --station-id later).${RESET}"
+  STATION_IDENT=$(ui_input "Station ID" "")
+  STATION_IDENT="${STATION_IDENT//[[:space:]]/}"
+}
+
 tui_confirm_install() {
   echo
   step "Installation Summary"
   echo
-  echo -e "  ${BOLD}Decoders:${RESET}  ${SELECTED_DECODERS[*]}"
-  echo -e "  ${BOLD}Method:${RESET}    ${SELECTED_METHOD}"
-  echo -e "  ${BOLD}Region:${RESET}    ${SELECTED_REGION}"
-  echo -e "  ${BOLD}SDR:${RESET}       ${SELECTED_SDR}"
-  if [ -n "$STATION_IDENT" ]; then
+  [ "$WANT_XNG" = true ] && xng_plan_lines
+  if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    echo -e "  ${BOLD}Decoders:${RESET}  ${SELECTED_DECODERS[*]}"
+    echo -e "  ${BOLD}Method:${RESET}    ${SELECTED_METHOD}"
+    echo -e "  ${BOLD}Region:${RESET}    ${SELECTED_REGION}"
+    echo -e "  ${BOLD}SDR:${RESET}       ${SELECTED_SDR}"
+    if [ "$SELECTED_SDR" = "rtlsdr" ] && [ -n "$SDR_DEVICE" ]; then
+      echo -e "  ${BOLD}Device:${RESET}    RTL-SDR $(sdr_device_label)"
+    fi
+  fi
+  if [ "$WANT_ADSB" = true ]; then
+    local partners="Airplanes.Live"
+    [ -n "$PLANEWATCH_KEY" ] && partners+=", Plane Watch"
+    local source="existing decoder on port 30005"
+    xng_has_job adsb && source="xng"
+    xng_has_job adsb || adsb_source_ready || source="new readsb"
+    [ "$SELECTED_METHOD" = "docker" ] && ! adsb_source_ready && source="new ultrafeeder (Docker)"
+    echo -e "  ${BOLD}ADS-B:${RESET}     ${partners} (from ${source})"
+    echo -e "  ${BOLD}Antenna:${RESET}   ${ADSB_LAT}, ${ADSB_LON}, ${ADSB_ALT}  (MLAT name ${ADSB_NAME})"
+  fi
+  if [ -n "$STATION_IDENT" ] && [ "$WANT_XNG" = false ]; then
     echo -e "  ${BOLD}Station:${RESET}   ${STATION_IDENT}"
   fi
   echo
 
   if ! ui_confirm "Proceed with installation?"; then
+    REPORT_ARMED=false
     info "Aborted."
     exit 0
   fi
 }
 
+# Is systemd running here (not just installed, as in many containers)?
+# Everything is downloaded with curl. The one-liner has it, but "wget -O- | bash"
+# or a copied script may not.
+ensure_curl() {
+  command -v curl >/dev/null 2>&1 && return 0
+  if [ "${PKG:-}" = apt ]; then
+    info "Installing curl"
+    sudo apt-get update -qq >/dev/null 2>&1 || true
+    sudo apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || true
+  fi
+  command -v curl >/dev/null 2>&1 && return 0
+  err "The installer needs curl. Install it (for example: sudo apt-get install curl) and run this again."
+  exit 1
+}
+
+have_systemd() {
+  [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+# CLI mode: run the decoder as a service unless --no-service. -y, or no
+# terminal to ask, means yes: the person asked for the decoder to be set up.
+cli_post_install() {
+  local decoder="$1"
+  [ "$SELECTED_METHOD" = "docker" ] && return 0
+  if [ "$NO_SERVICE" = true ]; then
+    show_run_command "$decoder"
+    return 0
+  fi
+  if have_systemd; then
+    if ui_confirm "Start ${decoder} now and on every boot (systemd service)?" "yes"; then
+      create_systemd_service "$decoder"
+      return 0
+    fi
+  elif [ "$OS" = "macos" ]; then
+    if ui_confirm "Start ${decoder} now and at login (launchd service)?" "yes"; then
+      create_launchd_service "$decoder"
+      return 0
+    fi
+  else
+    warn "systemd isn't running here, so ${decoder} won't start by itself."
+  fi
+  show_run_command "$decoder"
+}
+
 tui_post_install() {
   local decoder="$1"
 
+  [ "$SELECTED_METHOD" = "docker" ] && return 0
+  if [ "$NO_SERVICE" = true ]; then
+    show_run_command "$decoder"
+    return 0
+  fi
   echo
-  if [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+  if have_systemd; then
     local actions=("Show run command" "Create systemd service (auto-start on boot)" "Both")
     local choice
     choice=$(ui_choose "How would you like to run ${decoder}?" "${actions[@]}")
@@ -2085,30 +6078,44 @@ tui_flow() {
 
   # Install gum for TUI
   if [ "$USE_GUM" = true ]; then
-    install_gum
+    install_gum || { warn "Could not install gum, using plain menus"; HAS_GUM=false; }
   fi
 
-  # Decoder selection
-  tui_select_decoders
+  # ADS-B / decoders already on this machine
+  check_existing_setup
 
-  # Installation method
-  tui_select_method
+  # What to set up
+  tui_select_setup
+  REPORT_ARMED=true
 
-  # Region selection
-  tui_select_region
+  [ "$WANT_XNG" = true ] && plan_xng_station
 
-  # SDR selection
-  tui_select_sdr
+  if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    tui_select_method
+    tui_select_region
+    tui_select_sdr
+    check_sdr_for_decoders
+    tui_station_id
+  fi
+
+  # ADS-B: antenna position, MLAT name, Plane Watch key
+  if [ "$WANT_ADSB" = true ]; then
+    [ -z "$ADSB_LAT" ] && ADSB_LAT="$STATION_LAT"
+    [ -z "$ADSB_LON" ] && ADSB_LON="$STATION_LON"
+    adsb_collect_location
+  fi
 
   # Confirmation
   tui_confirm_install
 
   # Install
-  install_base_deps
-
-  mkdir -p "$BUILD_DIR"
+  if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    install_base_deps
+    mkdir -p "$BUILD_DIR"
+  fi
 
   for decoder in "${SELECTED_DECODERS[@]}"; do
+    report_step "decoder-${SELECTED_METHOD}"
     case "$SELECTED_METHOD" in
       source)  install_from_source "$decoder" ;;
       docker)  install_with_docker "$decoder" ;;
@@ -2116,14 +6123,33 @@ tui_flow() {
       package) install_from_package "$decoder" ;;
     esac
 
+    report_step service
     save_config "$decoder"
     tui_post_install "$decoder"
   done
 
-  install_manager_script
+  [ "$WANT_XNG" = true ] && { setup_xng_station || exit 1; }
 
+  setup_adsb
+
+  [ ${#SELECTED_DECODERS[@]} -gt 0 ] && install_manager_script
+
+  [ "$WANT_XNG" = true ] && setup_auto_update
+
+  [ "$WANT_XNG" = true ] && verify_xng_station
+
+  [ "$WANT_XNG" = true ] && xng_summary
+  closing_message
+}
+
+closing_message() {
   echo
-  ok "Done! Thank you for feeding Airframes."
+  if [ "$WANT_XNG" = false ] && [ ${#SELECTED_DECODERS[@]} -eq 0 ] && [ "$WANT_ADSB" = true ]; then
+    ok "Done! Thank you for feeding Airframes' ADS-B partners."
+    info "For ACARS, VDL2 or airband voice on Airframes, add an SDR and run this again."
+  else
+    ok "Done! Thank you for feeding Airframes."
+  fi
   info "Learn more at https://docs.airframes.io"
 }
 
@@ -2132,8 +6158,26 @@ tui_flow() {
 # ===========================================================================
 
 main() {
+  if [ -t 0 ]; then IS_TTY=true; else IS_TTY=false; fi
+  trap 'installer_exit $?; rm -rf "$BUILD_DIR"' EXIT
+
   parse_args "$@"
+  if [ "$WANT_XNG" = true ] && [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+    err "xng decodes ACARS, VDL2 and HFDL itself, and both would want the same SDRs."
+    err "Pick xng or ${SELECTED_DECODERS[*]}, not both."
+    exit 1
+  fi
   detect_platform
+  # Removing xng and turning auto-update off are local; everything else downloads
+  case "$COMMAND" in
+    uninstall) ;;
+    autoupdate) if [ "$AUTO_UPDATE" = yes ]; then ensure_curl; fi ;;
+    *) ensure_curl ;;
+  esac
+  if [ -n "$COMMAND" ]; then
+    run_command
+    exit 0
+  fi
 
   # Windows native (not WSL) — show guide and exit
   if [ "$OS" = "windows" ] && [ "$IS_WSL" = false ]; then
@@ -2156,15 +6200,19 @@ main() {
     echo
 
     api_fetch_config || exit 1
+    REPORT_ARMED=true
 
     if [ -z "$SELECTED_REGION" ]; then
       SELECTED_REGION=$(detect_region_from_timezone)
     fi
 
+    check_existing_setup
+
     install_base_deps
     mkdir -p "$BUILD_DIR"
 
     for decoder in "${SELECTED_DECODERS[@]}"; do
+      report_step "decoder-${SELECTED_METHOD}"
       case "$SELECTED_METHOD" in
         source)  install_from_source "$decoder" ;;
         docker)  install_with_docker "$decoder" ;;
@@ -2172,12 +6220,15 @@ main() {
         package) install_from_package "$decoder" ;;
       esac
 
+      report_step service
       save_config "$decoder"
 
       api_report_status "configuring" "Configuring ${decoder}" 80
       show_run_command "$decoder"
 
-      if [ "$OS" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+      if [ "$NO_SERVICE" = true ]; then
+        :
+      elif have_systemd; then
         if [ "$AUTO_YES" = true ] || ui_confirm "Create systemd service for ${decoder}?"; then
           create_systemd_service "$decoder"
           api_report_status "feeding" "${decoder} is feeding" 95
@@ -2199,7 +6250,7 @@ main() {
   fi
 
   # CLI mode: decoder(s) passed as arguments
-  if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+  if [ ${#SELECTED_DECODERS[@]} -gt 0 ] || [ "$WANT_ADSB" = true ] || [ "$WANT_XNG" = true ]; then
     show_banner
     info "Detected: ${OS} / ${ARCH} / ${DISTRO} / ${PKG}"
     echo
@@ -2208,17 +6259,39 @@ main() {
       SELECTED_REGION=$(detect_region_from_timezone)
     fi
 
+    REPORT_ARMED=true
+    check_existing_setup
+    [ "$WANT_XNG" = true ] && plan_xng_station
+    [ ${#SELECTED_DECODERS[@]} -gt 0 ] && check_sdr_for_decoders
+    if [ "$WANT_ADSB" = true ]; then
+      [ -z "$ADSB_LAT" ] && ADSB_LAT="$STATION_LAT"
+      [ -z "$ADSB_LON" ] && ADSB_LON="$STATION_LON"
+      adsb_collect_location
+    fi
+
+    if [ "$WANT_XNG" = true ]; then
+      echo
+      xng_plan_lines
+    fi
+
     if [ "$AUTO_YES" = false ]; then
-      if ! ui_confirm "Install ${SELECTED_DECODERS[*]}?"; then
+      local what=("${SELECTED_DECODERS[@]}")
+      [ "$WANT_XNG" = true ] && what=("the xng station ${STATION_IDENT}" "${what[@]}")
+      [ "$WANT_ADSB" = true ] && what+=("ADS-B feeds for Airplanes.Live${PLANEWATCH_KEY:+ and Plane Watch}")
+      if ! ui_confirm "Install $(join_by ', ' "${what[@]}")?"; then
+        REPORT_ARMED=false
         info "Aborted."
         exit 0
       fi
     fi
 
-    install_base_deps
-    mkdir -p "$BUILD_DIR"
+    if [ ${#SELECTED_DECODERS[@]} -gt 0 ]; then
+      install_base_deps
+      mkdir -p "$BUILD_DIR"
+    fi
 
     for decoder in "${SELECTED_DECODERS[@]}"; do
+      report_step "decoder-${SELECTED_METHOD}"
       case "$SELECTED_METHOD" in
         source)  install_from_source "$decoder" ;;
         docker)  install_with_docker "$decoder" ;;
@@ -2226,28 +6299,65 @@ main() {
         package) install_from_package "$decoder" ;;
       esac
 
+      report_step service
       save_config "$decoder"
-      show_run_command "$decoder"
+      cli_post_install "$decoder"
     done
 
-    install_manager_script
+    [ "$WANT_XNG" = true ] && { setup_xng_station || exit 1; }
 
-    echo
-    ok "Done! Thank you for feeding Airframes."
-    info "Learn more at https://docs.airframes.io"
+    setup_adsb
+
+    [ ${#SELECTED_DECODERS[@]} -gt 0 ] && install_manager_script
+
+    [ "$WANT_XNG" = true ] && setup_auto_update
+
+    [ "$WANT_XNG" = true ] && verify_xng_station
+
+    [ "$WANT_XNG" = true ] && xng_summary
+    closing_message
     exit 0
   fi
 
   # TUI mode: no args, interactive
   if [ "$IS_TTY" = true ]; then
     tui_flow
+    # Exit here, inside main: the exit trap asks about the report on the terminal
+    exit 0
   else
-    # Piped without args and without a TTY — show help
-    err "No decoder specified and no interactive terminal detected."
+    # No terminal to ask on (cron, CI, ssh without -t, docker without -t)
+    # and no decoder named. Say exactly what to run instead.
+    show_banner
+    detect_existing_setup
+    show_existing_setup
     echo
-    usage
+    echo -e "${RED}[airframes]${RESET} There is no terminal to ask questions on, and no decoder was named."
+    echo
+    echo "  Run it from a terminal to pick from a menu:"
+    echo "    curl -sSL https://install.airframes.sh/installer | bash"
+    echo
+    echo "  Or set up an xng station on every SDR here (recommended):"
+    echo "    curl -sSL https://install.airframes.sh/installer | bash -s -- -y xng"
+    echo
+    echo "  Or name decoders to install (acarsdec, dumpvdl2, dumphfdl, vdlm2dec or all):"
+    echo "    curl -sSL https://install.airframes.sh/installer | bash -s -- -y acarsdec"
+    echo
+    echo "  ADS-B, fed to Airframes' partners Airplanes.Live and Plane Watch:"
+    echo "    curl -sSL https://install.airframes.sh/installer | bash -s -- -y adsb --lat 38.68 --lon -120.99 --alt 120m"
+    echo
+    echo "  More options: curl -sSL https://install.airframes.sh/installer | bash -s -- --help"
     exit 1
   fi
 }
 
-main "$@"
+# Entry point. With "curl ... | bash", bash reads this script from stdin, so
+# prompts would read the script instead of the keyboard. When a terminal is
+# there (/dev/tty opens), give main() the terminal as stdin; bash keeps
+# reading the rest of the script (only "exit" below) from the pipe.
+# AIRFRAMES_NO_TTY=1 skips this, for tests and automation.
+if [ ! -t 0 ] && [ -z "${AIRFRAMES_NO_TTY:-}" ] && { : </dev/tty; } 2>/dev/null; then
+  main "$@" </dev/tty
+else
+  main "$@"
+fi
+exit $?

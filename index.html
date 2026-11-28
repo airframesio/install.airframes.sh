@@ -55,11 +55,31 @@
 
         <div class="install-section">
           <h3>Quick Start</h3>
+          <p class="install-step">Run this in a terminal on the machine with your SDR. It sets up <strong>xng</strong>, which gives every SDR a job (ACARS, VDL2, HFDL, AIS, airband voice or ADS-B) and feeds Airframes. Sign in with a code on your phone and the station is on your account right away.</p>
           <div class="code-block">
-            <code>curl -sSL https://install.airframes.sh/installer | bash</code>
-            <button class="copy-btn" onclick="navigator.clipboard.writeText('curl -sSL https://install.airframes.sh/installer | bash')">Copy</button>
+            <code>curl -sSL https://install.airframes.sh/installer <span class="nowrap">| bash</span></code>
+            <button class="copy-btn" data-copy="curl -sSL https://install.airframes.sh/installer | bash">Copy</button>
           </div>
-          <p class="install-note">Supports Linux, macOS, and Windows (WSL)</p>
+
+          <p class="install-step">No questions: <code>-y xng</code> picks a job for each SDR and runs xng as a service. Add <code>--sign-in</code> to link it to your account, or <code>--modes "0=acars,1=vdl2"</code> to choose the jobs. The separate decoders (<code>acarsdec</code>, <code>dumpvdl2</code>, <code>dumphfdl</code>, <code>vdlm2dec</code>) are still there too.</p>
+          <div class="code-block">
+            <code>curl -sSL https://install.airframes.sh/installer <span class="nowrap">| bash -s -- -y xng --sign-in</span></code>
+            <button class="copy-btn" data-copy="curl -sSL https://install.airframes.sh/installer | bash -s -- -y xng --sign-in">Copy</button>
+          </div>
+
+          <p class="install-step">Already set up? <code>status</code> shows what's running and when Airframes last heard each feed (paste it in Discord if you need help). <code>sign-in</code> puts a station on your account later (scan the QR code it shows with your phone), <code>update</code> installs the newest xng (<code>auto-update on</code> does it weekly) and <code>uninstall</code> removes it.</p>
+          <div class="code-block">
+            <code>curl -sSL https://install.airframes.sh/installer <span class="nowrap">| bash -s -- status</span></code>
+            <button class="copy-btn" data-copy="curl -sSL https://install.airframes.sh/installer | bash -s -- status">Copy</button>
+          </div>
+
+          <p class="install-step">At the end, the installer asks whether to send Airframes an anonymous report (installer version, system, SDR types, modes, and the step that failed if one did). The answer defaults to no; <code>--no-report</code> skips the question. <a href="https://docs.airframes.io/docs/feeding/how">What's in it</a>.</p>
+
+          <div class="install-callout">
+            <strong>ADS-B?</strong> Airframes doesn't ingest ADS-B itself, but the installer can feed it to our partners <a href="https://airplanes.live">Airplanes.Live</a> and <a href="https://plane.watch">Plane Watch</a>: pick ADS-B in the menu (xng can decode it too), or run <code class="nowrap">| bash -s -- adsb</code>. On a PiAware or other ADS-B box it feeds them from the decoder you already run. To feed Airframes ACARS, VDL2, HFDL or airband voice as well, add a second SDR.
+          </div>
+
+          <p class="install-note">Supports Linux, macOS, and Windows (WSL). See all options with <code class="nowrap">| bash -s -- --help</code>, or read the <a href="https://docs.airframes.io/docs/feeding/how">feeding guide</a>.</p>
         </div>
       </main>
 
@@ -76,5 +96,15 @@
       </footer>
     </div>
     <div id="bg"></div>
+    <script>
+      document.querySelectorAll('.copy-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          navigator.clipboard.writeText(btn.dataset.copy).then(function () {
+            btn.textContent = 'Copied';
+            setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+          });
+        });
+      });
+    </script>
   </body>
 </html>
