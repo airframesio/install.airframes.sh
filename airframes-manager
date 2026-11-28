@@ -45,7 +45,13 @@ fi
 
 MANAGER_VERSION="1.0.0"
 CONFIG_DIR="/opt/airframes/config"
-BUILD_DIR="/tmp/airframes-build"
+# Private per-run build directory. A fixed path under /tmp let any other local
+# user plant sources there before we run `sudo make install` on them.
+BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/airframes-build.XXXXXX")" || {
+  echo "Could not create a temporary build directory" >&2
+  exit 1
+}
+trap 'rm -rf "$BUILD_DIR"' EXIT
 LIBACARS_REPO="https://github.com/szpajder/libacars.git"
 GITHUB_REPO="airframesio/install.airframes.sh"
 GITHUB_RELEASES="https://github.com/airframesio/install.airframes.sh/releases"
@@ -239,15 +245,24 @@ EOF
   ok "Service ${service_name} created"
 }
 
+# Escape &, < and > for a plist <string>.
+xml_escape() {
+  local s="$1"
+  s="${s//&/\&amp;}"
+  s="${s//</\&lt;}"
+  s="${s//>/\&gt;}"
+  printf '%s' "$s"
+}
+
 create_launchd_service() {
   local decoder="$1"
   local cmd="$2"
   local service_label="io.airframes.${decoder}"
   local plist_dir="$HOME/Library/LaunchAgents"
   local plist_file="${plist_dir}/${service_label}.plist"
-  local logfile="/tmp/airframes-${decoder}.log"
+  local logfile="${HOME}/Library/Logs/airframes-${decoder}.log"
 
-  mkdir -p "$plist_dir"
+  mkdir -p "$plist_dir" "${HOME}/Library/Logs"
 
   step "Creating launchd service: ${service_label}"
 
@@ -260,11 +275,11 @@ create_launchd_service() {
   local first=true
   for arg in $cmd; do
     if [ "$first" = true ]; then
-      args_xml="${args_xml}    <string>${bin_path}</string>
+      args_xml="${args_xml}    <string>$(xml_escape "$bin_path")</string>
 "
       first=false
     else
-      args_xml="${args_xml}    <string>${arg}</string>
+      args_xml="${args_xml}    <string>$(xml_escape "$arg")</string>
 "
     fi
   done
@@ -284,9 +299,9 @@ ${args_xml}  </array>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>${logfile}</string>
+  <string>$(xml_escape "$logfile")</string>
   <key>StandardErrorPath</key>
-  <string>${logfile}</string>
+  <string>$(xml_escape "$logfile")</string>
 </dict>
 </plist>
 EOF
@@ -460,7 +475,11 @@ do_logs() {
       fi
       ;;
     launchd)
-      local logfile="/tmp/airframes-${decoder}.log"
+      local logfile="${HOME}/Library/Logs/airframes-${decoder}.log"
+      # Services created before 2.1.1 still log to /tmp.
+      if [ ! -f "$logfile" ] && [ -f "/tmp/airframes-${decoder}.log" ]; then
+        logfile="/tmp/airframes-${decoder}.log"
+      fi
       if [ -f "$logfile" ]; then
         if [ "$follow" = true ]; then
           tail -f "$logfile"
